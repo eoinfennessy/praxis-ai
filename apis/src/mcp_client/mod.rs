@@ -70,7 +70,6 @@ impl McpDisplayUrl {
         let (Some(scheme), Some(host)) = (uri.scheme_str(), uri.host()) else {
             return Self::invalid();
         };
-
         let mut out = String::with_capacity(scheme.len() + host.len() + 16);
         out.push_str(scheme);
         out.push_str("://");
