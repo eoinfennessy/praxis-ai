@@ -247,6 +247,19 @@ fn resolve_model_unknown_fallback() {
 // -----------------------------------------------------------------------------
 
 #[test]
+fn from_config_succeeds() {
+    let filter = TimeToFirstTokenFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    assert_eq!(filter.name(), "time_to_first_token", "filter name should match");
+}
+
+#[test]
+fn from_config_rejects_unknown_fields() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("bogus: true").unwrap();
+    let result = TimeToFirstTokenFilter::from_config(&yaml);
+    assert!(result.is_err(), "unknown fields should be rejected");
+}
+
+#[test]
 fn name_returns_time_to_first_token() {
     let filter = TimeToFirstTokenFilter;
     assert_eq!(filter.name(), "time_to_first_token");

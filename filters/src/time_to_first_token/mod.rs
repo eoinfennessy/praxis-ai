@@ -33,7 +33,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use metrics::histogram;
 use praxis_ai_apis::is_event_stream_content_type;
-use praxis_filter::{BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext};
+use praxis_filter::{
+    BodyAccess, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+};
 use tracing::debug;
 
 /// Prometheus histogram name for time-to-first-token measurements.
@@ -63,8 +65,8 @@ impl TimeToFirstTokenFilter {
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
-    #[expect(clippy::unnecessary_wraps, reason = "signature required by FilterFactory")]
-    pub fn from_config(_config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let _: EmptyFilterConfig = parse_filter_config("time_to_first_token", config)?;
         Ok(Box::new(Self))
     }
 }
