@@ -242,6 +242,35 @@ fn resolve_model_unknown_fallback() {
     assert_eq!(resolve_model(&ctx), "unknown");
 }
 
+#[test]
+fn resolve_model_rejects_control_characters() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    ctx.set_metadata("anthropic_to_openai.model", "model\ninjection");
+    assert_eq!(resolve_model(&ctx), "unknown");
+}
+
+#[test]
+fn resolve_model_rejects_oversized_value() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let long_model = "a".repeat(MAX_PROMOTED_VALUE_LEN + 1);
+    ctx.set_metadata("openai_responses_format.model", &long_model);
+    assert_eq!(resolve_model(&ctx), "unknown");
+}
+
+#[test]
+fn resolve_model_accepts_max_length_value() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let model = "a".repeat(MAX_PROMOTED_VALUE_LEN);
+    ctx.set_metadata("openai_responses_format.model", &model);
+    assert_eq!(resolve_model(&ctx), model);
+}
+
 // -----------------------------------------------------------------------------
 // Filter Metadata
 // -----------------------------------------------------------------------------
