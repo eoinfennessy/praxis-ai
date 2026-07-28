@@ -35,4 +35,5 @@ serde_yaml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+metrics-util = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

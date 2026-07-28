@@ -116,13 +116,36 @@ async fn first_non_empty_chunk_records_and_deactivates() {
 
     assert!(ctx.filter_metadata.contains_key(META_ACTIVE));
 
-    let mut body = Some(Bytes::from_static(b"data: {}\n\n"));
-    drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+    let snapshotter = record_body_with_metrics(&filter, &mut ctx, b"data: {}\n\n");
 
     assert!(
         !ctx.filter_metadata.contains_key(META_ACTIVE),
         "TTFT metadata should be removed after recording"
     );
+
+    let (model, samples) = assert_single_ttft_histogram(&snapshotter);
+    assert_eq!(model, "unknown", "model should fall back to unknown");
+    assert_eq!(samples.len(), 1, "histogram should have exactly one sample");
+    assert!(samples[0] > 0.0, "TTFT should be positive");
+}
+
+#[tokio::test]
+async fn first_non_empty_chunk_records_with_model_label() {
+    let filter = TimeToFirstTokenFilter;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    ctx.set_metadata("openai_responses_format.model", "gpt-4o");
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let snapshotter = record_body_with_metrics(&filter, &mut ctx, b"data: {}\n\n");
+
+    let (model, _) = assert_single_ttft_histogram(&snapshotter);
+    assert_eq!(model, "gpt-4o", "model label should match metadata");
 }
 
 #[tokio::test]
@@ -317,4 +340,43 @@ fn make_response_with_status_and_content_type(status: http::StatusCode, ct: &str
     };
     resp.headers.insert("content-type", HeaderValue::from_str(ct).unwrap());
     resp
+}
+
+fn record_body_with_metrics(
+    filter: &TimeToFirstTokenFilter,
+    ctx: &mut HttpFilterContext<'_>,
+    chunk: &'static [u8],
+) -> metrics_util::debugging::Snapshotter {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let mut body = Some(Bytes::from(chunk));
+        drop(filter.on_response_body(ctx, &mut body, false).unwrap());
+    });
+    snapshotter
+}
+
+fn assert_single_ttft_histogram(snapshotter: &metrics_util::debugging::Snapshotter) -> (String, Vec<f64>) {
+    let snapshot = snapshotter.snapshot().into_vec();
+    let histograms: Vec<_> = snapshot
+        .iter()
+        .filter(|(key, ..)| key.key().name() == METRIC_TTFT_SECONDS)
+        .collect();
+    assert_eq!(histograms.len(), 1, "exactly one TTFT histogram should be recorded");
+
+    let (key, _, _, value) = &histograms[0];
+    let model = key
+        .key()
+        .labels()
+        .find(|l| l.key() == "model")
+        .expect("histogram should have a model label")
+        .value()
+        .to_owned();
+
+    let samples = match value {
+        metrics_util::debugging::DebugValue::Histogram(s) => s.iter().map(|v| v.into_inner()).collect(),
+        other => panic!("expected histogram value, got {other:?}"),
+    };
+
+    (model, samples)
 }
