@@ -594,7 +594,6 @@ fn is_ssrf_sensitive(ip: &IpAddr) -> bool {
         },
     }
 }
-
 /// Convert `rmcp::model::Tool` values to opaque JSON.
 fn tools_to_json(tools: Vec<rmcp::model::Tool>) -> Result<Vec<serde_json::Value>, McpClientError> {
     tools
