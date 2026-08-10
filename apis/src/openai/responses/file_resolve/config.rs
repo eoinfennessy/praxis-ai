@@ -7,7 +7,10 @@ use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
 use super::resolve_url::NormalizedOrigin;
-use crate::{callout_policy::OnMissing, openai::api_client};
+use crate::{
+    callout_policy::OnMissing,
+    openai::{api_client, responses::body_limits::validate_size_limit},
+};
 
 /// Default HTTP timeout for Files API callout requests (30 000 ms).
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -67,9 +70,23 @@ pub(crate) struct FileResolveConfig {
     #[serde(default)]
     pub forward_headers: Vec<String>,
 
-    /// Maximum body size in bytes for `StreamBuffer` mode.
-    #[serde(default = "default_max_body_bytes")]
-    pub max_body_bytes: usize,
+    /// Maximum size in bytes of the request body this filter *produces*
+    /// after inlining resolved `file_id` / `file_url` content (default 64
+    /// MiB).
+    ///
+    /// Raw request body size is governed by the pipeline's `body_limits`,
+    /// not this field. The resolved body can grow larger than the raw
+    /// input because references are replaced with inline content.
+    #[serde(default = "default_max_rewritten_body_bytes")]
+    pub max_rewritten_body_bytes: usize,
+
+    /// Maximum size in bytes of a single resolved file's content fetched
+    /// from the Files API or a remote URL (default 64 MiB).
+    ///
+    /// Bounds each individual callout payload before it is inlined,
+    /// independently of the total rewritten body size.
+    #[serde(default = "default_max_resolved_bytes")]
+    pub max_resolved_bytes: usize,
 
     /// Maximum number of distinct content-part / `file_id` pairs to
     /// resolve in one request, including rehydrated history.
@@ -96,8 +113,13 @@ pub(crate) struct FileResolveConfig {
     pub allowed_file_url_origins: Vec<String>,
 }
 
-/// Default max body bytes.
-fn default_max_body_bytes() -> usize {
+/// Default max rewritten body bytes (64 MiB).
+fn default_max_rewritten_body_bytes() -> usize {
+    MAX_JSON_BODY_BYTES
+}
+
+/// Default max resolved content bytes per reference (64 MiB).
+fn default_max_resolved_bytes() -> usize {
     MAX_JSON_BODY_BYTES
 }
 
@@ -147,17 +169,12 @@ fn validate_pre_security_callout(cfg: &FileResolveConfig) -> Result<(), FilterEr
 
 /// Validate numeric limits applied while buffering and resolving.
 fn validate_limits(cfg: &FileResolveConfig) -> Result<(), FilterError> {
-    if cfg.max_body_bytes == 0 {
-        return Err("openai_file_resolve: 'max_body_bytes' must be greater than 0".into());
-    }
-
-    if cfg.max_body_bytes > MAX_JSON_BODY_BYTES {
-        return Err(format!(
-            "openai_file_resolve: 'max_body_bytes' ({}) exceeds maximum ({MAX_JSON_BODY_BYTES})",
-            cfg.max_body_bytes
-        )
-        .into());
-    }
+    validate_size_limit(
+        "openai_file_resolve",
+        "max_rewritten_body_bytes",
+        cfg.max_rewritten_body_bytes,
+    )?;
+    validate_size_limit("openai_file_resolve", "max_resolved_bytes", cfg.max_resolved_bytes)?;
 
     validate_resolution_limits(cfg)
 }
@@ -220,6 +237,7 @@ fn validate_file_url_config(cfg: &FileResolveConfig) -> Result<(), FilterError> 
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     reason = "tests"
 )]
 mod tests {
@@ -240,8 +258,12 @@ allow_pre_security_callout: true
             "files_api_url should match"
         );
         assert_eq!(
-            validated.max_body_bytes, MAX_JSON_BODY_BYTES,
-            "max_body_bytes should default to 64 MiB"
+            validated.max_rewritten_body_bytes, MAX_JSON_BODY_BYTES,
+            "max_rewritten_body_bytes should default to 64 MiB"
+        );
+        assert_eq!(
+            validated.max_resolved_bytes, MAX_JSON_BODY_BYTES,
+            "max_resolved_bytes should default to 64 MiB"
         );
         assert_eq!(
             validated.timeout_ms, DEFAULT_TIMEOUT_MS,
@@ -272,7 +294,8 @@ allow_pre_security_callout: true
 forward_headers:
   - authorization
   - x-custom-tenant
-max_body_bytes: 1048576
+max_rewritten_body_bytes: 1048576
+max_resolved_bytes: 524288
 max_file_references: 16
 on_missing: reject
 timeout_ms: 10000
@@ -288,7 +311,11 @@ timeout_ms: 10000
             vec!["authorization", "x-custom-tenant"],
             "forward_headers should match"
         );
-        assert_eq!(validated.max_body_bytes, 1_048_576, "max_body_bytes should match");
+        assert_eq!(
+            validated.max_rewritten_body_bytes, 1_048_576,
+            "max_rewritten_body_bytes should match"
+        );
+        assert_eq!(validated.max_resolved_bytes, 524_288, "max_resolved_bytes should match");
         assert_eq!(validated.max_file_references, 16, "max_file_references should match");
         assert_eq!(validated.on_missing, OnMissing::Reject, "on_missing should match");
         assert_eq!(validated.timeout_ms, 10_000, "timeout_ms should match");
@@ -319,12 +346,32 @@ on_mising: reject"#;
     }
 
     #[test]
-    fn zero_max_body_bytes_rejected() {
+    fn zero_max_rewritten_body_bytes_rejected() {
         let yaml = r#"files_api_url: "http://files-api:8321"
-max_body_bytes: 0"#;
+max_rewritten_body_bytes: 0"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         let result = validate_config(cfg);
-        assert!(result.is_err(), "zero max_body_bytes should be rejected");
+        assert!(result.is_err(), "zero max_rewritten_body_bytes should be rejected");
+    }
+
+    #[test]
+    fn zero_max_resolved_bytes_rejected() {
+        let yaml = r#"files_api_url: "http://files-api:8321"
+max_resolved_bytes: 0"#;
+        let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
+        let result = validate_config(cfg);
+        assert!(result.is_err(), "zero max_resolved_bytes should be rejected");
+    }
+
+    #[test]
+    fn legacy_max_body_bytes_rejected_as_unknown_field() {
+        let yaml = r#"files_api_url: "http://files-api:8321"
+max_body_bytes: 1024"#;
+        let result: Result<FileResolveConfig, _> = serde_yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "legacy max_body_bytes should be rejected as an unknown field"
+        );
     }
 
     #[test]
@@ -376,7 +423,8 @@ timeout_ms: 300001"#;
             allow_pre_security_callout: true,
             files_api_url: "http://files-api:8321".to_owned(),
             forward_headers: Vec::new(),
-            max_body_bytes: MAX_JSON_BODY_BYTES,
+            max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
+            max_resolved_bytes: MAX_JSON_BODY_BYTES,
             max_file_references: DEFAULT_MAX_FILE_REFERENCES,
             on_missing: OnMissing::Continue,
             timeout_ms: DEFAULT_TIMEOUT_MS,
