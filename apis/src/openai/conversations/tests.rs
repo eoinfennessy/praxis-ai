@@ -3688,6 +3688,21 @@ impl ConversationItemStore for FailingItemStore {
         Ok(())
     }
 
+    async fn create_items_and_sync_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        if self.fail_create_items {
+            return Err(StoreError::Database("mock item insert failure".to_owned()));
+        }
+        if self.fail_message_sync {
+            return Err(StoreError::Database("mock message sync failure".to_owned()));
+        }
+        Ok(())
+    }
+
     async fn list_conversation_items(
         &self,
         _tenant_id: &str,
@@ -3737,6 +3752,15 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn max_item_position(&self, _tenant_id: &str, _conversation_id: &str) -> Result<i64, StoreError> {
         Ok(0)
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
     }
 }
 

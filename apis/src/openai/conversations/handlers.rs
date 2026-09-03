@@ -12,7 +12,9 @@ use serde::{
     de::{DeserializeOwned, MapAccess, Visitor, value::MapAccessDeserializer},
 };
 use serde_json::{Map, Value};
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(test)]
+use tracing::warn;
 
 use super::{
     contracts::{
@@ -41,6 +43,7 @@ use crate::{
 /// up on refreshing the cache. Each failed swap means another writer refreshed
 /// the cache first from the same authoritative rows, so a small bound absorbs
 /// realistic append contention.
+#[cfg(test)]
 const MAX_SYNC_ATTEMPTS: usize = 8;
 
 // -----------------------------------------------------------------------------
@@ -948,6 +951,7 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
 /// assumed to be small: the OpenAI contract has no cumulative item or byte
 /// ceiling. Replace this full-history rebuild with incremental processing; do
 /// not add a non-spec conversation limit as a workaround. Tracked in #532.
+#[cfg(test)]
 pub(super) async fn sync_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &str,
@@ -991,6 +995,7 @@ pub(super) async fn sync_conversation_messages(
 /// Returns `Ok(true)` when the cache is up to date — either already current or
 /// swapped in this call — and `Ok(false)` when a concurrent writer won the swap
 /// and the caller should retry with a freshly read snapshot.
+#[cfg(test)]
 async fn try_sync_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &str,
@@ -1025,6 +1030,7 @@ async fn try_sync_conversation_messages(
 }
 
 /// Collect all item JSON values for a conversation in ascending order.
+#[cfg(test)]
 async fn collect_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &str,
@@ -1725,6 +1731,17 @@ mod tests {
             self.inner.create_conversation_items(items).await
         }
 
+        async fn create_items_and_sync_messages(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            items: &[ConversationItemRecord],
+        ) -> Result<(), StoreError> {
+            self.inner
+                .create_items_and_sync_messages(tenant_id, conversation_id, items)
+                .await
+        }
+
         async fn list_conversation_items(
             &self,
             tenant_id: &str,
@@ -1791,6 +1808,17 @@ mod tests {
 
         async fn max_item_position(&self, tenant_id: &str, conversation_id: &str) -> Result<i64, StoreError> {
             self.inner.max_item_position(tenant_id, conversation_id).await
+        }
+
+        async fn delete_item_and_sync_messages(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            item_id: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner
+                .delete_item_and_sync_messages(tenant_id, conversation_id, item_id)
+                .await
         }
     }
 }
