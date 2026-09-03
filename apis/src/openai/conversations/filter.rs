@@ -526,10 +526,8 @@ impl HttpFilter for OpenaiConversationsFilter {
         // yields a 2xx followed by a reset — but either way the body is withheld.
         // `failure_mode: open` is an explicit operator opt-out of that guarantee:
         // the pipeline logs this error and converts it to Continue, releasing the
-        // body even though items were lost. Only pre-commit failures (item insertion
-        // and earlier) reach this `?`: a post-commit message-cache refresh failure
-        // is tolerated inside `persist_items` because the cache is a self-healing
-        // projection (see `refresh_message_cache`).
+        // body even though items were lost. Transactional item insertion and cache
+        // rebuild failures reach this `?` before any append-back bytes are released.
         self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items)
             .inspect_err(|e| warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed"))?;
 
