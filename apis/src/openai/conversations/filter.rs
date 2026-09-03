@@ -410,7 +410,6 @@ impl HttpFilter for OpenaiConversationsFilter {
         true
     }
 
-    #[expect(clippy::too_many_lines, reason = "dispatcher with one arm per endpoint")]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
             if should_append_back(ctx) {
