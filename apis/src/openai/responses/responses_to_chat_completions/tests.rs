@@ -98,7 +98,10 @@ fn oversized_rewritten_body_limit_is_rejected() {
 fn legacy_max_body_bytes_is_rejected() {
     let yaml = serde_yaml::from_str("max_body_bytes: 1048576").unwrap();
 
-    assert!(ResponsesToChatCompletionsFilter::from_config(&yaml).is_err());
+    assert!(
+        ResponsesToChatCompletionsFilter::from_config(&yaml).is_err(),
+        "legacy max_body_bytes should be rejected as an unknown field"
+    );
 }
 
 #[test]

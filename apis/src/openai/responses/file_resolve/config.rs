@@ -80,11 +80,19 @@ pub(crate) struct FileResolveConfig {
     #[serde(default = "default_max_rewritten_body_bytes")]
     pub max_rewritten_body_bytes: usize,
 
-    /// Maximum size in bytes of a single resolved file's content fetched
-    /// from the Files API or a remote URL (default 64 MiB).
+    /// Maximum total size in bytes of inline file content this filter
+    /// adds to one request (default 64 MiB).
     ///
-    /// Bounds each individual callout payload before it is inlined,
-    /// independently of the total rewritten body size.
+    /// Charged against the *encoded* inline form — base64 `file_data`
+    /// and `data:` URL `image_url` values — not the raw bytes fetched
+    /// from the Files API or remote URL, and shared as a single budget
+    /// across every reference resolved in the request rather than
+    /// applied per file. A file whose raw content would fit can still be
+    /// rejected once base64 expansion is counted, and several
+    /// individually small files can exhaust the budget together.
+    ///
+    /// Bounds inline expansion independently of the total rewritten body
+    /// size (`max_rewritten_body_bytes`).
     #[serde(default = "default_max_resolved_bytes")]
     pub max_resolved_bytes: usize,
 
@@ -118,7 +126,7 @@ fn default_max_rewritten_body_bytes() -> usize {
     MAX_JSON_BODY_BYTES
 }
 
-/// Default max resolved content bytes per reference (64 MiB).
+/// Default max total inline resolved bytes per request (64 MiB).
 fn default_max_resolved_bytes() -> usize {
     MAX_JSON_BODY_BYTES
 }
