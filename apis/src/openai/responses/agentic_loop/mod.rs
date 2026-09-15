@@ -150,7 +150,7 @@ use super::{
         DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
         current_round_file_search_admissions,
     },
-    stream_events::{encode_local_completion, encode_local_error},
+    stream_events::{encode_local_completion, encode_local_error, retained_stream_payload_bytes},
     usage::merge_usage,
     web_search::configured_max_calls_per_round as configured_web_max_calls,
 };
@@ -194,6 +194,7 @@ const META_STATUS: &str = "responses.status";
 /// ```yaml
 /// filter: openai_agentic_loop
 /// max_infer_iters: 10
+/// max_retained_bytes: 67108864
 /// ```
 ///
 /// # Example
@@ -255,6 +256,10 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if let Some(action) = admit_retained_payload_budget(ctx, self.config.max_retained_bytes)? {
+            return Ok(action);
+        }
+
         // Fail closed on an unsafe terminal-streaming configuration *before* any
         // upstream dispatch. Within each IRR round this filter's `on_request`
         // runs after `openai_responses_proxy` has selected the typed transport
@@ -301,29 +306,28 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
-            return Ok(FilterAction::Continue);
-        };
-
-        // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
-        // records a shared terminal outcome instead of committing a second terminal
-        // response. The sole loop owner converts it here — before preparing another
-        // inference request — into a buffered JSON rejection (pre-commitment) or a
-        // logical-stream SSE error (post-commitment). See issue #1046.
-        if let Some(failure) = state.dispatch_failure.take() {
-            return convert_dispatch_failure(ctx, state, &failure);
+        // StreamBuffer pre-read reaches this hook before `on_request`. Admit the
+        // starting state here so a deferred approval cannot execute first.
+        if let Some(action) = admit_retained_payload_budget(ctx, self.config.max_retained_bytes)? {
+            return Ok(action);
         }
-
-        if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
-            return finish_deferred_local_response(ctx, state);
+        // Defer the sole request-side mutation until the proxy, which follows
+        // every loop instance in canonical step order. This lets every instance
+        // lower the shared budget before local completion or dispatch can commit.
+        if ctx.extensions.get::<IterationState>().is_some() {
+            ctx.extensions.insert(DeferredAgenticRequestFinish);
+            Ok(FilterAction::Continue)
+        } else {
+            // Unit-level and defensive non-IRR invocation retains the historic
+            // direct behavior; production loop pipelines always carry IRR state.
+            finish_request_after_dispatch(ctx)
         }
-
-        prepare_iteration(ctx, &mut state);
-        trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
-        ctx.extensions.insert(state);
-        Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one ordered response extraction and loop-decision pipeline"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -334,15 +338,33 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
+        // Several conditionally composed loop instances may touch one request
+        // to contribute safety policy. Only the first response callback owns
+        // parsing and the loop transition; otherwise the same provider round is
+        // accumulated and charged once per configured instance.
+        let router_iteration = ctx.extensions.get::<IterationState>().map(IterationState::iteration);
+        if !claim_response_round(ctx, router_iteration) {
+            return Ok(FilterAction::Continue);
+        }
+
         let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
 
         if let Some(bytes) = body.as_ref() {
-            extract_tool_calls_from_body(bytes, &mut state);
-        } else if !prepare_streamed_round(ctx, &mut state)? {
-            ctx.extensions.insert(state);
-            return Ok(FilterAction::Continue);
+            if let Err(failure) = extract_tool_calls_from_body(bytes, &mut state) {
+                return finish_response_failure(ctx, state, &failure, true);
+            }
+        } else {
+            match prepare_streamed_round(ctx, &mut state) {
+                Ok(true) => {},
+                Ok(false) => {
+                    set_action(ctx, ACTION_DONE)?;
+                    ctx.extensions.insert(state);
+                    return Ok(FilterAction::Continue);
+                },
+                Err(failure) => return finish_response_failure(ctx, state, &failure, true),
+            }
         }
 
         if is_finish_reason_length(&state) {
@@ -354,13 +376,144 @@ impl HttpFilter for AgenticLoopFilter {
         }
 
         if let Err(failure) = prepare_dispatcher_round(ctx, &mut state) {
-            return finish_response_failure(ctx, state, &failure);
+            let retained_budget_failure = state.retained_payload_failed;
+            return finish_response_failure(ctx, state, &failure, retained_budget_failure);
+        }
+
+        let stream_payload_bytes = retained_stream_payload_bytes(ctx).unwrap_or(usize::MAX);
+        if !state.can_replace_retained_payload(0, 0, stream_payload_bytes) {
+            if request_is_streaming(&state) {
+                state.discard_payload_for_budget_error();
+            }
+            return finish_response_failure(ctx, state, &retained_payload_failure(), true);
         }
 
         let result = evaluate_loop_decision(ctx, &mut state, body, &self.config)?;
         ctx.extensions.insert(state);
         Ok(result)
     }
+}
+
+/// Marker consumed by `openai_responses_proxy` after every loop instance has
+/// admitted its configured retained-payload limit.
+struct DeferredAgenticRequestFinish;
+
+/// Claim sole ownership of one IRR provider response while allowing every
+/// configured loop instance to participate in request-side budget admission.
+fn claim_response_round(ctx: &mut HttpFilterContext<'_>, iteration: Option<u32>) -> bool {
+    let Some(iteration) = iteration else {
+        return true;
+    };
+    let marker = iteration.to_string();
+    if ctx.get_metadata("responses.agentic_response_processed_iteration") == Some(marker.as_str()) {
+        return false;
+    }
+    ctx.set_metadata("responses.agentic_response_processed_iteration", marker);
+    true
+}
+
+/// Return whether request-side loop preparation is waiting for the proxy.
+pub(crate) fn request_finish_is_deferred(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<DeferredAgenticRequestFinish>().is_some()
+}
+
+/// Complete request-side loop preparation after all local dispatchers ran.
+fn finish_request_after_dispatch(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
+        return Ok(FilterAction::Continue);
+    };
+
+    // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
+    // records a shared terminal outcome instead of committing a second terminal
+    // response. The sole loop owner converts it here — before preparing another
+    // inference request — into a buffered JSON rejection (pre-commitment) or a
+    // logical-stream SSE error (post-commitment). See issue #1046.
+    if let Some(failure) = state.dispatch_failure.take() {
+        return convert_dispatch_failure(ctx, state, &failure);
+    }
+
+    if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
+        return finish_deferred_local_response(ctx, state);
+    }
+
+    prepare_iteration(ctx, &mut state);
+    trace!(
+        iteration = state.iteration,
+        "openai_agentic_loop request dispatch complete"
+    );
+    ctx.extensions.insert(state);
+    Ok(FilterAction::Continue)
+}
+
+/// Complete the first request after MCP execution was deferred past all budget
+/// admissions in the `StreamBuffer` pre-read phase.
+pub(crate) fn finish_request_after_deferred_dispatch(
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<FilterAction, FilterError> {
+    ctx.extensions.remove::<DeferredAgenticRequestFinish>();
+    finish_request_after_dispatch(ctx)
+}
+
+/// Apply the request-wide retained-payload limit before any local dispatcher
+/// side effect or upstream inference request.
+#[expect(clippy::too_many_lines, reason = "shared initial and continuation budget admission")]
+fn admit_retained_payload_budget(
+    ctx: &mut HttpFilterContext<'_>,
+    configured_limit: usize,
+) -> Result<Option<FilterAction>, FilterError> {
+    let stream_payload_bytes = retained_stream_payload_bytes(ctx).unwrap_or(usize::MAX);
+    let store_payload_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
+    let mut retained_overflow = None;
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.apply_retained_payload_limit(configured_limit);
+        state.set_retained_external_payload_bytes(store_payload_bytes);
+        if !state.can_replace_retained_payload(0, 0, stream_payload_bytes) {
+            let initial = state.iteration == 0;
+            let streaming = request_is_streaming(state);
+            state.discard_payload_for_budget_error();
+            retained_overflow = Some((initial, streaming));
+        }
+    }
+    let Some((initial, streaming)) = retained_overflow else {
+        return Ok(None);
+    };
+
+    ctx.set_metadata("responses.skip_persist", "true");
+    set_action(ctx, ACTION_DONE)?;
+    if initial {
+        // The terminal 413 cannot persist or dispatch anything. Release the
+        // sibling store snapshot as well as the shared response state so an
+        // oversized rejected request does not remain live for the response
+        // lifetime.
+        super::store::discard_retained_request_payload(ctx);
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.set_retained_external_payload_bytes(0);
+        }
+        return Ok(Some(FilterAction::Reject(responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+        ))));
+    }
+    if streaming {
+        let body = encode_local_error(
+            ctx,
+            "server_error",
+            "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+        );
+        let mut rejection = Rejection::status(200)
+            .with_header("content-type", "text/event-stream")
+            .preserving_keepalive();
+        if let Some(body) = body {
+            rejection = rejection.with_body(body);
+        }
+        return Ok(Some(FilterAction::Reject(rejection)));
+    }
+    Ok(Some(FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+    ))))
 }
 
 /// Apply dispatcher-specific response validation before the sole loop decision.
@@ -387,10 +540,20 @@ fn finish_response_failure(
     ctx: &mut HttpFilterContext<'_>,
     mut state: ResponsesState,
     failure: &DispatchFailure,
+    retained_budget_failure: bool,
 ) -> Result<FilterAction, FilterError> {
+    // Every terminal response drops this round's dispatcher selections, but only
+    // a retained-payload overflow may discard pending local synthesis and mark
+    // the request as budget-failed. Dispatcher validation/execution failures
+    // must leave already-executed tool events available to the stream finalizer.
     state.tool_calls.clear();
     state.web_search_calls.clear();
     state.file_search_assignments.clear();
+    if retained_budget_failure {
+        state.fail_retained_payload_budget();
+    }
+    ctx.set_metadata("responses.skip_persist", "true");
+    set_action(ctx, ACTION_DONE)?;
     if request_is_streaming(&state) {
         end_stream_with_error(ctx, &mut state, failure.code, &failure.message)?;
         ctx.extensions.insert(state);
@@ -405,6 +568,10 @@ fn finish_response_failure(
 }
 
 /// Complete a locally terminal round after every request-side dispatcher ran.
+#[expect(
+    clippy::too_many_lines,
+    reason = "shared buffered and streaming local terminal construction"
+)]
 fn finish_deferred_local_response(
     ctx: &mut HttpFilterContext<'_>,
     mut state: ResponsesState,
@@ -417,6 +584,10 @@ fn finish_deferred_local_response(
     let streaming = request_is_streaming(&state);
     let mut body = None;
     if !streaming && let Err(rejection) = state.finalize_response_body(&mut body) {
+        if state.retained_payload_failed {
+            ctx.set_metadata("responses.skip_persist", "true");
+            set_action(ctx, ACTION_DONE)?;
+        }
         ctx.extensions.insert(state);
         return Ok(rejection);
     }
@@ -501,6 +672,10 @@ fn finish_incomplete_round(
     // `request_is_streaming`). Only the buffered path serializes into `body`.
     let rewrites_buffered_body = !request_is_streaming(&state) && state.response_object.is_object();
     if rewrites_buffered_body && let Err(rejection) = state.finalize_response_body(body) {
+        if state.retained_payload_failed {
+            ctx.set_metadata("responses.skip_persist", "true");
+            set_action(ctx, ACTION_DONE)?;
+        }
         ctx.extensions.insert(state);
         return Ok(rejection);
     }
@@ -532,9 +707,9 @@ fn reject_mixed_ownership_round(
 }
 
 /// Collect an authoritative successful stream or terminate without dispatch.
-fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<bool, FilterError> {
+fn prepare_streamed_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<bool, DispatchFailure> {
     if !super::streamed_round_is_dispatchable(ctx, state) {
-        collect_streaming_output_items(state);
+        collect_streaming_output_items(state)?;
         state.tool_calls.clear();
         state.web_search_calls.clear();
         // No dispatcher runs on a non-dispatchable (terminal) round, so drop the
@@ -542,10 +717,9 @@ fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut Responses
         // those items, so `openai_stream_events` must not synthesize a lifecycle.
         state.file_search_assignments.clear();
         state.pending_local_tool_synthesis.clear();
-        set_action(ctx, ACTION_DONE)?;
         return Ok(false);
     }
-    collect_streaming_output_items(state);
+    collect_streaming_output_items(state)?;
     Ok(true)
 }
 
@@ -685,6 +859,7 @@ fn has_dispatchable_calls(state: &ResponsesState) -> bool {
 
 /// Decide the loop outcome: done (no dispatchable tool calls or model-owned
 /// finish), 508 (iteration limit), or loop (continue to tool execution).
+#[expect(clippy::too_many_lines, reason = "transactional terminal and continuation decisions")]
 fn evaluate_loop_decision(
     ctx: &mut HttpFilterContext<'_>,
     state: &mut ResponsesState,
@@ -699,6 +874,10 @@ fn evaluate_loop_decision(
         // `request_is_streaming`). Only the buffered path finalizes into `body`.
         let rewrites_buffered_body = !request_is_streaming(state) && state.response_object.is_object();
         if rewrites_buffered_body && let Err(rejection) = state.finalize_response_body(body) {
+            if state.retained_payload_failed {
+                ctx.set_metadata("responses.skip_persist", "true");
+                set_action(ctx, ACTION_DONE)?;
+            }
             return Ok(rejection);
         }
         if rewrites_buffered_body {
@@ -771,15 +950,37 @@ fn end_at_iteration_limit(
 
 /// Extract completed function-call items from a non-streaming response body
 /// and populate `state.tool_calls` and `state.messages`.
-fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "transactional parse, normalization, and retention admission"
+)]
+fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
+    // The framework owns and separately bounds the raw response body. Only the
+    // parsed response and the copies retained by agentic-loop state belong in
+    // this aggregate budget. The body length is an allocation-free upper bound
+    // for the parsed value's compact JSON payload, so reserve that projection
+    // before serde allocates it. The exact retained-owner accounting below runs
+    // after normalization and ID insertion without charging the framework body.
+    if !state.can_retain_payload(body.len()) {
+        return Err(retained_payload_failure());
+    }
     let response = serde_json::from_slice::<Value>(body)
         .ok()
         .filter(is_responses_api_output);
     let Some(mut response) = response else {
         state.response_object = Value::Null;
         state.tool_calls.clear();
-        return;
+        return Ok(());
     };
+    let normalization_staging = output_normalization_staging_bytes(&response, has_file_search_tool(state))
+        .ok_or_else(retained_payload_failure)?;
+    if !body
+        .len()
+        .checked_add(normalization_staging)
+        .is_some_and(|bytes| state.can_retain_payload(bytes))
+    {
+        return Err(retained_payload_failure());
+    }
     // Normalize private `function_call(name=file_search)` into canonical
     // `file_search_call`, gated on an actually configured hosted file-search
     // tool. The returned round-local indices identify the normalized items so
@@ -793,11 +994,125 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
     // so the public response never ships an item without an id (issue #955). Runs
     // after normalization so translated file-search calls are seen as such.
     ensure_public_output_item_ids_in_response(&mut response);
+    if !buffered_response_retention_fits(state, &response) {
+        return Err(retained_payload_failure());
+    }
     collect_output_items(&response, state, &private_indices);
     if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
         merge_usage(&mut state.usage, usage);
     }
     state.response_object = response;
+    Ok(())
+}
+
+/// Preflight every independently owned value retained from one buffered model
+/// response, including parser-local bytes that remain live through the commit.
+/// The parsed response remains local until this succeeds, so an oversized round
+/// commits no state mutation.
+#[expect(clippy::too_many_lines, reason = "exhaustive per-owner buffered response accounting")]
+fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) -> bool {
+    let Some(response_bytes) = super::state::retained_json_bytes(response) else {
+        return false;
+    };
+    let Some(old_response_bytes) = super::state::retained_json_bytes(&state.response_object) else {
+        return false;
+    };
+    let Some(old_usage_bytes) = super::state::retained_json_bytes(&state.usage) else {
+        return false;
+    };
+
+    // The parsed response and this helper's usage projection coexist with all
+    // prior-round state. Admit that construction peak before cloning usage.
+    if !state.can_retain_payload(response_bytes.saturating_add(old_usage_bytes)) {
+        return false;
+    }
+
+    let mut merged_usage = state.usage.clone();
+    if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
+        merge_usage(&mut merged_usage, usage);
+    }
+    let Some(new_usage_bytes) = super::state::retained_json_bytes(&merged_usage) else {
+        return false;
+    };
+    let mut copied_item_bytes = 0_usize;
+
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        let peak_added = response_bytes.saturating_add(new_usage_bytes.saturating_sub(old_usage_bytes));
+        let final_removed = old_response_bytes.saturating_add(old_usage_bytes);
+        let final_added = response_bytes.saturating_add(new_usage_bytes);
+        return state.can_retain_payload(peak_added)
+            && state.can_replace_retained_payload(final_removed, final_added, 0);
+    };
+    for item in output {
+        let Some(bytes) = super::state::retained_json_bytes(item) else {
+            return false;
+        };
+        // Every item enters accumulated_output. History and dispatcher owners
+        // are charged separately according to the same classification used by
+        // collect_output_items below.
+        let copies = match item.get("type").and_then(Value::as_str) {
+            Some("function_call")
+                if item
+                    .get("status")
+                    .is_none_or(|status| status.is_null() || status.as_str() == Some("completed")) =>
+            {
+                4
+            },
+            Some("reasoning" | "web_search_call") => 3,
+            Some("file_search_call") => 2,
+            _ => 1,
+        };
+        copied_item_bytes = copied_item_bytes.saturating_add(bytes.saturating_mul(copies));
+    }
+    // `collect_output_items` creates the copied owners while both the parsed
+    // response and the previous response tree are still live. Only the final
+    // assignment releases the previous tree, so both the mutation peak and the
+    // final replacement must fit independently.
+    let peak_added = response_bytes
+        .saturating_add(copied_item_bytes)
+        .saturating_add(new_usage_bytes.saturating_sub(old_usage_bytes));
+    let final_removed = old_response_bytes.saturating_add(old_usage_bytes);
+    let final_added = response_bytes
+        .saturating_add(new_usage_bytes)
+        .saturating_add(copied_item_bytes);
+    state.can_retain_payload(peak_added) && state.can_replace_retained_payload(final_removed, final_added, 0)
+}
+
+/// Shared server-side failure for payload growth after initial admission.
+fn retained_payload_failure() -> DispatchFailure {
+    DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
+    }
+}
+
+/// Bound payload allocated while provider output is normalized in place.
+///
+/// Private file-search translation parses the arguments JSON and clones its
+/// decoded queries before removing the original argument string. Two argument
+/// lengths cover the parsed tree plus decoded-query owner; call-id copies and
+/// fixed rewritten fields are charged separately. Synthetic public IDs are
+/// bounded without formatting them first.
+fn output_normalization_staging_bytes(response: &Value, translate_file_search: bool) -> Option<usize> {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return Some(0);
+    };
+    output.iter().try_fold(0_usize, |used, item| {
+        let mut added = 0_usize;
+        if translate_file_search && is_file_search_function_call(item) {
+            let arguments = item.get("arguments").and_then(Value::as_str).map_or(0, str::len);
+            let call_id = item.get("call_id").and_then(Value::as_str).map_or(0, str::len);
+            added = arguments
+                .checked_mul(2)?
+                .checked_add(call_id.checked_mul(2)?)?
+                .checked_add(256)?;
+        }
+        if item.get("id").and_then(Value::as_str).is_none_or(str::is_empty) {
+            added = added.checked_add(64)?;
+        }
+        used.checked_add(added)
+    })
 }
 
 /// Return whether one model round mixed server-owned MCP, web-search, or pending
@@ -960,7 +1275,13 @@ fn terminalize_file_search_item(state: &mut ResponsesState, index: usize) {
     clippy::too_many_lines,
     reason = "linear per-item classification of the streamed round"
 )]
-fn collect_streaming_output_items(state: &mut ResponsesState) {
+fn collect_streaming_output_items(state: &mut ResponsesState) -> Result<(), DispatchFailure> {
+    let normalization_staging = output_normalization_staging_bytes(&state.response_object, has_file_search_tool(state))
+        .ok_or_else(retained_payload_failure)?;
+    if !state.can_retain_payload(normalization_staging) {
+        state.discard_payload_for_budget_error();
+        return Err(retained_payload_failure());
+    }
     // Normalize private file-search `function_call`s in the streamed response
     // object before draining it. The returned round-local indices tag the
     // synthesis origin (private openings were suppressed live and must be
@@ -984,6 +1305,10 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
     // Stamp stable synthetic IDs on any id-less streamed items before draining the
     // round into the accumulator (issue #955), mirroring the buffered path.
     ensure_public_output_item_ids_in_response(&mut state.response_object);
+    if !streaming_collection_retention_fits(state) {
+        state.discard_payload_for_budget_error();
+        return Err(retained_payload_failure());
+    }
     let base = state.accumulated_output.len();
     state.current_round_output_start = Some(base);
     // Move the round out (leaving a valid `[]`), so each item is routed to its
@@ -1038,6 +1363,36 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
         }
     }
     record_file_search_assignments(state, pending_file_search);
+    Ok(())
+}
+
+/// Preflight the new owners created when the canonical streamed response output
+/// is drained into the cross-round accumulator and classified for dispatch.
+fn streaming_collection_retention_fits(state: &ResponsesState) -> bool {
+    let Some(output) = state.response_object.get("output").and_then(Value::as_array) else {
+        return true;
+    };
+    let Some(response_bytes) = super::state::retained_json_bytes(&state.response_object) else {
+        return false;
+    };
+    let Some(output_array_bytes) = super::bounded_json_size(output, usize::MAX).ok().flatten() else {
+        return false;
+    };
+    let drained_response_bytes = response_bytes.saturating_sub(output_array_bytes).saturating_add(2);
+    let mut added = drained_response_bytes;
+    for item in output {
+        let Some(bytes) = super::state::retained_json_bytes(item) else {
+            return false;
+        };
+        let copies = match item.get("type").and_then(Value::as_str) {
+            Some("function_call" | "reasoning" | "web_search_call") => 3,
+            Some("file_search_call") => 2,
+            _ => 1,
+        };
+        added = added.saturating_add(bytes.saturating_mul(copies));
+    }
+    // The old response tree is replaced by the same tree with an empty output.
+    state.can_replace_retained_payload(response_bytes, added, 0)
 }
 
 /// Check whether a parsed response is a valid Responses API output.

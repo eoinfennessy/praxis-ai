@@ -935,6 +935,55 @@ async fn on_response_body_releases_when_skip_persist_is_true() {
     );
 }
 
+#[test]
+fn retained_request_payload_counts_store_input_snapshot() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let input = json!([{"role": "user", "content": "retained by store"}]);
+    ctx.set_metadata(
+        "responses.store_request_payload_bytes",
+        crate::openai::responses::state::retained_json_bytes(&input)
+            .unwrap()
+            .to_string(),
+    );
+
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        crate::openai::responses::state::retained_json_bytes(&input)
+    );
+}
+
+#[test]
+fn persistence_construction_is_rejected_before_payload_clones() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let input = json!([{"role": "user", "content": "request input"}]);
+    let input_bytes = crate::openai::responses::state::retained_json_bytes(&input).unwrap();
+    ctx.set_metadata("responses.store_request_payload_bytes", input_bytes.to_string());
+    let mut state = ResponsesState {
+        response_object: json!({
+            "id": "resp_budget",
+            "created_at": 1,
+            "model": "test",
+            "output": [{"type": "message", "content": "x".repeat(1_024)}],
+        }),
+        persisted_messages: vec![json!({"role": "assistant", "content": "x".repeat(1_024)})],
+        ..ResponsesState::default()
+    };
+    state.set_retained_external_payload_bytes(input_bytes);
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current);
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&state.response_object).unwrap();
+    ctx.extensions.insert(state);
+
+    assert!(!super::filter::persistence_construction_fits(&ctx, response_bytes));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        !state.retained_payload_failed,
+        "preflight must not mutate canonical state"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_releases_streaming_request_before_eos() {
     let filter = make_filter();

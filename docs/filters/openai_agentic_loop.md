@@ -13,7 +13,8 @@ Manages iteration bookkeeping in `on_request_body`, extracts tool calls from non
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. |
+| `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. Must be between 1 and [`MAX_ITERATIONS_CEILING`] (currently 100); defaults to 10. |
+| `max_retained_bytes` | integer | no | Maximum aggregate payload bytes retained by the Responses agentic execution. Counts compact JSON for each independently owned value and raw bytes for owned strings and streaming buffers. When several loop filters touch one request, the smallest configured value wins. Valid from 4 `KiB` through the non-disableable 256 `MiB` ceiling; defaults to 64 `MiB`. |
 
 ## Examples
 
@@ -28,4 +29,5 @@ filter: openai_agentic_loop
 ```yaml
 filter: openai_agentic_loop
 max_infer_iters: 10
+max_retained_bytes: 67108864
 ```

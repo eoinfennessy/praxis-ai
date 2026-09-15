@@ -162,7 +162,7 @@ pub(crate) struct VectorStoreSearchResponse {
 }
 
 /// Single search result from a vector store.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SearchResult {
     /// Optional attributes.
     #[serde(default)]
@@ -182,7 +182,7 @@ pub(crate) struct SearchResult {
 }
 
 /// Content chunk within a search result.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ContentChunk {
     /// Chunk type.
     #[serde(rename = "type")]
@@ -193,7 +193,8 @@ pub(crate) struct ContentChunk {
 }
 
 /// Supported vector-store content chunk type.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum ContentChunkType {
     /// Plain text chunk.
     Text,
@@ -257,6 +258,16 @@ pub(crate) enum FileSearchError {
         /// Vector store ID.
         store_id: String,
     },
+
+    /// Aggregate response admission was exhausted before decoding.
+    AggregateLimit {
+        /// Active aggregate byte limit.
+        limit: usize,
+        /// Whether the request-wide retained-payload budget selected the limit.
+        retained_payload: bool,
+        /// Vector store ID.
+        store_id: String,
+    },
 }
 
 impl fmt::Display for FileSearchError {
@@ -276,11 +287,29 @@ impl fmt::Display for FileSearchError {
                     "invalid vector-store response from store {store_id:?} at line {line}, column {column}"
                 )
             },
+            Self::AggregateLimit {
+                limit,
+                retained_payload: _,
+                store_id,
+            } => write!(
+                f,
+                "callout to store {store_id:?} failed: aggregate response body limit of {limit} bytes reached"
+            ),
         }
     }
 }
 
 impl std::error::Error for FileSearchError {}
+
+impl FileSearchError {
+    /// Count strings retained by a batch failure while the batch is staged.
+    fn staging_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Callout { message, store_id } => message.len().checked_add(store_id.len()),
+            Self::Deserialize { store_id, .. } | Self::AggregateLimit { store_id, .. } => Some(store_id.len()),
+        }
+    }
+}
 
 /// One failed vector-store search.
 #[derive(Debug)]
@@ -328,6 +357,34 @@ impl SearchBatch {
         for results in &mut self.results_by_call {
             results.sort_by(|left, right| right.score.total_cmp(&left.score));
         }
+    }
+
+    /// Count payload owned by the decoded batch while a dispatcher commit is
+    /// staged. The batch is borrowed by the commit path, so these values remain
+    /// live alongside the newly formatted state owners.
+    pub(super) fn staging_bytes(&self) -> Option<usize> {
+        let result_bytes = self.results_by_call.iter().try_fold(0_usize, |total, results| {
+            results.iter().try_fold(total, |total, result| {
+                crate::openai::responses::state::retained_json_bytes(result).and_then(|bytes| total.checked_add(bytes))
+            })
+        });
+        let failure_bytes = self.failures.iter().try_fold(0_usize, |total, failure| {
+            total.checked_add(failure.error.staging_bytes()?)
+        });
+        result_bytes?.checked_add(failure_bytes?)
+    }
+
+    /// Whether request-wide admission stopped a response before decoding.
+    pub(super) fn retained_payload_overflow(&self) -> bool {
+        self.failures.iter().any(|failure| {
+            matches!(
+                failure.error,
+                FileSearchError::AggregateLimit {
+                    retained_payload: true,
+                    ..
+                }
+            )
+        })
     }
 }
 
@@ -380,21 +437,50 @@ impl FileSearchClient {
     }
 
     /// Search multiple vector stores with bounded concurrency and aggregation.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "deadline, budget, and failure policy share one scheduling loop"
-    )]
     pub async fn search(
         &self,
         specs: &[SearchSpec<'_>],
         call_count: usize,
         request_headers: &HeaderMap,
     ) -> SearchBatch {
+        self.search_with_retained_limit(specs, call_count, request_headers, usize::MAX)
+            .await
+    }
+
+    /// Search with a request-scoped ceiling for decoded result payload.
+    ///
+    /// The ceiling is applied to response bodies before deserialization because
+    /// their length is an allocation-free upper bound for the compact payload
+    /// retained by the decoded result tree. Half of the request-scoped allowance
+    /// is reserved for collected bodies and half for decoded values, since both
+    /// owners coexist while `serde` parses each response.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deadline, compatibility budget, and retained budget share one scheduling loop"
+    )]
+    pub(super) async fn search_with_retained_limit(
+        &self,
+        specs: &[SearchSpec<'_>],
+        call_count: usize,
+        request_headers: &HeaderMap,
+        max_decoded_bytes: usize,
+    ) -> SearchBatch {
         let mut batch = SearchBatch::new(call_count);
         let mut consumed_response_bytes = 0_usize;
         let mut deadline_recorded = false;
         let mut next_spec = 0_usize;
         let execution_started = Instant::now();
+        let (total_response_limit, retained_payload_controls_limit) =
+            retained_response_body_limit(self.max_total_response_bytes, max_decoded_bytes);
+        if total_response_limit == 0 {
+            append_budget_failures(
+                &mut batch.failures,
+                specs,
+                total_response_limit,
+                retained_payload_controls_limit,
+            );
+            return batch;
+        }
         let admission = match self.acquire_execution_admission(specs.len(), execution_started).await {
             Ok(admission) => admission,
             Err(message) => {
@@ -411,10 +497,16 @@ impl FileSearchClient {
                 break;
             }
 
-            let chunk_len = self.reserved_chunk_len(consumed_response_bytes, specs.len() - next_spec);
+            let chunk_len =
+                self.reserved_chunk_len(consumed_response_bytes, specs.len() - next_spec, total_response_limit);
             if chunk_len == 0 {
                 if let Some(remaining_specs) = specs.get(next_spec..) {
-                    append_budget_failures(&mut batch.failures, remaining_specs, self.max_total_response_bytes);
+                    append_budget_failures(
+                        &mut batch.failures,
+                        remaining_specs,
+                        total_response_limit,
+                        retained_payload_controls_limit,
+                    );
                 }
                 break;
             }
@@ -422,16 +514,26 @@ impl FileSearchClient {
             let Some(chunk) = specs.get(next_spec..next_spec.saturating_add(chunk_len)) else {
                 break;
             };
-            let futures = chunk
-                .iter()
-                .map(|spec| self.search_one(spec, execution_started, Arc::clone(&admission), request_headers));
+            let remaining_decode_bytes = total_response_limit.saturating_sub(consumed_response_bytes);
+            let per_response_decode_limit = self.max_response_bytes.min(remaining_decode_bytes);
+            let futures = chunk.iter().map(|spec| {
+                self.search_one(
+                    spec,
+                    execution_started,
+                    Arc::clone(&admission),
+                    request_headers,
+                    per_response_decode_limit,
+                    retained_payload_controls_limit,
+                )
+            });
             let chunk_results = futures::future::join_all(futures).await;
             let chunk_failed = merge_chunk_results(
                 &mut batch,
                 &mut consumed_response_bytes,
                 chunk,
                 chunk_results,
-                self.max_total_response_bytes,
+                total_response_limit,
+                retained_payload_controls_limit,
             );
 
             next_spec = next_spec.saturating_add(chunk_len);
@@ -456,12 +558,18 @@ impl FileSearchClient {
     }
 
     /// Search a single vector store.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "deadline and two independent response admissions stay explicit"
+    )]
     async fn search_one(
         &self,
         spec: &SearchSpec<'_>,
         execution_started: Instant,
         response_admission: Arc<ResponseAdmission>,
         request_headers: &HeaderMap,
+        max_decoded_bytes: usize,
+        retained_payload_controls_limit: bool,
     ) -> Result<SearchResponse, FileSearchError> {
         deadline_remaining(self.timeout, execution_started, spec.store_id)?;
         let request = self.build_request(spec, execution_started)?;
@@ -469,6 +577,13 @@ impl FileSearchClient {
         let body = self
             .execute_request(request, spec.store_id, execution_started, request_headers)
             .await?;
+        if body.len() > max_decoded_bytes {
+            return Err(aggregate_limit_error(
+                spec.store_id,
+                max_decoded_bytes,
+                retained_payload_controls_limit,
+            ));
+        }
         parse_response_body_with_deadline(
             body,
             spec.store_id,
@@ -555,11 +670,20 @@ impl FileSearchClient {
     }
 
     /// Calculate a chunk whose worst-case bodies fit the remaining budget.
-    fn reserved_chunk_len(&self, consumed_bytes: usize, remaining_specs: usize) -> usize {
-        let remaining_bytes = self.max_total_response_bytes.saturating_sub(consumed_bytes);
-        (remaining_bytes / self.max_response_bytes)
-            .min(MAX_CONCURRENT_SEARCHES)
-            .min(remaining_specs)
+    fn reserved_chunk_len(&self, consumed_bytes: usize, remaining_specs: usize, total_limit: usize) -> usize {
+        let remaining_bytes = total_limit.saturating_sub(consumed_bytes);
+        if remaining_bytes == 0 {
+            return 0;
+        }
+        // Reserve the configured worst-case body for every scheduled request.
+        // When the request-scoped aggregate cap is itself smaller, admit only
+        // the first request with that smaller decode ceiling.
+        let reserved = if total_limit < self.max_response_bytes {
+            usize::from(consumed_bytes == 0)
+        } else {
+            remaining_bytes / self.max_response_bytes
+        };
+        reserved.min(MAX_CONCURRENT_SEARCHES).min(remaining_specs)
     }
 
     /// Build a search URL without treating a store ID as path syntax.
@@ -581,6 +705,20 @@ impl FileSearchClient {
             .resource_url("v1/vector_stores", store_id, Some("search"))
             .map_err(|error| request_error(store_id, error.to_string()))
     }
+}
+
+/// Intersect the compatibility response-body ceiling with the aggregate
+/// retained-payload allowance.
+///
+/// A collected body remains live while its decoded result tree is built. Body
+/// length bounds the compact decoded payload, so limiting the sum of collected
+/// bodies to half the available aggregate bytes admits both simultaneous owners.
+fn retained_response_body_limit(configured_limit: usize, available_bytes: usize) -> (usize, bool) {
+    if available_bytes == usize::MAX {
+        return (configured_limit, false);
+    }
+    let retained_limit = available_bytes / RESPONSE_DECODE_MEMORY_MULTIPLIER;
+    (configured_limit.min(retained_limit), retained_limit <= configured_limit)
 }
 
 // -----------------------------------------------------------------------------
@@ -921,16 +1059,28 @@ fn fixup_file_id(result: &mut SearchResult) {
 }
 
 /// Merge one bounded concurrency chunk into the aggregate batch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "chunk merge carries compatibility and retained-budget provenance"
+)]
 fn merge_chunk_results(
     batch: &mut SearchBatch,
     consumed_bytes: &mut usize,
     specs: &[SearchSpec<'_>],
     results: Vec<Result<SearchResponse, FileSearchError>>,
     total_limit: usize,
+    retained_payload_controls_limit: bool,
 ) -> bool {
     let mut failed = false;
     for (spec, result) in specs.iter().zip(results) {
-        let result = merge_search_result(batch, consumed_bytes, spec, result, total_limit);
+        let result = merge_search_result(
+            batch,
+            consumed_bytes,
+            spec,
+            result,
+            total_limit,
+            retained_payload_controls_limit,
+        );
         if let Err(error) = result {
             failed = true;
             batch.failures.push(SearchFailure {
@@ -943,22 +1093,27 @@ fn merge_chunk_results(
 }
 
 /// Account for and retain only the top results from one response.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "result merge carries compatibility and retained-budget provenance"
+)]
 fn merge_search_result(
     batch: &mut SearchBatch,
     consumed_bytes: &mut usize,
     spec: &SearchSpec<'_>,
     response: Result<SearchResponse, FileSearchError>,
     total_limit: usize,
+    retained_payload_controls_limit: bool,
 ) -> Result<(), FileSearchError> {
     let body_bytes = match &response {
         Ok(response) => response.body_bytes,
         Err(FileSearchError::Deserialize { body_bytes, .. }) => *body_bytes,
-        Err(FileSearchError::Callout { .. }) => 0,
+        Err(FileSearchError::Callout { .. } | FileSearchError::AggregateLimit { .. }) => 0,
     };
     let total = consumed_bytes
         .checked_add(body_bytes)
         .filter(|total| *total <= total_limit)
-        .ok_or_else(|| aggregate_limit_error(spec.store_id, total_limit))?;
+        .ok_or_else(|| aggregate_limit_error(spec.store_id, total_limit, retained_payload_controls_limit))?;
     *consumed_bytes = total;
 
     let SearchResponse { body_bytes: _, data } = response?;
@@ -984,10 +1139,15 @@ fn append_admission_failures(failures: &mut Vec<SearchFailure>, specs: &[SearchS
 }
 
 /// Append one aggregate-budget failure for each unexecuted spec.
-fn append_budget_failures(failures: &mut Vec<SearchFailure>, specs: &[SearchSpec<'_>], limit: usize) {
+fn append_budget_failures(
+    failures: &mut Vec<SearchFailure>,
+    specs: &[SearchSpec<'_>],
+    limit: usize,
+    retained_payload: bool,
+) {
     failures.extend(specs.iter().map(|spec| SearchFailure {
         call_index: spec.call_index,
-        error: aggregate_limit_error(spec.store_id, limit),
+        error: aggregate_limit_error(spec.store_id, limit, retained_payload),
     }));
 }
 
@@ -1018,11 +1178,12 @@ fn append_fail_closed_failures(failures: &mut Vec<SearchFailure>, specs: &[Searc
 }
 
 /// Build an aggregate-budget error.
-fn aggregate_limit_error(store_id: &str, limit: usize) -> FileSearchError {
-    request_error(
-        store_id,
-        format!("aggregate response body limit of {limit} bytes reached"),
-    )
+fn aggregate_limit_error(store_id: &str, limit: usize, retained_payload: bool) -> FileSearchError {
+    FileSearchError::AggregateLimit {
+        limit,
+        retained_payload,
+        store_id: bounded_store_id(store_id),
+    }
 }
 
 /// Merge response results without retaining more than the final top-k.
@@ -1074,8 +1235,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        FileSearchError, SearchResult, SearchSpec, VectorStoreSearchRequest, append_unprocessed_deadline_failures,
-        deserialize_search_results, merge_top_results, parse_response_body, response_admission_units,
+        FileSearchError, SearchBatch, SearchFailure, SearchResult, SearchSpec, VectorStoreSearchRequest,
+        append_unprocessed_deadline_failures, deserialize_search_results, merge_top_results, parse_response_body,
+        response_admission_units, retained_response_body_limit,
     };
 
     fn decode(body: &[u8], limit: usize) -> Result<Vec<SearchResult>, serde_json::Error> {
@@ -1102,6 +1264,44 @@ mod tests {
             ranking_options: None,
             store_id,
         }
+    }
+
+    #[test]
+    fn retained_budget_limit_is_distinct_from_file_search_compatibility_limit() {
+        let retained = SearchBatch::with_failures(
+            1,
+            vec![SearchFailure {
+                call_index: 0,
+                error: FileSearchError::AggregateLimit {
+                    limit: 4_096,
+                    retained_payload: true,
+                    store_id: "vs-retained".to_owned(),
+                },
+            }],
+        );
+        let compatibility = SearchBatch::with_failures(
+            1,
+            vec![SearchFailure {
+                call_index: 0,
+                error: FileSearchError::AggregateLimit {
+                    limit: 4_096,
+                    retained_payload: false,
+                    store_id: "vs-compatibility".to_owned(),
+                },
+            }],
+        );
+
+        assert!(retained.retained_payload_overflow());
+        drop(retained);
+        assert!(!compatibility.retained_payload_overflow());
+        drop(compatibility);
+    }
+
+    #[test]
+    fn retained_budget_reserves_raw_and_decoded_response_owners() {
+        assert_eq!(retained_response_body_limit(8_192, usize::MAX), (8_192, false));
+        assert_eq!(retained_response_body_limit(8_192, 4_096), (2_048, true));
+        assert_eq!(retained_response_body_limit(1_024, 4_096), (1_024, false));
     }
 
     #[test]

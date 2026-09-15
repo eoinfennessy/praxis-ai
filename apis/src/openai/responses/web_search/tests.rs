@@ -179,6 +179,72 @@ fn emit_status_uses_valid_key() {
         "status should be stored with underscore-separated key"
     );
 }
+
+#[test]
+fn web_search_construction_reserves_provider_result_owners() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+    let current = state.retained_payload_bytes().unwrap();
+    let results = vec![SearchResult {
+        title: "title".repeat(128),
+        url: "https://example.test/result".to_owned(),
+        snippet: "snippet".repeat(512),
+    }];
+    let source_bytes = web_search_results_bytes(&results).unwrap();
+    state.apply_retained_payload_limit(current + source_bytes - 1);
+    ctx.extensions.insert(state);
+    let ids = SearchCallIds::new("ws_1", "ws_bridge", 0);
+
+    assert!(!web_search_construction_fits(
+        &ctx,
+        &ids,
+        "completed",
+        "query",
+        &results,
+        true,
+        source_bytes,
+    ));
+}
+
+#[test]
+fn web_search_response_limit_is_derived_before_dispatch() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + 32_768);
+    ctx.extensions.insert(state);
+
+    let limit = web_search_response_limit(&ctx, "query").unwrap();
+    assert!(limit < MAX_SEARCH_RESPONSE_BYTES);
+    assert!(limit <= (32_768 - 4_096 - "query".len() * 8) / 32);
+}
+
+#[test]
+fn moving_pending_search_calls_keeps_their_payload_charged() {
+    let call = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "x".repeat(4_096)}
+    });
+    let mut state = ResponsesState {
+        web_search_calls: vec![call],
+        ..ResponsesState::default()
+    };
+    let before = state.retained_payload_bytes().unwrap();
+
+    let (calls, bytes) = take_pending_search_calls(&mut state).unwrap();
+
+    assert_eq!(state.retained_payload_bytes().unwrap(), before);
+    drop(calls);
+    state.release_external_payload_bytes(bytes);
+    assert_eq!(
+        state.retained_payload_bytes().unwrap(),
+        before - bytes,
+        "the charge is released only after the local owner is dropped"
+    );
+}
 // -----------------------------------------------------------------------------
 // Response ownership
 // -----------------------------------------------------------------------------

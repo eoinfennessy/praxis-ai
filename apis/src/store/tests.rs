@@ -458,6 +458,28 @@ async fn record_and_get_pending_approval_round_trips_fields() {
 }
 
 #[tokio::test]
+async fn pending_approval_payload_size_is_measured_without_fetching_columns() {
+    let store = make_store().await;
+    let record = make_pending("call_abc");
+    store
+        .record_pending_approvals("tenant_a", RESP, std::slice::from_ref(&record), 1000)
+        .await
+        .expect("record should succeed");
+
+    let bytes = store
+        .pending_approval_payload_bytes("tenant_a", RESP, &["call_abc", "missing"])
+        .await
+        .expect("size query should succeed");
+    let expected = record.approval_id.len()
+        + record.server_label.len()
+        + record.tool_name.len()
+        + record.arguments.len()
+        + record.target_fingerprint.len();
+
+    assert_eq!(bytes, expected);
+}
+
+#[tokio::test]
 async fn get_pending_approvals_absent_id_returns_empty() {
     let store = make_store().await;
     seed_pending(&store, "tenant_a", RESP, &["call_present"]).await;
