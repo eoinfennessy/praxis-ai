@@ -811,8 +811,9 @@ impl<'de> Visitor<'de> for SearchResultsVisitor<'_> {
             if retained.len() < MAX_NUM_RESULTS {
                 validate_search_result(raw.get(), Some(self.decoded_budget))
                     .map_err(|_error| de::Error::custom("invalid retained vector-store search result"))?;
-                let result = serde_json::from_str::<SearchResult>(raw.get())
-                    .map_err(|_error| de::Error::custom("invalid retained vector-store search result"))?;
+                let result = serde_json::from_str::<SearchResult>(raw.get()).map_err(|error| {
+                    de::Error::custom(format!("invalid retained vector-store search result: {error}"))
+                })?;
                 retained.push(result);
             } else {
                 validate_search_result(raw.get(), None)
