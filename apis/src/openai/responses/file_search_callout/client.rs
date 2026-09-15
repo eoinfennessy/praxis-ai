@@ -628,6 +628,12 @@ struct ResponseAdmission {
 }
 
 /// Remaining allocation budget for retained typed response values.
+///
+/// Retained results are first walked as borrowed `RawValue`s to validate their
+/// schema and charge the estimated owned storage for strings, attributes, and
+/// content, then deserialized into `SearchResult`. Those representations can
+/// briefly coexist, so `RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES` also provides
+/// headroom for the duplicate allocations and parser scratch during that handoff.
 struct DecodedBudget {
     /// Bytes that may still be represented by owned decoded values.
     remaining: usize,
