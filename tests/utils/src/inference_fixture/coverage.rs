@@ -1300,6 +1300,7 @@ mod tests {
                 "messages/native-tool-use",
                 "messages/typed-server-tools",
                 "messages/upstream-error",
+                "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-retained-overflow-stream",
                 "responses/agentic-status-less-function-call",
@@ -1446,6 +1447,10 @@ mod tests {
                 (
                     &"responses.agentic.retained_overflow".to_owned(),
                     &vec!["responses/agentic-retained-overflow-stream".to_owned()]
+                ),
+                (
+                    &"responses.agentic.deferred_mcp_connectors".to_owned(),
+                    &vec!["responses/agentic-deferred-mcp-connectors".to_owned()]
                 ),
                 (
                     &"responses.chat.continuation".to_owned(),
