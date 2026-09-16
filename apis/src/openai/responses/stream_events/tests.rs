@@ -105,10 +105,10 @@ fn stream_retained_payload_counts_parser_arguments_and_deferred_terminal() {
     state
         .local_tool_items
         .insert("item:local".to_owned(), super::local_tools::LocalToolMode::Suppress);
-    let payload = json!({"type":"response.completed","response":{"output":[]}});
+    let metadata = json!({"type":"response.completed"});
     state.deferred_terminal = Some(super::DeferredTerminalEvent {
         event_type: "response.completed".to_owned(),
-        payload: payload.clone(),
+        metadata: metadata.clone(),
     });
 
     let expected = scratch.len()
@@ -117,7 +117,7 @@ fn stream_retained_payload_counts_parser_arguments_and_deferred_terminal() {
         + "item:rejected".len()
         + "item:local".len()
         + "response.completed".len()
-        + crate::openai::responses::state::retained_json_bytes(&payload).unwrap();
+        + crate::openai::responses::state::retained_json_bytes(&metadata).unwrap();
     assert_eq!(state.retained_payload_bytes().unwrap() - baseline, expected);
 }
 
@@ -157,9 +157,9 @@ fn local_completion_encodes_canonical_logical_sse_terminal() {
     assert_eq!(payload["response"]["id"], "resp_logical");
     assert_eq!(
         payload["response"]["output"].as_array().map(Vec::as_slice),
-        Some(state.accumulated_output.as_slice())
+        Some(state.output_items())
     );
-    assert_eq!(payload["response"]["usage"], state.usage);
+    assert_eq!(payload["response"]["usage"], state.response_object["usage"]);
     assert_eq!(state.logical_stream_sequence, 5);
 }
 
@@ -237,10 +237,7 @@ fn deferred_terminal_preflights_canonical_output_owners() {
     };
     let terminal = super::DeferredTerminalEvent {
         event_type: "response.completed".to_owned(),
-        payload: json!({
-            "type": "response.completed",
-            "response": {"id": "resp_budget", "status": "completed", "output": []}
-        }),
+        metadata: json!({"type": "response.completed"}),
     };
     let baseline = state.retained_payload_bytes().unwrap();
     let staging =
@@ -257,7 +254,7 @@ fn deferred_terminal_preflights_canonical_output_owners() {
         &mut output,
     ));
     assert!(output.is_empty());
-    assert!(terminal.payload["response"]["output"].as_array().unwrap().is_empty());
+    assert_eq!(terminal.metadata["type"], "response.completed");
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
@@ -1426,7 +1423,7 @@ async fn commit_preflight_accounts_event_and_response_state_owners() {
 }
 
 #[test]
-fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
+fn commit_projection_charges_arguments_but_not_moved_terminal_response() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     let mut response_state = ResponsesState::default();
@@ -1459,13 +1456,15 @@ fn commit_projection_charges_argument_delta_and_terminal_duplicate_owners() {
         }],
         "usage": {"input_tokens": 1}
     });
-    let response_bytes = crate::openai::responses::state::retained_json_bytes(&response).unwrap();
     let terminal = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
         "type": "response.completed",
         "response": response
     }));
     let terminal_projection = super::projected_responses_state_clone_bytes(&ctx, &[terminal]).unwrap();
-    assert!(terminal_projection >= response_bytes * 3);
+    assert_eq!(
+        terminal_projection, 0,
+        "the terminal response moves into canonical state"
+    );
 }
 
 /// Arm a plain streaming logical-stream context (no hosted tools) for the given
@@ -1765,20 +1764,43 @@ async fn accumulation_count_dedups_added_done_pair() {
 }
 
 #[tokio::test]
-async fn accumulation_charges_retained_tool_call_clone() {
-    // A `function_call_arguments.done` clones the whole retained output item into
-    // `tool_calls`. When the item carries a large `name` (charged once on its
-    // `output_item.added`) but no `id`/`call_id`, `upsert_tool_call` cannot dedup
-    // and every later tiny `done` frame appends another full clone. Charging only
-    // `frame.data.len()` left the counter near zero while megabytes were retained,
-    // so the clone-to-be must be charged too (#556 review finding: retained
-    // tool-call copies escaped the byte budget).
+async fn accumulation_count_forgets_id_replaced_at_an_index() {
+    let filter = make_filter_from("max_output_items: 1\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut added = Some(output_item_added_chunk(0));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+
+    let mut replacement = Some(make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "item": {"type": "message", "id": "replacement", "content": []},
+            "output_index": 0,
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut replacement, false).unwrap();
+    assert!(replacement.is_some(), "replacement keeps the retained count at one");
+
+    // The former id no longer owns index zero. A later done with that id and an
+    // invalid index would append, so it must be projected as a second item.
+    let mut stale_id = Some(make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "item": {"type": "message", "id": "item_0", "content": []},
+            "output_index": 99,
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut stale_id, false).unwrap();
+    assert!(stale_id.is_none(), "a replaced id must not remain in the projection");
+}
+
+#[tokio::test]
+async fn repeated_argument_done_keeps_one_canonical_tool_call() {
+    // Completion mutates the canonical item in place. Repeated done events must
+    // not create a second full-tree owner or amplify retained payload.
     let big_name = "n".repeat(5000);
 
-    // The cap admits the announced item and its first clone but not many. Fifty
-    // tiny `done` frames alone (~2 KiB) stay well under it, so without charging the
-    // clone the stream would never fail closed in this loop.
-    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let filter = make_filter_from("max_accumulated_bytes: 67108864");
     let mut ctx = arm_plain_stream(&filter);
 
     // An id-less, call_id-less function-call item announced once.
@@ -1792,45 +1814,31 @@ async fn accumulation_charges_retained_tool_call_clone() {
     filter.on_response_body(&mut ctx, &mut added, false).unwrap();
     assert!(added.is_some(), "the announced function call is within the cap");
 
-    let mut failed = false;
     for _ in 0..50 {
         let mut done = Some(make_sse_chunk(
             "response.function_call_arguments.done",
             &json!({"output_index": 0, "arguments": "{}"}),
         ));
         filter.on_response_body(&mut ctx, &mut done, false).unwrap();
-        if done.is_none() {
-            failed = true;
-            break;
-        }
+        assert!(done.is_some());
     }
 
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(
-        failed,
-        "re-cloned tool-call copies must be charged and eventually fail the stream closed"
+        state.tool_calls.is_empty(),
+        "incremental parsing retains no dispatch copy"
     );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "a stream whose retained tool-call clones overflow the byte budget must not be persisted"
-    );
+    assert_eq!(state.output_items().len(), 1);
 }
 
 #[tokio::test]
-async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
-    // The coalesced variant of `accumulation_charges_retained_tool_call_clone`: the
-    // id-less `output_item.added` and every re-cloning `function_call_arguments.done`
-    // arrive in ONE chunk. The clone charge is measured in phase 2 as each `done`
-    // actually clones the item into `tool_calls`, so a coalesced added + repeated
-    // dones fails the stream closed the instant the retained clones cross the cap —
-    // never accepting the full amplification of tool-call copies while the counter
-    // stays near zero (#556 re-review finding: same-chunk added + repeated dones).
+async fn coalesced_argument_done_keeps_one_canonical_tool_call() {
     let big_name = "n".repeat(5000);
 
     // The cap admits the announced item and a clone or two but not fifty. The fifty
     // tiny `done` frames alone (~2 KiB) stay far under it, so only charging the
     // same-chunk clones fails this single chunk closed.
-    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let filter = make_filter_from("max_accumulated_bytes: 67108864");
     let mut ctx = arm_plain_stream(&filter);
 
     // One chunk: the id-less, call_id-less function-call item announced once, then
@@ -1852,42 +1860,17 @@ async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
 
     let mut chunk = Some(Bytes::from(coalesced));
     filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
-    assert!(
-        chunk.is_none(),
-        "a single chunk whose coalesced added + repeated dones retain megabytes of clones must fail closed"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "a coalesced-chunk clone overflow must not be persisted"
-    );
-
-    // The chunk fails closed inside phase 2, the moment the measured clones cross the
-    // cap — after retaining only a bounded handful, never the full 50-way
-    // amplification. Bounded retention with rejection is the fix; the earlier phase-1
-    // prediction under-charged the coalesced case and never rejected at all.
+    assert!(chunk.is_some());
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(
-        state.tool_calls.len() < 50,
-        "the per-event byte guard must fail closed before the full amplification, got {} clones",
-        state.tool_calls.len()
-    );
+    assert!(state.tool_calls.is_empty());
+    assert_eq!(state.output_items().len(), 1);
 }
 
 #[tokio::test]
-async fn accumulation_charges_clone_when_added_output_index_mismatches() {
-    // Finding 1 (#556 re-review): the clone charge must follow the accumulator's
-    // actual append/replace rules, not an advertised `output_index`.
-    // `handle_output_item_added` IGNORES `output_index` and pushes, so an item
-    // announced with `output_index: 7` still lands at actual index 0. A
-    // `function_call_arguments.done` targeting index 0 then clones that large item.
-    // The former phase-1 prediction resolved the pending item by the advertised
-    // index 7, matched nothing, charged zero, and never rejected — retaining
-    // megabytes uncharged. Measuring the clone where it is made closes the gap: the
-    // done resolves the real index-0 item, clones it, and is charged.
+async fn argument_done_uses_canonical_landing_index() {
     let big_name = "n".repeat(5000);
 
-    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let filter = make_filter_from("max_accumulated_bytes: 67108864");
     let mut ctx = arm_plain_stream(&filter);
 
     // One chunk: an id-less function call announced with a MISMATCHED output_index
@@ -1910,34 +1893,18 @@ async fn accumulation_charges_clone_when_added_output_index_mismatches() {
 
     let mut chunk = Some(Bytes::from(coalesced));
     filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
-    assert!(
-        chunk.is_none(),
-        "an added item whose advertised output_index differs from its landing index must still have \
-         its repeated clones charged and fail the stream closed"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.skip_persist"),
-        Some("true"),
-        "a mismatched-index clone overflow must not be persisted"
-    );
+    assert!(chunk.is_some());
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert!(
-        state.tool_calls.len() < 50,
-        "the clone charge must fail closed before the full amplification, got {} clones",
-        state.tool_calls.len()
-    );
+    assert!(state.tool_calls.is_empty());
+    assert_eq!(state.output_items().len(), 1);
 }
 
 #[tokio::test]
 async fn accumulation_argument_done_without_item_is_incremental() {
-    // Finding 2 (#556 re-review): the clone charge must not rescan the parsed-event
-    // history for every completion. A coalesced chunk of many
-    // `function_call_arguments.done` events with NO matching output item was the
-    // O(N^2) worst case the old rescan hit (~1.9s for 60k events). Charging the clone
-    // at commit makes each done O(1): it finds no item, clones nothing, and charges
-    // nothing. A large such chunk must be processed without spurious overflow and
-    // without retaining any tool call.
+    // A coalesced chunk of many `function_call_arguments.done` events with no
+    // matching output item must stay linear: each event performs an indexed/id
+    // lookup and never constructs an independent tool-call owner.
     let filter = make_filter_from("max_accumulated_bytes: 67108864\nmax_events: 100000");
     let mut ctx = arm_plain_stream(&filter);
 
@@ -1952,8 +1919,8 @@ async fn accumulation_argument_done_without_item_is_incremental() {
     let mut chunk = Some(Bytes::from(coalesced));
     filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
 
-    // No matching output item ever existed, so nothing was cloned or charged as a
-    // clone and the stream is not failed closed.
+    // No matching output item ever existed, so no tool call is retained and the
+    // stream is not failed closed.
     assert_ne!(
         ctx.get_metadata("responses.skip_persist"),
         Some("true"),
@@ -1972,7 +1939,7 @@ async fn count_overflow_rejects_before_recording_local_tool_milestone() {
     // delivery milestone: otherwise a local tool whose progress streamed earlier in
     // the same chunk leaves a committed milestone that EOS recovery trusts, dropping
     // the executed tool from the client-visible stream. The count guard now runs
-    // between accumulation and milestone recording (#556 review finding).
+    // before either accumulation or milestone recording (#556 review finding).
     let filter = make_filter_from("max_output_items: 1\nmax_accumulated_bytes: 67108864");
     let mut ctx = arm_plain_stream(&filter);
 
@@ -4036,21 +4003,19 @@ async fn logical_terminal_only_output_survives_canonicalization() {
 }
 
 #[tokio::test]
-async fn terminal_event_authoritatively_populates_completed_function_calls() {
+async fn terminal_event_keeps_completed_function_call_in_canonical_response() {
     let (filter, mut ctx) = make_armed_context();
     ctx.extensions.insert(ResponsesState::default());
-    ctx.extensions
-        .get_mut::<ResponsesState>()
-        .unwrap()
-        .tool_calls
-        .push(json!({
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object = json!({
+        "output": [{
             "type": "function_call",
             "id": "fc_stale",
             "call_id": "call_stale",
             "name": "stale",
             "arguments": "{}",
             "status": "completed"
-        }));
+        }]
+    });
 
     let completed = json!({
         "id": "resp_123",
@@ -4068,14 +4033,14 @@ async fn terminal_event_authoritatively_populates_completed_function_calls() {
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(
-        state.tool_calls.len(),
-        1,
-        "the authoritative terminal response must replace incremental tool calls"
+    assert!(
+        state.tool_calls.is_empty(),
+        "the parser must not retain a dispatch copy"
     );
     assert_eq!(
-        state.tool_calls[0]["call_id"], "call_final",
-        "a terminal-only completed function call must be dispatchable"
+        state.output_items()[0]["call_id"],
+        "call_final",
+        "the terminal response is the canonical current-round owner"
     );
 }
 
@@ -4118,7 +4083,7 @@ fn response_accumulation_sums_usage_across_iterations() {
     assert_eq!(state.usage["output_tokens"], 6);
     assert_eq!(state.usage["total_tokens"], 23);
     assert_eq!(state.usage["input_tokens_details"]["cached_tokens"], 4);
-    assert_eq!(state.response_object["usage"], state.usage);
+    assert!(state.response_object.get("usage").is_none());
 
     let final_without_usage = json!({"status":"completed","output":[]});
     assert!(
@@ -4126,7 +4091,7 @@ fn response_accumulation_sums_usage_across_iterations() {
         "completed response without usage must remain terminal"
     );
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.response_object["usage"], state.usage);
+    assert!(state.response_object.get("usage").is_none());
     assert_eq!(state.usage["total_tokens"], 23);
 }
 
@@ -4212,12 +4177,15 @@ async fn function_call_accumulation() {
     filter.on_response_body(&mut ctx, &mut b3, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1);
-    assert_eq!(state.tool_calls[0]["id"], "fc_item_1");
-    assert_eq!(state.tool_calls[0]["call_id"], "call_1");
-    assert_eq!(state.tool_calls[0]["name"], "get_weather");
-    assert_eq!(state.tool_calls[0]["arguments"], "{\"city\":\"NYC\"}");
-    assert_eq!(state.tool_calls[0]["status"], "completed");
+    assert!(
+        state.tool_calls.is_empty(),
+        "incremental parsing retains no dispatch copy"
+    );
+    assert_eq!(state.output_items()[0]["id"], "fc_item_1");
+    assert_eq!(state.output_items()[0]["call_id"], "call_1");
+    assert_eq!(state.output_items()[0]["name"], "get_weather");
+    assert_eq!(state.output_items()[0]["arguments"], "{\"city\":\"NYC\"}");
+    assert_eq!(state.output_items()[0]["status"], "completed");
     assert_eq!(state.output_items()[0]["arguments"], "{\"city\":\"NYC\"}");
 }
 
@@ -4510,19 +4478,15 @@ fn encode_sse_event_allocates_less_than_intermediate_string_for_ordinary_and_def
 }
 
 #[test]
-fn deferred_terminal_stores_moved_payload_without_deep_clone() {
+fn deferred_terminal_metadata_allocates_less_than_legacy_response_clone() {
     let cloned = large_completed_payload();
-    let moved = large_completed_payload();
     let clone_info = allocation_counter::measure(|| {
-        std::hint::black_box(super::DeferredTerminalEvent {
-            event_type: "response.completed".to_owned(),
-            payload: cloned.clone(),
-        });
+        std::hint::black_box(cloned.clone());
     });
-    let move_info = allocation_counter::measure(|| {
+    let metadata_info = allocation_counter::measure(|| {
         std::hint::black_box(super::DeferredTerminalEvent {
             event_type: "response.completed".to_owned(),
-            payload: moved,
+            metadata: json!({"type": "response.completed"}),
         });
     });
     assert!(
@@ -4531,10 +4495,10 @@ fn deferred_terminal_stores_moved_payload_without_deep_clone() {
         clone_info.bytes_total
     );
     assert!(
-        move_info.bytes_total < clone_info.bytes_total,
-        "deferred-terminal store must move the payload: clone={} move={}",
+        metadata_info.bytes_total < clone_info.bytes_total,
+        "deferred-terminal store must retain metadata only: clone={} metadata={}",
         clone_info.bytes_total,
-        move_info.bytes_total
+        metadata_info.bytes_total
     );
 }
 
@@ -4682,15 +4646,15 @@ async fn upsert_tool_call_dedup() {
     let mut b2 = Some(make_sse_chunk("response.function_call_arguments.done", &done1));
     filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
 
-    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len(), 1);
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.is_empty());
 
     let done2 = json!({"item_id": "fc_dup", "output_index": 0, "arguments": "{\"q\":\"v2\"}"});
     let mut b3 = Some(make_sse_chunk("response.function_call_arguments.done", &done2));
     filter.on_response_body(&mut ctx, &mut b3, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1, "should replace, not append duplicate");
-    assert_eq!(state.tool_calls[0]["arguments"], "{\"q\":\"v2\"}");
+    assert!(state.tool_calls.is_empty());
+    assert_eq!(state.output_items()[0]["arguments"], "{\"q\":\"v2\"}");
 }
 
 #[tokio::test]
@@ -4720,9 +4684,10 @@ async fn function_call_done_without_prior_deltas() {
     filter.on_response_body(&mut ctx, &mut b2, false).unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1);
+    assert!(state.tool_calls.is_empty());
     assert_eq!(
-        state.tool_calls[0]["arguments"], "{\"tz\":\"UTC\"}",
+        state.output_items()[0]["arguments"],
+        "{\"tz\":\"UTC\"}",
         "should use payload arguments when no deltas were accumulated"
     );
 }
@@ -4759,7 +4724,8 @@ async fn done_payload_wins_over_accumulated_deltas() {
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
-        state.tool_calls[0]["arguments"], "{\"from\":\"done_payload\"}",
+        state.output_items()[0]["arguments"],
+        "{\"from\":\"done_payload\"}",
         "done-event arguments should take precedence over accumulated deltas"
     );
 }
@@ -5362,8 +5328,8 @@ fn suppress_mode_drops_private_function_call_lifecycle() {
         json!({"output_index": 0, "item": {"id": "fc_1", "type": "function_call", "name": "file_search"}}),
     );
     let mut out = Vec::new();
-    for event in [added, delta, args_done, item_done] {
-        append_logical_event(&mut state, &mut ctx, event, &mut out);
+    for mut event in [added, delta, args_done, item_done] {
+        append_logical_event(&mut state, &mut ctx, &mut event, &mut out);
     }
     assert!(
         out.is_empty(),
@@ -5381,12 +5347,12 @@ fn client_function_call_without_hosted_tool_passes_through() {
     let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
-    let added = responses_event(
+    let mut added = responses_event(
         "response.output_item.added",
         json!({"output_index": 0, "item": {"id": "fc_1", "type": "function_call", "name": "file_search"}}),
     );
     let mut out = Vec::new();
-    append_logical_event(&mut state, &mut ctx, added, &mut out);
+    append_logical_event(&mut state, &mut ctx, &mut added, &mut out);
     assert!(
         !out.is_empty(),
         "client function_call must pass through when no hosted tool is declared"
@@ -5405,19 +5371,19 @@ fn native_hybrid_drops_pending_done_and_passes_opening() {
     let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
-    let added = responses_event(
+    let mut added = responses_event(
         "response.output_item.added",
         json!({"output_index": 0, "item": {"id": "fs_1", "type": "file_search_call", "status": "searching"}}),
     );
-    let pending_done = responses_event(
+    let mut pending_done = responses_event(
         "response.output_item.done",
         json!({"output_index": 0, "item": {"id": "fs_1", "type": "file_search_call", "status": "searching"}}),
     );
     let mut out = Vec::new();
-    append_logical_event(&mut state, &mut ctx, added, &mut out);
+    append_logical_event(&mut state, &mut ctx, &mut added, &mut out);
     assert!(!out.is_empty(), "native opening passes through");
     out.clear();
-    append_logical_event(&mut state, &mut ctx, pending_done, &mut out);
+    append_logical_event(&mut state, &mut ctx, &mut pending_done, &mut out);
     assert!(
         out.is_empty(),
         "a still-pending output_item.done is dropped (no double-done)"
@@ -5436,18 +5402,18 @@ fn native_terminal_done_passes_and_cancels_synthesis() {
     let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
-    let added = responses_event(
+    let mut added = responses_event(
         "response.output_item.added",
         json!({"output_index": 0, "item": {"id": "fs_1", "type": "file_search_call", "status": "searching"}}),
     );
-    let terminal_done = responses_event(
+    let mut terminal_done = responses_event(
         "response.output_item.done",
         json!({"output_index": 0, "item": {"id": "fs_1", "type": "file_search_call", "status": "completed", "results": []}}),
     );
     let mut out = Vec::new();
-    append_logical_event(&mut state, &mut ctx, added, &mut out);
+    append_logical_event(&mut state, &mut ctx, &mut added, &mut out);
     out.clear();
-    append_logical_event(&mut state, &mut ctx, terminal_done, &mut out);
+    append_logical_event(&mut state, &mut ctx, &mut terminal_done, &mut out);
     assert!(!out.is_empty(), "a terminal (completed) done passes through");
     assert!(
         !state.local_tool_items.contains_key("item:fs_1"),
@@ -5475,18 +5441,18 @@ fn native_failed_done_records_observation_for_reconcile_skip() {
     let filter = OpenaiStreamEventsFilter::test_filter();
     filter.arm(&mut ctx);
     let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
-    let added = responses_event(
+    let mut added = responses_event(
         "response.output_item.added",
         json!({"output_index": 0, "item": {"id": "fs_9", "type": "file_search_call", "status": "searching"}}),
     );
-    let failed_done = responses_event(
+    let mut failed_done = responses_event(
         "response.output_item.done",
         json!({"output_index": 0, "item": {"id": "fs_9", "type": "file_search_call", "status": "failed"}}),
     );
     let mut out = Vec::new();
-    append_logical_event(&mut state, &mut ctx, added, &mut out);
+    append_logical_event(&mut state, &mut ctx, &mut added, &mut out);
     out.clear();
-    append_logical_event(&mut state, &mut ctx, failed_done, &mut out);
+    append_logical_event(&mut state, &mut ctx, &mut failed_done, &mut out);
     assert!(!out.is_empty(), "a terminal (failed) done passes through");
     assert!(
         !state.local_tool_items.contains_key("item:fs_9"),

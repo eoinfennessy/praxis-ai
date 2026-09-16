@@ -31,6 +31,7 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
     SubRequestResponseMode, parse_filter_config,
 };
+use serde::{Serialize, ser::SerializeMap as _};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
@@ -43,7 +44,8 @@ use crate::{
     openai::{
         responses::{
             error::{responses_error_rejection, responses_error_sse_payload},
-            state::{EmittedItem, ResponsesState, retained_json_bytes, retained_json_values_bytes},
+            file_search_callout::citations::annotation_staging_bytes,
+            state::{EmittedItem, ResponsesState, retained_json_bytes},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
     },
@@ -53,15 +55,16 @@ use crate::{
 struct DeferredTerminalEvent {
     /// Canonical event type.
     event_type: String,
-    /// Parsed event payload.
-    payload: Value,
+    /// Parsed envelope metadata after its `response` tree has been moved into
+    /// [`ResponsesState::response_object`].
+    metadata: Value,
 }
 
 impl DeferredTerminalEvent {
     /// Payload bytes retained while the loop owner decides whether this round
     /// is terminal.
     fn retained_payload_bytes(&self) -> Option<usize> {
-        self.event_type.len().checked_add(retained_json_bytes(&self.payload)?)
+        self.event_type.len().checked_add(retained_json_bytes(&self.metadata)?)
     }
 }
 
@@ -615,8 +618,8 @@ fn parse_and_accumulate(
         return Ok(None);
     };
     // The parsed event values remain owned by `events` while the commit runs.
-    // Accumulation can also clone portions of those values into `ResponsesState`
-    // before each event is consumed, so admit those projected owners alongside
+    // Accumulation moves canonical values into `ResponsesState`, but can still
+    // create small normalization and bookkeeping values, so admit those projected owners alongside
     // the frames and logical output. The post-commit check below is still useful
     // as a consistency check for the exact state and output lengths.
     let projected_state_clone_bytes = projected_responses_state_clone_bytes(ctx, &events);
@@ -668,69 +671,34 @@ fn retained_event_payload_bytes(event: &ResponsesEvent) -> Option<usize> {
     }
 }
 
-/// Count payloads that accumulation may clone into [`ResponsesState`] while
-/// the parsed event vector is still live.
+/// Count payloads that accumulation may create while the parsed event vector is live.
 ///
-/// This is intentionally an upper bound: replacement writes may release the
-/// previous state owner during commit, but charging the projected owner keeps
-/// the preflight transactional at the allocation peak. Function-call completion
-/// includes the event and its matched output item because the accumulator may
-/// clone the completed item into `tool_calls` while retaining the event.
-#[expect(
-    clippy::too_many_lines,
-    reason = "exhaustive per-event transactional projection accounting"
-)]
-fn projected_responses_state_clone_bytes(ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
-    let state = ctx.extensions.get::<ResponsesState>();
+/// Canonical response and output trees are moved out of events rather than
+/// cloned. This upper bound therefore covers only normalization strings and
+/// logical-stream bookkeeping that can coexist with an event during commit.
+fn projected_responses_state_clone_bytes(_ctx: &HttpFilterContext<'_>, events: &[ResponsesEvent]) -> Option<usize> {
     events.iter().try_fold(0_usize, |used, event| {
         let event_bytes = retained_event_payload_bytes(event)?;
         let additional = match event {
-            ResponsesEvent::ResponseCompleted(payload)
-            | ResponsesEvent::ResponseIncomplete(payload)
-            | ResponsesEvent::ResponseFailed(payload) => {
-                let response_bytes = retained_json_bytes(payload.get("response").unwrap_or(payload))?;
-                let usage_bytes = state.map_or(Some(0), |state| retained_json_bytes(&state.usage))?;
-                // Terminal accumulation retains the response, clones completed
-                // calls out of its output, merges a distinct usage owner, and
-                // may insert that merged usage back into the response. Three
-                // response projections plus the prior usage size bound all of
-                // those simultaneous owners before the event is consumed.
-                response_bytes.checked_mul(3)?.checked_add(usage_bytes)?
-            },
+            ResponsesEvent::ResponseCompleted(_)
+            | ResponsesEvent::ResponseIncomplete(_)
+            | ResponsesEvent::ResponseFailed(_) => 0,
             ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
-                let item_bytes = payload.get("item").map_or(Some(0), retained_json_bytes)?;
-                // Besides the canonical output item, logical-stream
-                // reconciliation can retain item ids, local-tool keys, and a
-                // normalized payload while the parsed event is still live.
-                item_bytes.checked_add(event_bytes.checked_mul(2)?)?
+                // The item itself moves into canonical output. Bound the small
+                // ids and milestone keys created while the envelope is live.
+                payload
+                    .get("item")
+                    .and_then(|item| item.get("id"))
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len)
+                    .checked_add(event_bytes)?
             },
             ResponsesEvent::FunctionCallArgumentsDelta(payload) => {
                 let key_bytes = projected_tool_call_key_bytes(payload)?;
                 let delta_bytes = payload.get("delta").and_then(Value::as_str).map_or(0, str::len);
                 key_bytes.checked_add(delta_bytes)?.checked_add(event_bytes)?
             },
-            ResponsesEvent::FunctionCallArgumentsDone(payload) => {
-                let matched_item = state.and_then(|state| {
-                    if let Some(item_id) = payload.get("item_id").and_then(Value::as_str) {
-                        state
-                            .output_items()
-                            .iter()
-                            .find(|item| item.get("id").and_then(Value::as_str) == Some(item_id))
-                    } else {
-                        payload
-                            .get("output_index")
-                            .and_then(Value::as_u64)
-                            .and_then(|index| usize::try_from(index).ok())
-                            .and_then(|index| state.output_items().get(index))
-                    }
-                });
-                // Completion may own an extracted argument string, grow the
-                // canonical item, and clone that completed item into
-                // `tool_calls` before the event is consumed.
-                event_bytes
-                    .checked_mul(3)?
-                    .checked_add(matched_item.map_or(Some(0), retained_json_bytes)?)?
-            },
+            ResponsesEvent::FunctionCallArgumentsDone(payload) => projected_tool_call_key_bytes(payload)?,
             // Other events can still acquire logical-stream bookkeeping keys
             // or grow their normalized payload before serialization.
             _ => event_bytes,
@@ -860,26 +828,19 @@ fn logical_output_upper_bound(ctx: &HttpFilterContext<'_>, events: &[ResponsesEv
     Some(bound)
 }
 
-/// Return the compact size of the output that canonicalization will duplicate.
-fn canonical_logical_output_bytes(state: &ResponsesState) -> Option<usize> {
-    if state.accumulated_output.is_empty() {
-        retained_json_values_bytes(state.output_items())
-    } else {
-        retained_json_values_bytes(&state.accumulated_output)
-    }
-}
-
 /// Reserve the transient owners created before a logical terminal is emitted.
 ///
-/// `canonicalize_logical_response` keeps one output in the returned terminal
-/// and clones another into `response_object`. The caller's existing terminal
-/// and already-emitted bytes remain live while those owners are constructed,
-/// so this admission must happen before canonicalization, not only after the
-/// terminal has been mutated.
+/// Canonicalization moves output and usage into `response_object`; only citation
+/// annotation staging and the caller's existing emitted bytes add owners.
 fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes: usize) -> Option<usize> {
-    canonical_logical_output_bytes(state)
-        .and_then(|output_bytes| output_bytes.checked_mul(2))
-        .and_then(|output_bytes| existing_output_bytes.checked_add(output_bytes))
+    let output = if state.accumulated_output.is_empty() {
+        state.output_items()
+    } else {
+        &state.accumulated_output
+    };
+    annotation_staging_bytes(output, &state.citation_files)
+        .ok()
+        .and_then(|annotation_bytes| existing_output_bytes.checked_add(annotation_bytes))
 }
 
 /// Abort an offending chunk after aggregate admission fails. The caller drops
@@ -939,22 +900,12 @@ fn parse_chunk_events(
 /// byte budget.
 ///
 /// Bounds every accumulator this filter grows *from the driving frame* — the
-/// response output-item list, the per-tool-call argument buffers, the local-tool
-/// `emitted_output_items` map (keyed by an owned `item_id`, with a
-/// `streamed_phases` set of owned event-type strings), and the terminal snapshot
-/// retained in `response_object` and the deferred terminal — by an aggregate byte
-/// ceiling. Each of these grows by a substring of the frame that drives it, so
-/// `frame.data.len()` is a conservative upper bound on the bytes each event
-/// contributes to shared state, and the budget bounds total accumulated memory even
-/// when every individual event stays within `max_buffer_bytes`.
-///
-/// The one accumulator whose growth is *not* bounded by the driving frame is the
-/// `tool_calls` list: a `function_call_arguments.done` clones the whole retained
-/// output item (whose payload arrived in an earlier frame) rather than the small
-/// `done` frame. That clone is charged in phase 2 ([`commit_chunk_events`]), where
-/// it is actually performed and its size is known exactly, instead of being
-/// predicted here — so the byte budget cannot diverge from the item the commit
-/// retains, and no per-event history rescan is needed.
+/// canonical response output, per-tool-call argument buffers, local-tool
+/// lifecycle keys, and terminal metadata — by an aggregate byte ceiling. Each
+/// owner grows by a substring of its driving frame, so `frame.data.len()` is a
+/// conservative upper bound even when every individual event stays within
+/// `max_buffer_bytes`. Dispatch queues retain only fixed-size output indices;
+/// completed arguments move into the canonical item instead of cloning it.
 ///
 /// The running total lives in [`ResponsesState::stream_accumulated_bytes`], so it
 /// is charged once per request and survives the per-round re-arm: a multi-round
@@ -970,14 +921,11 @@ fn parse_chunk_events(
 /// buffered path would accept.
 ///
 /// Terminal lifecycle events (`response.completed`/`incomplete`/`failed`) are
-/// charged: their payload snapshots the full accumulated output plus usage into
-/// `response_object` and is retained a second time as the deferred terminal, so a
-/// terminal frame that alone exceeds the ceiling (yet still fits
-/// `max_buffer_bytes`) must fail closed like any other accumulator growth. The
-/// per-frame `added`/`done`/terminal charges over-count an item that also streams
-/// the paired envelopes; that is a deliberately conservative, fail-closed-earlier
-/// byte bound. The distinct item-count dimension is enforced separately from the
-/// retained output (see [`accumulation_count_exceeded`]).
+/// charged because their authoritative response becomes the canonical tree.
+/// The deferred terminal retains only envelope metadata and later serializes a
+/// borrowed view of that tree. Per-frame `added`/`done`/terminal charges can
+/// still conservatively over-count paired envelopes; the distinct item-count
+/// dimension is enforced separately (see [`accumulation_count_exceeded`]).
 ///
 /// Runs in phase 1 (parse) so a frame-bounded accumulator's growth aborts the chunk
 /// atomically before [`commit_chunk_events`] mutates shared state.
@@ -1067,64 +1015,100 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
     })
 }
 
+/// Project the retained output count before moving any parsed event into state.
+///
+/// This mirrors the accumulator's append/replace rules using borrowed ids and
+/// indices only, so a rejected chunk commits neither canonical items nor wire
+/// delivery milestones.
+#[expect(
+    clippy::too_many_lines,
+    reason = "mirrors terminal, append, indexed replace, and id replace rules"
+)]
+fn projected_accumulation_count(
+    state: &StreamEventsState,
+    ctx: &HttpFilterContext<'_>,
+    events: &[ResponsesEvent],
+) -> Option<usize> {
+    let responses = ctx.extensions.get::<ResponsesState>();
+    let accumulated = responses.map_or(0, |responses| responses.accumulated_output.len());
+    let mut output_ids: Vec<Option<&str>> = responses
+        .into_iter()
+        .flat_map(ResponsesState::output_items)
+        .map(|item| item.get("id").and_then(Value::as_str))
+        .collect();
+
+    for event in events {
+        match event {
+            ResponsesEvent::ResponseCompleted(payload)
+            | ResponsesEvent::ResponseIncomplete(payload)
+            | ResponsesEvent::ResponseFailed(payload) => {
+                let response = payload.get("response").unwrap_or(payload);
+                let output = response
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .map_or(&[][..], Vec::as_slice);
+                output_ids.clear();
+                output_ids.extend(output.iter().map(|item| item.get("id").and_then(Value::as_str)));
+            },
+            ResponsesEvent::OutputItemAdded(payload) => {
+                output_ids.push(
+                    payload
+                        .get("item")
+                        .and_then(|item| item.get("id"))
+                        .and_then(Value::as_str),
+                );
+            },
+            ResponsesEvent::OutputItemDone(payload) => {
+                let index = payload
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(|index| index.saturating_sub(state.output_index_offset))
+                    .and_then(|index| usize::try_from(index).ok());
+                let item_id = payload
+                    .get("item")
+                    .and_then(|item| item.get("id"))
+                    .and_then(Value::as_str);
+                if let Some(slot) = index.and_then(|index| output_ids.get_mut(index)) {
+                    *slot = item_id;
+                } else if let Some(slot) = item_id.and_then(|id| output_ids.iter_mut().find(|seen| **seen == Some(id)))
+                {
+                    *slot = item_id;
+                } else {
+                    output_ids.push(item_id);
+                }
+            },
+            _ => {},
+        }
+    }
+    accumulated.checked_add(output_ids.len())
+}
+
 /// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
 ///
-/// Split into two passes so both retained-state budgets are validated before any
-/// delivery milestone is recorded:
-///
-/// - Phase 2a accumulates every event into the retained output (`output_items`, `tool_calls`, `response_object`) — the
-///   only state the count derives from, and state no delivery milestone depends on. As it accumulates it charges the
-///   one byte-bearing growth the phase-1 frame charge cannot bound: the `tool_calls` clone a
-///   `function_call_arguments.done` makes of a whole retained output item (see [`charge_accumulation_budget`]). That
-///   clone is measured, not predicted, so the charge equals the item the commit actually retained and a `done` that
-///   re-clones a large item fails the chunk closed the instant the request-wide byte total exceeds the cap.
-/// - The count guard then runs against the grown output, *before* any delivery milestone is recorded. A chunk that
-///   overflows the item cap therefore fails closed without leaving a committed local-tool milestone that EOS recovery
-///   would trust for bytes the client never received (review finding: the former post-commit count check let an
-///   already-executed tool's milestone survive a rejected chunk, dropping that tool from the client-visible stream).
-/// - Phase 2b records milestones and emits the logical bytes.
-///
-/// On a rejected chunk phase 2a has already grown the retained output past a cap, so
-/// the request-wide guards in [`accumulation_budget_exceeded`] stay sticky for every
-/// later chunk and round. The byte guard fails closed per event, so transient
-/// overshoot is bounded to the single clone that trips the cap. Phase 2b is
-/// infallible, so every recorded milestone still corresponds to bytes that actually
-/// reach the client. Returns the logical-stream bytes.
+/// The borrowed count projection validates the full chunk before any canonical
+/// item or delivery milestone is committed. Each ordinary event is then encoded
+/// while its provider payload is intact and moved into the canonical response
+/// tree; terminal events move their response first and encode a borrowed view of
+/// that tree. A rejected chunk therefore retains neither payload nor milestones.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preflight and ordered move/serialize commit share one transaction"
+)]
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     events: Vec<ResponsesEvent>,
     output_capacity: usize,
 ) -> Result<Vec<u8>, SseParseError> {
-    for event in &events {
-        let retained_clone_bytes = accumulate_event(ctx, state, event);
-        // A `function_call_arguments.done` clones a whole retained output item into
-        // `tool_calls` — the one accumulator whose growth the driving `done` frame
-        // does not bound. Charge that measured clone here, where it happens, and fail
-        // the chunk closed the instant the request-wide byte total exceeds the cap.
-        // Charging the actual clone (not a phase-1 prediction) is exact and
-        // O(clone size): it cannot diverge from the item the commit retained, and the
-        // per-event check bounds transient overshoot to a single clone.
-        if retained_clone_bytes > 0 {
-            let accumulated_bytes = {
-                let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-                responses.stream_accumulated_bytes =
-                    responses.stream_accumulated_bytes.saturating_add(retained_clone_bytes);
-                responses.stream_accumulated_bytes
-            };
-            if let Some(error) = accumulation_bytes_exceeded(state, accumulated_bytes) {
-                return Err(error);
-            }
-        }
+    if let Some(count) = projected_accumulation_count(state, ctx, &events)
+        && count > state.max_output_items
+    {
+        return Err(SseParseError::AccumulationLimitExceeded {
+            dimension: "output_items",
+            value: count,
+            limit: state.max_output_items,
+        });
     }
-
-    // The retained item count only exists after phase 2a grows it. Enforce it here,
-    // before phase 2b records any delivery milestone, so a rejected chunk leaves no
-    // milestone for undelivered bytes. Any overshoot is bounded to a single chunk.
-    if let Some(error) = accumulation_count_exceeded(state, ctx) {
-        return Err(error);
-    }
-
     let mut logical_output = if ctx
         .extensions
         .get::<ResponsesState>()
@@ -1135,8 +1119,22 @@ fn commit_chunk_events(
     } else {
         Vec::new()
     };
-    for event in events {
-        append_logical_event(state, ctx, event, &mut logical_output);
+    for mut event in events {
+        // Ordinary events must be serialized while their provider-owned payload
+        // is intact, then move any output item into the canonical response tree.
+        // Terminal events reverse the order: move the authoritative response
+        // tree first, then retain only the lightweight envelope metadata.
+        if event.is_terminal() {
+            accumulate_event(ctx, state, &mut event);
+            append_logical_event(state, ctx, &mut event, &mut logical_output);
+        } else {
+            append_logical_event(state, ctx, &mut event, &mut logical_output);
+            accumulate_event(ctx, state, &mut event);
+        }
+    }
+
+    if let Some(error) = accumulation_count_exceeded(state, ctx) {
+        return Err(error);
     }
 
     // Mirror the parser's deferred-`[DONE]` decision into shared response state,
@@ -1174,7 +1172,7 @@ fn is_response_lifecycle_creation(event: &ResponsesEvent) -> bool {
 fn append_logical_event(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
-    event: ResponsesEvent,
+    event: &mut ResponsesEvent,
     output: &mut Vec<u8>,
 ) {
     // #313 §4/§6: classify locally-executable file_search items at first sight and
@@ -1253,11 +1251,11 @@ fn append_logical_event(
         let event_type = event.event_type().to_owned();
         state.deferred_terminal = Some(DeferredTerminalEvent {
             event_type,
-            payload: event.into_payload(),
+            metadata: event.payload_mut().take(),
         });
         return;
     }
-    if state.iteration > 0 && is_response_lifecycle_creation(&event) {
+    if state.iteration > 0 && is_response_lifecycle_creation(event) {
         return;
     }
 
@@ -1265,14 +1263,14 @@ fn append_logical_event(
     // (record streamed milestones, flush pending local items ahead of the first
     // resumed event, suppress a premature local-tool `done`). Returns true when
     // this event must not be forwarded.
-    if commit_local_tool_milestones(state, ctx, &event, output) {
+    if commit_local_tool_milestones(state, ctx, event, output) {
         return;
     }
 
     let event_type = event.event_type().to_owned();
-    let mut payload = event.into_payload();
-    normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
-    encode_sse_event(&event_type, &payload, output);
+    let payload = event.payload_mut();
+    normalize_logical_payload(ctx, payload, state.output_index_offset);
+    encode_sse_event(&event_type, payload, output);
 }
 
 /// Reconcile locally executed tool items against the resumed model stream for one
@@ -1604,14 +1602,15 @@ fn flush_local_output_items(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8
         None => return,
     };
     for pending in pending {
-        let PendingItem {
-            index,
-            item,
-            digest,
-            plan,
-        } = pending;
-        if let Some(id) = item.get("id").and_then(Value::as_str) {
-            let id = id.to_owned();
+        let PendingItem { index, digest, plan } = pending;
+        let id = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .and_then(|state| state.accumulated_output.get(index))
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(id) = id {
             // This pass emits the `done` envelope iff the plan says so, so record
             // the finalizer only when it is actually delivered.
             let done_delivered = plan.emit_done;
@@ -1631,7 +1630,7 @@ fn flush_local_output_items(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8
                 emitted.content_digest = digest;
             });
         }
-        synthesize_local_item(ctx, output, index, item, plan);
+        synthesize_local_item(ctx, output, index, plan);
     }
 }
 
@@ -1672,12 +1671,7 @@ fn collect_pending_local_items(state: &ResponsesState) -> Vec<PendingItem> {
             let digest = item_digest(item);
             let previous = state.emitted_output_items.get(id);
             let plan = plan_pending_item(previous, item, digest)?;
-            Some(PendingItem {
-                index,
-                item: item.clone(),
-                digest,
-                plan,
-            })
+            Some(PendingItem { index, digest, plan })
         })
         .collect()
 }
@@ -1754,8 +1748,6 @@ fn max_streamed_ordinal(expected: &[&'static str], streamed: Option<&BTreeSet<St
 struct PendingItem {
     /// Absolute output index in `accumulated_output`.
     index: usize,
-    /// The owned output item, moved through the synthesized events.
-    item: Value,
     /// The item's content digest, recorded before synthesis.
     digest: u64,
     /// Which lifecycle milestones this synthesis pass must emit.
@@ -1787,59 +1779,97 @@ struct EmissionPlan {
 /// after accounting for anything the model streamed in-band), then the finalizing
 /// `output_item.done` (only when `plan.emit_done`). A partial in-band lifecycle
 /// therefore gets only its missing phases; a content-change re-emission gets just
-/// the refreshed `done` envelope. The owned item is moved into `added`, reclaimed
-/// via `take`, then moved into `done`, so the full item is never cloned here.
-fn synthesize_local_item(
-    ctx: &mut HttpFilterContext<'_>,
-    output: &mut Vec<u8>,
-    index: usize,
-    mut item: Value,
-    plan: EmissionPlan,
-) {
+/// the refreshed `done` envelope. Both item-carrying envelopes borrow the
+/// canonical accumulator item.
+fn synthesize_local_item(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>, index: usize, plan: EmissionPlan) {
     let output_index = u64::try_from(index).unwrap_or(u64::MAX);
-    let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let item_id = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.accumulated_output.get(index))
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
 
     if plan.emit_added {
-        let mut added = item_lifecycle_payload("response.output_item.added", output_index, item);
-        normalize_logical_payload(ctx, &mut added, 0);
-        encode_sse_event("response.output_item.added", &added, output);
-        // Reclaim ownership of the item (leaving `null` behind) so the `done`
-        // event below reuses it without a second clone.
-        item = added.get_mut("item").map(Value::take).unwrap_or_default();
+        encode_borrowed_item_lifecycle(ctx, output, "response.output_item.added", output_index, index);
     }
 
     for event_type in plan.phases {
-        let mut payload = serde_json::json!({
-            "type": event_type,
-            "item_id": item_id,
-            "output_index": output_index,
-            "sequence_number": 0,
-        });
-        normalize_logical_payload(ctx, &mut payload, 0);
+        let payload = BorrowedToolPhase {
+            event_type,
+            item_id: &item_id,
+            output_index,
+            sequence_number: take_logical_sequence(ctx),
+        };
         encode_sse_event(event_type, &payload, output);
     }
 
     if plan.emit_done {
-        let mut done = item_lifecycle_payload("response.output_item.done", output_index, item);
-        normalize_logical_payload(ctx, &mut done, 0);
-        encode_sse_event("response.output_item.done", &done, output);
+        encode_borrowed_item_lifecycle(ctx, output, "response.output_item.done", output_index, index);
     }
 }
 
-/// Build an `output_item.added`/`output_item.done` payload, moving the item in.
-///
-/// The object is assembled with `Map::insert` rather than `json!` so the item is
-/// moved rather than deep-cloned through serialization (AGENTS.md ownership
-/// rule). `output_index` is already absolute, so callers normalize with a zero
-/// offset; normalization only rewrites the logical response id and sequence.
-fn item_lifecycle_payload(event_type: &str, output_index: u64, item: Value) -> Value {
-    let mut object = serde_json::Map::new();
-    object.insert("type".to_owned(), Value::String(event_type.to_owned()));
-    object.insert("response_id".to_owned(), Value::Null);
-    object.insert("output_index".to_owned(), Value::from(output_index));
-    object.insert("item".to_owned(), item);
-    object.insert("sequence_number".to_owned(), Value::from(0));
-    Value::Object(object)
+/// Serialize an item envelope without constructing an owned payload tree.
+fn encode_borrowed_item_lifecycle(
+    ctx: &mut HttpFilterContext<'_>,
+    output: &mut Vec<u8>,
+    event_type: &str,
+    output_index: u64,
+    item_index: usize,
+) {
+    let sequence_number = take_logical_sequence(ctx);
+    let state = ctx.extensions.get::<ResponsesState>();
+    let Some(item) = state.and_then(|state| state.accumulated_output.get(item_index)) else {
+        return;
+    };
+    let payload = BorrowedItemLifecycle {
+        event_type,
+        response_id: state.and_then(|state| state.logical_stream_response_id.as_deref()),
+        output_index,
+        item,
+        sequence_number,
+    };
+    encode_sse_event(event_type, &payload, output);
+}
+
+/// Take and advance the request-wide logical SSE sequence number.
+pub(super) fn take_logical_sequence(ctx: &mut HttpFilterContext<'_>) -> u64 {
+    let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
+    let sequence = state.logical_stream_sequence;
+    state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
+    sequence
+}
+
+/// Borrowed output-item lifecycle envelope.
+#[derive(Serialize)]
+struct BorrowedItemLifecycle<'a> {
+    #[serde(rename = "type")]
+    /// SSE payload discriminator.
+    event_type: &'a str,
+    /// Logical response identifier, when known.
+    response_id: Option<&'a str>,
+    /// Absolute canonical output index.
+    output_index: u64,
+    /// Canonical output item.
+    item: &'a Value,
+    /// Monotonic logical-stream sequence number.
+    sequence_number: u64,
+}
+
+/// Borrowed tool-specific progress envelope.
+#[derive(Serialize)]
+struct BorrowedToolPhase<'a> {
+    #[serde(rename = "type")]
+    /// SSE payload discriminator.
+    event_type: &'a str,
+    /// Canonical item identifier.
+    item_id: &'a str,
+    /// Absolute canonical output index.
+    output_index: u64,
+    /// Monotonic logical-stream sequence number.
+    sequence_number: u64,
 }
 
 /// The full ordered tool-specific lifecycle a local item owes the client between
@@ -1943,7 +1973,7 @@ fn normalize_logical_payload(ctx: &mut HttpFilterContext<'_>, payload: &mut Valu
 }
 
 /// Encode one canonical single-line SSE event.
-fn encode_sse_event(event_type: &str, payload: &Value, output: &mut Vec<u8>) {
+pub(super) fn encode_sse_event(event_type: &str, payload: &(impl Serialize + ?Sized), output: &mut Vec<u8>) {
     output.extend_from_slice(b"event: ");
     output.extend_from_slice(event_type.as_bytes());
     output.extend_from_slice(b"\ndata: ");
@@ -2223,8 +2253,8 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     ctx.insert_filter_state(parser_state);
 }
 
-/// Emit the deferred terminal snapshot as the logical stream's final event,
-/// preceded by any locally generated tool items not yet streamed to the client.
+/// Emit the deferred terminal metadata plus a borrowed view of the canonical
+/// response, preceded by any locally generated tool items not yet streamed.
 #[expect(clippy::too_many_lines, reason = "ordered logical stream terminal reconciliation")]
 fn emit_deferred_terminal(
     ctx: &mut HttpFilterContext<'_>,
@@ -2234,7 +2264,7 @@ fn emit_deferred_terminal(
 ) -> bool {
     // #276: stream any locally generated tool items that never reached the
     // client as incremental events (e.g. an MCP approval request that ends the
-    // loop without a resumed round) before the terminal snapshot.
+    // loop without a resumed round) before the borrowed terminal view.
     if !flush_local_output_items_with_budget(ctx, parser_state, output) {
         return false;
     }
@@ -2260,21 +2290,22 @@ fn emit_deferred_terminal(
         record_retained_payload_overflow(ctx, parser_state);
         return false;
     }
-    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id);
-    if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
-        response.insert("output".to_owned(), Value::Array(accumulated_output));
-        if !usage.is_null() {
-            response.insert("usage".to_owned(), usage);
-        }
-    }
-    let terminal_bytes = retained_json_bytes(&terminal.payload).unwrap_or(usize::MAX);
+    canonicalize_logical_response(state, restore_previous_response_id);
+    normalize_logical_payload(ctx, &mut terminal.metadata, parser_state.output_index_offset);
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return false;
+    };
+    let borrowed_terminal = BorrowedTerminalPayload {
+        metadata: &terminal.metadata,
+        response: &state.response_object,
+    };
+    let terminal_bytes = retained_json_bytes(&borrowed_terminal).unwrap_or(usize::MAX);
     if !stream_payload_fits(ctx, parser_state, output.len().saturating_add(terminal_bytes)) {
         output.clear();
         record_retained_payload_overflow(ctx, parser_state);
         return false;
     }
-    normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
-    encode_sse_event(&terminal.event_type, &terminal.payload, output);
+    encode_sse_event(&terminal.event_type, &borrowed_terminal, output);
     if parser_state.deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
@@ -2349,12 +2380,12 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 ///
 /// Either way the id is only ever restored, never fabricated: a non-rehydrated
 /// turn keeps the real value the backend echoed.
-fn canonicalize_logical_response(
-    state: &mut ResponsesState,
-    restore_previous_response_id: bool,
-) -> (Vec<Value>, Value) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "terminal ownership move, annotation, and identity restoration"
+)]
+fn canonicalize_logical_response(state: &mut ResponsesState, restore_previous_response_id: bool) {
     let logical_id = state.logical_stream_response_id.clone();
-    let usage = state.usage.clone();
     let restored_previous_response_id = restore_previous_response_id
         .then(|| state.previous_response_id.clone())
         .flatten();
@@ -2362,11 +2393,19 @@ fn canonicalize_logical_response(
     // (agentic pipelines). When no such filter ran — a plain one-round logical
     // stream — it stays empty, so fall back to the terminal event's own output
     // rather than clobber it with nothing. Mirrors `finalize_response_body`.
-    let mut output = if state.accumulated_output.is_empty() {
-        state.output_items().to_vec()
-    } else {
-        state.accumulated_output.clone()
-    };
+    if !state.accumulated_output.is_empty()
+        && let Some(response) = state.response_object.as_object_mut()
+    {
+        response.insert(
+            "output".to_owned(),
+            Value::Array(std::mem::take(&mut state.accumulated_output)),
+        );
+    }
+    // Terminal canonicalization invalidates every absolute assignment into the
+    // accumulator. No dispatcher may run after this point.
+    state.tool_calls.clear();
+    state.tool_search_calls.clear();
+    state.web_search_calls.clear();
     // Rewrite file_search citation markers into typed annotations on the final
     // assistant message, mirroring the buffered `annotate_response` finalize
     // path. In streaming the dispatcher reconciled `citation_files` during a
@@ -2375,10 +2414,15 @@ fn canonicalize_logical_response(
     // No-op when no dispatcher recorded citation files. Best-effort: the logical
     // stream is already committed here, so a malformed marker degrades to
     // un-annotated text rather than aborting the terminal.
-    if let Err(error) = crate::openai::responses::file_search_callout::citations::annotate_output_items(
-        &mut output,
-        &state.citation_files,
-    ) {
+    let output = state
+        .response_object
+        .get_mut("output")
+        .and_then(Value::as_array_mut)
+        .map(Vec::as_mut_slice)
+        .unwrap_or_default();
+    if let Err(error) =
+        crate::openai::responses::file_search_callout::citations::annotate_output_items(output, &state.citation_files)
+    {
         tracing::warn!(%error, "failed to annotate logical stream response citations");
     }
     if let Some(response) = state.response_object.as_object_mut() {
@@ -2388,12 +2432,39 @@ fn canonicalize_logical_response(
         if let Some(prev_id) = restored_previous_response_id {
             response.insert("previous_response_id".to_owned(), Value::String(prev_id));
         }
-        response.insert("output".to_owned(), Value::Array(output.clone()));
-        if !usage.is_null() {
-            response.insert("usage".to_owned(), usage.clone());
+        if !state.usage.is_null() {
+            response.insert("usage".to_owned(), std::mem::take(&mut state.usage));
         }
     }
-    (output, usage)
+}
+
+/// Borrowed serializer for a terminal event whose canonical response tree is
+/// owned by [`ResponsesState`].
+struct BorrowedTerminalPayload<'a> {
+    /// Deferred terminal envelope fields other than the response.
+    metadata: &'a Value,
+    /// Canonical response tree serialized into the envelope.
+    response: &'a Value,
+}
+
+impl Serialize for BorrowedTerminalPayload<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let metadata = self.metadata.as_object();
+        let len = metadata.map_or(1, |object| usize::from(!object.contains_key("response")) + object.len());
+        let mut map = serializer.serialize_map(Some(len))?;
+        if let Some(metadata) = metadata {
+            for (key, value) in metadata {
+                if key != "response" {
+                    map.serialize_entry(key, value)?;
+                }
+            }
+        }
+        map.serialize_entry("response", self.response)?;
+        map.end()
+    }
 }
 
 /// Check whether the stream has exceeded its wall-clock timeout.

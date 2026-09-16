@@ -1246,6 +1246,7 @@ mod tests {
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1283,11 +1284,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 25);
-        assert_eq!(report.scenarios_total, 25);
-        assert_eq!(report.recordings_total, 30);
+        assert_eq!(report.features_total, 26);
+        assert_eq!(report.scenarios_total, 26);
+        assert_eq!(report.recordings_total, 31);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1319,7 +1321,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 25);
+        assert_eq!(manifest.features.len(), 26);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest

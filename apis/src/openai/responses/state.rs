@@ -61,6 +61,50 @@ pub(crate) struct FileSearchAssignment {
     pub synthesis: SynthesisKind,
 }
 
+/// Absolute reference to an item in [`ResponsesState::accumulated_output`].
+///
+/// Dispatch queues retain these fixed-size references instead of cloning the
+/// provider output item into a second JSON owner. The accumulator remains the
+/// canonical public-response owner until terminal finalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputAssignment {
+    /// Absolute index of the assigned output item.
+    pub output_index: usize,
+}
+
+/// One hosted web-search call assigned to the local dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WebSearchAssignment {
+    /// Absolute index of the canonical `web_search_call` output item.
+    pub output_index: usize,
+    /// Position among web-search calls in the current model round.
+    pub ordinal: usize,
+}
+
+/// Compact invocation reconstructed from a server-owned MCP approval.
+///
+/// Approval resumptions have no current-round provider output item to point at,
+/// so they retain only the fields execution needs. In particular the approval
+/// id is owned once and serves as both the call id and approval correlation id.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ApprovedMcpInvocation {
+    /// Encoded function name used to resolve the MCP target.
+    pub encoded_name: String,
+    /// Original approval id, also used as the MCP call id.
+    pub approval_id: String,
+    /// JSON-encoded invocation arguments.
+    pub arguments: String,
+}
+
+/// Dispatch reference for one function call.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToolCallAssignment {
+    /// Provider-produced call owned by `accumulated_output`.
+    Output(OutputAssignment),
+    /// Approved call reconstructed from the durable approval record.
+    Approved(ApprovedMcpInvocation),
+}
+
 /// A terminal failure a request-phase dispatcher recorded in shared state.
 ///
 /// A dispatcher (e.g. `openai_file_search_callout`) never rejects or rewrites a
@@ -448,20 +492,23 @@ pub(crate) struct ResponsesState {
     /// Its output has already been drained into [`Self::accumulated_output`].
     pub local_completion_response_template: serde_json::Value,
 
-    /// Tool calls from the current inference response only.
+    /// Tool calls selected for dispatch from the current inference response.
     ///
     /// Cleared by `openai_agentic_loop` at the start of each iteration
     /// before `stream_events` writes new ones. Without explicit
     /// clearing, stale tool calls from a previous iteration cause
     /// duplicate dispatch.
-    pub tool_calls: Vec<serde_json::Value>,
+    /// Provider-produced calls are fixed-size absolute assignments into
+    /// [`Self::accumulated_output`]. Approval resumptions use a compact typed
+    /// invocation because no provider output item owns their arguments.
+    pub tool_calls: Vec<ToolCallAssignment>,
 
     /// `tool_search_call` items from the current inference response.
     ///
     /// Cleared by `openai_agentic_loop` at the start of each iteration.
     /// `openai_mcp_dispatch` consumes these to load deferred connector
     /// tools before the next inference round.
-    pub tool_search_calls: Vec<serde_json::Value>,
+    pub tool_search_calls: Vec<OutputAssignment>,
 
     /// Web search calls from the current inference response only.
     ///
@@ -469,7 +516,7 @@ pub(crate) struct ResponsesState {
     /// Stored separately from `tool_calls` because `web_search_call`
     /// items have a different shape (`action.query` instead of
     /// `name`/`arguments`) and are dispatched by a different filter.
-    pub web_search_calls: Vec<serde_json::Value>,
+    pub web_search_calls: Vec<WebSearchAssignment>,
 
     /// Cumulative web searches dispatched to the provider across all
     /// agentic-loop iterations.
@@ -518,7 +565,7 @@ pub(crate) struct ResponsesState {
     ///
     /// Request-wide (not per-round) because the memory it bounds —
     /// [`Self::accumulated_output`], [`Self::emitted_output_items`], and the
-    /// terminal snapshot — persists across rounds: resetting the counter each
+    /// canonical terminal tree — persists across rounds: resetting the counter each
     /// round would let a multi-round stream accumulate unbounded state while no
     /// single round trips the cap. Monotonically non-decreasing, so once the
     /// budget is exceeded the stream stays failed closed. A fixed `usize`, so it
@@ -845,11 +892,20 @@ impl ResponsesState {
             &self.messages,
             &self.persisted_messages,
             &self.previous_tools,
-            &self.tool_calls,
             &self.tools,
-            &self.web_search_calls,
         ] {
             meter.json_values(values)?;
+        }
+        for call in &self.tool_calls {
+            if let ToolCallAssignment::Approved(invocation) = call {
+                meter.raw(
+                    invocation
+                        .encoded_name
+                        .len()
+                        .saturating_add(invocation.approval_id.len())
+                        .saturating_add(invocation.arguments.len()),
+                )?;
+            }
         }
         for value in [
             self.context_management.as_ref(),
@@ -1117,9 +1173,14 @@ impl ResponsesState {
                 );
             }
             if !self.usage.is_null() {
-                obj.insert("usage".to_owned(), self.usage.clone());
+                obj.insert("usage".to_owned(), std::mem::take(&mut self.usage));
             }
         }
+        // The assignments point into `accumulated_output`, whose owner has just
+        // moved into the terminal response. Finalization never dispatches them.
+        self.tool_calls.clear();
+        self.tool_search_calls.clear();
+        self.web_search_calls.clear();
         if let Err(error) = annotate_response(&mut response, &self.citation_files) {
             tracing::warn!(%error, "failed to annotate final response");
             self.response_object = response;
@@ -1145,15 +1206,17 @@ impl ResponsesState {
                 "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during final serialization",
             ));
         }
-        let serialized = match serde_json::to_vec(&response) {
+        // Commit the canonical tree before serialization, release the obsolete
+        // upstream buffered body, and serialize the sole tree by reference.
+        self.response_object = response;
+        *body = None;
+        let serialized = match serde_json::to_vec(&self.response_object) {
             Ok(serialized) => serialized,
             Err(error) => {
                 tracing::warn!(%error, "failed to encode final response");
-                self.response_object = response;
                 return Err(finalize_rejection("failed to encode final response"));
             },
         };
-        self.response_object = response;
         *body = Some(Bytes::from(serialized));
         Ok(())
     }
@@ -1170,6 +1233,12 @@ impl ResponsesState {
     /// time (drain-once), mirroring [`Self::drain_pending_local_tool_synthesis`].
     pub fn drain_file_search_assignments(&mut self) -> Vec<FileSearchAssignment> {
         std::mem::take(&mut self.file_search_assignments)
+    }
+
+    /// Resolve one fixed-size output assignment against the canonical
+    /// accumulator.
+    pub(crate) fn assigned_output(&self, assignment: OutputAssignment) -> Option<&serde_json::Value> {
+        self.accumulated_output.get(assignment.output_index)
     }
 }
 
@@ -1243,11 +1312,58 @@ fn finalize_rejection(message: &str) -> FilterAction {
 /// displace an earlier built-in call (or vice versa). MCP calls are exempt from
 /// this budget (see [`is_builtin_tool_call`]), so they never appear as budget
 /// consumers even when interleaved with the target calls in model output order.
+#[cfg(test)]
 pub(crate) fn current_round_tool_call_admissions(
     state: &ResponsesState,
     target_calls: &[serde_json::Value],
 ) -> Vec<bool> {
     current_round_tool_call_admissions_by(state, target_calls.len(), |index| target_calls.get(index))
+}
+
+/// Return ordered built-in-budget admissions for web-search assignments.
+pub(crate) fn current_round_web_search_admissions(
+    state: &ResponsesState,
+    assignments: &[WebSearchAssignment],
+) -> Vec<bool> {
+    current_round_output_assignment_admissions(state, assignments.iter().map(|assignment| assignment.output_index))
+}
+
+/// Return ordered built-in-budget admissions for generic output assignments.
+pub(crate) fn current_round_output_assignment_admissions(
+    state: &ResponsesState,
+    assignments: impl IntoIterator<Item = usize>,
+) -> Vec<bool> {
+    let targets = assignments.into_iter().collect::<Vec<_>>();
+    let previous_calls = consumed_builtin_tool_calls_before_current_round(state);
+    let mut remaining = state.max_tool_calls.map_or(usize::MAX, |limit| {
+        usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(previous_calls)
+    });
+    let mut admissions = Vec::with_capacity(targets.len());
+    let mut target = 0;
+    let round_start = state
+        .current_round_output_start
+        .unwrap_or(state.accumulated_output.len());
+
+    for (offset, item) in state
+        .accumulated_output
+        .get(round_start..)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let admitted = !is_builtin_tool_call(item) || remaining > 0;
+        if is_builtin_tool_call(item) {
+            remaining = remaining.saturating_sub(1);
+        }
+        let absolute = round_start.saturating_add(offset);
+        if targets.get(target).copied() == Some(absolute) {
+            admissions.push(admitted);
+            target = target.saturating_add(1);
+        }
+    }
+    admissions
 }
 
 /// Return budget admission decisions for file-search assignments in model order.
@@ -1301,6 +1417,7 @@ pub(crate) fn current_round_file_search_admissions(
 }
 
 /// Replay model output order against an arbitrary borrowed target-call view.
+#[cfg(test)]
 fn current_round_tool_call_admissions_by<'a>(
     state: &ResponsesState,
     target_count: usize,
@@ -1349,7 +1466,10 @@ pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> 
     if remaining == 0 {
         return false;
     }
-    let admissions = current_round_tool_call_admissions(state, &state.tool_search_calls);
+    let admissions = current_round_output_assignment_admissions(
+        state,
+        state.tool_search_calls.iter().map(|assignment| assignment.output_index),
+    );
     admissions.is_empty() || admissions.into_iter().any(|admitted| admitted)
 }
 
@@ -1478,8 +1598,13 @@ mod tests {
         state.previous_usage = Some(value.clone());
         state.original_tool_choice = Some(value.clone());
         state.previous_tools.push(value.clone());
-        state.tool_calls.push(value.clone());
-        state.web_search_calls.push(value.clone());
+        state
+            .tool_calls
+            .push(ToolCallAssignment::Output(OutputAssignment { output_index: 0 }));
+        state.web_search_calls.push(WebSearchAssignment {
+            output_index: 0,
+            ordinal: 0,
+        });
         state.tools.push(value.clone());
         state
             .mcp_tool_map
@@ -1501,7 +1626,7 @@ mod tests {
         });
 
         let replaced_null = retained_json_bytes(&serde_json::Value::Null).unwrap();
-        let json_delta = bytes * 10 - replaced_null;
+        let json_delta = bytes * 8 - replaced_null;
         let raw_delta = "server".len()
             + "tool".len()
             + "usage".len()
@@ -1845,10 +1970,11 @@ mod tests {
 
     #[test]
     fn tool_search_discovery_rejects_exhausted_budget() {
-        let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
         let exhausted = ResponsesState {
             max_tool_calls: Some(0),
-            tool_search_calls: vec![search.clone()],
+            current_round_output_start: Some(0),
+            accumulated_output: vec![json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"})],
+            tool_search_calls: vec![OutputAssignment { output_index: 0 }],
             ..ResponsesState::default()
         };
         assert!(
@@ -1858,7 +1984,9 @@ mod tests {
 
         let admitted = ResponsesState {
             max_tool_calls: Some(1),
-            tool_search_calls: vec![search],
+            current_round_output_start: Some(0),
+            accumulated_output: vec![json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"})],
+            tool_search_calls: vec![OutputAssignment { output_index: 0 }],
             ..ResponsesState::default()
         };
         assert!(
@@ -1875,7 +2003,7 @@ mod tests {
             max_tool_calls: Some(1),
             accumulated_output: vec![web.clone(), search.clone()],
             response_object: json!({"output": [web, search.clone()]}),
-            tool_search_calls: vec![search],
+            tool_search_calls: vec![OutputAssignment { output_index: 1 }],
             ..ResponsesState::default()
         };
         assert!(
