@@ -62,6 +62,13 @@ COMPACT_CONFIG_PATH = "examples/configs/openai/responses/compact.yaml"
 WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/web-search-chat-completions.yaml"
 )
+# The full-flow example trusts these only after an authentication gateway has
+# overwritten them. This harness connects directly to Praxis, so it emulates
+# that boundary for clients using the full-flow configuration.
+TRUSTED_OWNER_HEADERS = {
+    "x-auth-tenant": "test-tenant",
+    "x-auth-user": "test-user",
+}
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -1050,6 +1057,7 @@ def _witness_proxy_session(tmp_path_factory, request):
         client = OpenAI(
             base_url=f"http://127.0.0.1:{port}/v1",
             api_key="test",
+            default_headers=TRUSTED_OWNER_HEADERS,
             max_retries=0,
             timeout=300,
         )
@@ -1084,6 +1092,19 @@ def openai_client(praxis_proxy):
     return OpenAI(
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         api_key="test",
+        default_headers=TRUSTED_OWNER_HEADERS,
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def other_owner_openai_client(praxis_proxy):
+    """Return a same-tenant Responses client with another subject."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
+        api_key="test",
+        default_headers={**TRUSTED_OWNER_HEADERS, "x-auth-user": "other-test-user"},
         max_retries=0,
         timeout=300,
     )
@@ -1224,6 +1245,33 @@ class TestOpenAIResponsesVLLM:
         assert retrieved.output_text == response.output_text
         _assert_usage(retrieved.usage)
 
+    def test_same_tenant_other_owner_cannot_access_response(
+        self, openai_client, other_owner_openai_client
+    ):
+        response = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: OWNER-PRIVATE /no_think",
+            temperature=0,
+            store=True,
+            max_output_tokens=128,
+        )
+
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.retrieve(response.id)
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.input_items.list(response.id)
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.delete(response.id)
+        with pytest.raises(BadRequestError):
+            other_owner_openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="This must not use another owner's state.",
+                previous_response_id=response.id,
+                store=True,
+            )
+
+        assert openai_client.responses.retrieve(response.id).id == response.id
+
     def test_stored_input_items_pagination_and_delete(self, openai_client):
         response = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -1343,7 +1391,7 @@ class TestOpenAIResponsesVLLM:
         # application/json error envelope, not an SSE error event.
         raw = httpx.post(
             f"{str(openai_client.base_url).rstrip('/')}/responses",
-            headers={"Authorization": "Bearer test"},
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
             json={
                 "model": VLLM_MODEL,
                 "input": "This request must not reach vLLM.",
@@ -1367,7 +1415,7 @@ class TestOpenAIResponsesVLLM:
     def test_malformed_request_has_sdk_compatible_error(self, openai_client):
         response = httpx.post(
             f"{str(openai_client.base_url).rstrip('/')}/responses",
-            headers={"Authorization": "Bearer test"},
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
             json={},
             timeout=10,
         )

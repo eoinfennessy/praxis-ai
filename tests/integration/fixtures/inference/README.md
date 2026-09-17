@@ -48,6 +48,7 @@ The manifest declares **26 features** across **5 scopes**, linked to **26 scenar
 | `responses_agentic_loop` | `responses.agentic.deferred_mcp_connectors` | `synthetic_only` | `responses/agentic-deferred-mcp-connectors` | `synthetic`: `synthetic_only` |
 | `responses_to_chat_completions` | `responses.chat.continuation` | `synthetic_only` | `responses/chat-basic-nonstream` | `synthetic`: `synthetic_only` |
 | `responses_to_chat_completions` | `responses.chat.malformed_compaction` | `synthetic_only` | `responses/chat-malformed-compaction` | `synthetic`: `synthetic_only` |
+| `responses_to_chat_completions` | `responses.chat.unrepresentable_parameters` | `synthetic_only` | `responses/chat-unrepresentable-parameters` | `synthetic`: `synthetic_only` |
 | `responses_to_chat_completions` | `responses.chat.tools.function_echo` | `synthetic_only` | `responses/chat-tool-echo` | `synthetic`: `synthetic_only` |
 <!-- END GENERATED INFERENCE COVERAGE -->
 

@@ -8,7 +8,7 @@
 //! response classification, approval partitioning, and terminal policy. This
 //! dispatcher resumes client approval responses, lists deferred connectors
 //! after a hosted `tool_search_call`, and executes prepared MCP calls via
-//! [`mcp_client::call_tool`]. A streaming deferred `tools/list` failure is
+//! [`mcp_client::call_tool_with_forwarded_headers`]. A streaming deferred `tools/list` failure is
 //! stashed during the body pre-read and emitted from `on_request` as the
 //! canonical `response.mcp_list_tools.failed` / `response.failed` lifecycle.
 //!
@@ -44,6 +44,7 @@ mod config;
 mod tests;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Duration,
 };
@@ -60,18 +61,19 @@ use tracing::{debug, warn};
 
 use self::{
     approval::{
-        ApprovalError, ResolvedApproval, build_denial_message, extract_approval_responses, is_approval_response,
-        parse_approval_response, resolve_approval, target_fingerprint,
+        ApprovalError, ResolvedApproval, bind_forwarded_header_context, build_denial_message,
+        extract_approval_responses, is_approval_response, parse_approval_response, resolve_approval,
+        target_fingerprint,
     },
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config},
 };
 use super::{
-    DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
+    DEFAULT_STORE_NAME,
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure, discover_deferred_connectors,
-        has_pending_deferred_discovery, resolve_error_action,
+        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
+        discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
     state::{
         ApprovedMcpInvocation, DispatchFailure, McpApprovalState, ResponsesState, ToolCallAssignment,
@@ -79,9 +81,11 @@ use super::{
     },
 };
 use crate::{
+    callout_headers::effective_body_callout_headers,
     json_body::serialized_len,
     mcp_client,
-    store::{PendingApprovalRecord, ResponseStore, ResponseStoreRegistry},
+    state_owner::StateOwner,
+    store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseStoreRegistry},
 };
 
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
@@ -172,6 +176,17 @@ enum McpArgumentsRef<'a> {
     Encoded(&'a str),
 }
 
+/// Whether this internally resolved tool entry names a configured connector.
+///
+/// Optional fields are serialized into the tool map as JSON `null`, so field
+/// presence alone is not sufficient to distinguish a request-selected URL.
+pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
+    entry
+        .get("connector_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|connector_id| !connector_id.is_empty())
+}
+
 // -----------------------------------------------------------------------------
 // McpDispatchFilter
 // -----------------------------------------------------------------------------
@@ -189,16 +204,26 @@ enum McpArgumentsRef<'a> {
 ///
 /// ```yaml
 /// filter: openai_mcp_dispatch
+/// forward_headers:
+///   - x-tenant-id
+///   - x-user-id
 /// timeout_ms: 30000
 /// max_calls_per_round: 32
 /// max_parallel_calls: 8
 /// max_result_bytes: 1048576
 /// max_total_result_bytes: 8388608
 /// ```
+///
+/// `forward_headers` applies only to connector-backed tools resolved by
+/// `openai_mcp_tool_resolve`. Direct client-selected `server_url` targets never
+/// receive ambient request headers. Credential headers are rejected; use the
+/// MCP tool entry's dedicated `authorization` field for per-target credentials.
 #[derive(Clone)]
 pub struct McpDispatchFilter {
     /// Allow connections to loopback addresses.
     allow_loopback: bool,
+    /// Trusted request headers explicitly allowed across the MCP boundary.
+    forward_headers: Vec<http::HeaderName>,
     /// Timeout for MCP tool calls.
     timeout: Duration,
     /// Hard cap on calls accepted from one model round.
@@ -222,6 +247,11 @@ impl McpDispatchFilter {
         let validated = build_config(cfg)?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
+            forward_headers: validated
+                .forward_headers
+                .iter()
+                .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+                .collect(),
             timeout: Duration::from_millis(validated.timeout_ms),
             max_calls_per_round: validated.max_calls_per_round,
             max_parallel_calls: validated.max_parallel_calls,
@@ -242,6 +272,7 @@ impl McpDispatchFilter {
         mcp_calls: &[McpCallRef<'_>],
         tool_index: &McpToolIndex<'_>,
         max_total_result_bytes: usize,
+        forwarded_headers: &http::HeaderMap,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -257,8 +288,32 @@ impl McpDispatchFilter {
             max_total_result_bytes: execution_batch_limit,
             timeout: self.timeout,
             allow_loopback: self.allow_loopback,
+            forwarded_header_names: &self.forward_headers,
+            forwarded_headers: Some(forwarded_headers),
         };
         execute_mcp_calls(mcp_calls, tool_index, options).await
+    }
+
+    /// Select only configured headers from the effective body-phase request.
+    fn forwarded_headers(&self, ctx: &HttpFilterContext<'_>) -> http::HeaderMap {
+        let effective = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
+        let mut forwarded = http::HeaderMap::with_capacity(self.forward_headers.len());
+        for name in &self.forward_headers {
+            if let Some(value) = effective.get(name) {
+                forwarded.insert(name.clone(), value.clone());
+            }
+        }
+        forwarded
+    }
+
+    /// Bind connector approvals to the ambient headers this request will send.
+    fn bind_request_forwarded_header_context(&self, ctx: &mut HttpFilterContext<'_>, headers: &http::HeaderMap) {
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            return;
+        };
+        for entry in state.mcp_tool_map.values_mut() {
+            bind_forwarded_header_context(entry, &self.forward_headers, headers);
+        }
     }
 
     /// Append MCP execution results to private continuation and public output state.
@@ -356,7 +411,11 @@ impl McpDispatchFilter {
 
     /// Execute the request-side approval and MCP call lifecycle.
     #[expect(clippy::too_many_lines, reason = "ordered approval and bounded execution lifecycle")]
-    async fn dispatch(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn dispatch(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        forwarded_headers: &http::HeaderMap,
+    ) -> Result<FilterAction, FilterError> {
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
 
         // Resume approvals from the previous turn before executing any calls.
@@ -390,7 +449,13 @@ impl McpDispatchFilter {
             return Ok(Self::aggregate_budget_action(ctx));
         };
         let results = match self
-            .execute_pending_calls(state, &mcp_calls, &tool_index, max_total_result_bytes)
+            .execute_pending_calls(
+                state,
+                &mcp_calls,
+                &tool_index,
+                max_total_result_bytes,
+                forwarded_headers,
+            )
             .await
         {
             Ok(results) => results,
@@ -519,10 +584,14 @@ impl McpDispatchFilter {
         // persisted into the trace on a prior turn) has no matching pending row
         // and is therefore invisible here, and an approval issued by a different
         // response is out of scope under this previous_response_id.
-        let tenant_id_len = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID).len();
+        let owner = ctx.extensions.get::<StateOwner>().cloned().ok_or_else(|| {
+            responses_error_rejection(401, "missing_state_owner", "trusted state owner assertion is required")
+        })?;
         let input_local_bytes = approval_input_local_bytes(&inputs)
             .and_then(|bytes| bytes.checked_add(previous_response_id.len()))
-            .and_then(|bytes| bytes.checked_add(tenant_id_len));
+            .and_then(|bytes| bytes.checked_add(owner.tenant_id().len()))
+            .and_then(|bytes| bytes.checked_add(owner.issuer().len()))
+            .and_then(|bytes| bytes.checked_add(owner.subject().len()));
         if !input_local_bytes.is_some_and(|bytes| {
             ctx.extensions
                 .get::<ResponsesState>()
@@ -531,14 +600,10 @@ impl McpDispatchFilter {
             record_approval_budget_failure(ctx);
             return Ok(());
         }
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
         let store = ctx
             .extensions
             .get::<ResponseStoreRegistry>()
-            .and_then(|registry| registry.get(DEFAULT_STORE_NAME))
+            .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, &owner))
             .ok_or_else(|| {
                 warn!("mcp_dispatch: response store unavailable while resuming approvals");
                 responses_error_rejection(500, "server_error", "response store is not available")
@@ -550,7 +615,7 @@ impl McpDispatchFilter {
             .is_some_and(|state| state.retained_payload_limit().is_some());
         if aggregate_budget_armed {
             let pending_payload_bytes = store
-                .pending_approval_payload_bytes(&tenant_id, &previous_response_id, &approval_ids)
+                .pending_approval_payload_bytes(&previous_response_id, &approval_ids)
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "mcp_dispatch: failed to size pending approvals");
@@ -571,7 +636,7 @@ impl McpDispatchFilter {
             }
         }
         let pending_records = store
-            .get_pending_approvals(&tenant_id, &previous_response_id, &approval_ids)
+            .get_pending_approvals(&previous_response_id, &approval_ids)
             .await
             .map_err(|e| {
                 warn!(error = %e, "mcp_dispatch: failed to load pending approvals");
@@ -639,14 +704,7 @@ impl McpDispatchFilter {
         // approval was already consumed (replay) rather than never issued.
         let consumed_at = i64::try_from(ctx.time_source.now().as_millis()).unwrap_or(i64::MAX);
         let claim_ids: Vec<&str> = resolved.iter().map(|d| d.approval_id.as_str()).collect();
-        consume_batch(
-            store.as_ref(),
-            &tenant_id,
-            &previous_response_id,
-            &claim_ids,
-            consumed_at,
-        )
-        .await?;
+        consume_batch(&store, &previous_response_id, &claim_ids, consumed_at).await?;
 
         // Phase 4: apply the decisions to request-scoped state.
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -827,16 +885,12 @@ fn record_approval_budget_failure(ctx: &mut HttpFilterContext<'_>) {
 /// rejects the whole batch without consuming any id, so a corrected retry can
 /// still resume the legitimately approved calls.
 async fn consume_batch(
-    store: &dyn ResponseStore,
-    tenant_id: &str,
+    store: &OwnerScopedResponseStore,
     response_id: &str,
     approval_ids: &[&str],
     consumed_at: i64,
 ) -> Result<(), Rejection> {
-    match store
-        .consume_approvals(tenant_id, response_id, approval_ids, consumed_at)
-        .await
-    {
+    match store.consume_approvals(response_id, approval_ids, consumed_at).await {
         Ok(None) => Ok(()),
         Ok(Some(index)) => {
             let approval_id = approval_ids.get(index).copied().unwrap_or_default();
@@ -1140,6 +1194,10 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
 
+        ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        let forwarded_headers = self.forwarded_headers(ctx);
+        self.bind_request_forwarded_header_context(ctx, &forwarded_headers);
+
         // Praxis runs StreamBuffer request-body hooks before request-header
         // hooks. On the first turn the agentic loop therefore has not applied
         // its configured aggregate limit yet. Hand this filter instance to the
@@ -1182,13 +1240,13 @@ impl HttpFilter for McpDispatchFilter {
                 .as_ref()
                 .filter(|bytes| !bytes.is_empty())
                 .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
-            let action = discover_pending_connectors(ctx, bytes).await?;
+            let action = discover_pending_connectors(ctx, bytes, &self.forward_headers, &forwarded_headers).await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
             }
         }
 
-        self.dispatch(ctx).await
+        self.dispatch(ctx, &forwarded_headers).await
     }
 }
 
@@ -1222,6 +1280,10 @@ pub(crate) async fn dispatch_after_budget_admission(
     let Some(deferred) = ctx.extensions.remove::<DeferredInitialMcpDispatch>() else {
         return Ok(FilterAction::Continue);
     };
+    let forwarded_headers = deferred.0.forwarded_headers(ctx);
+    deferred
+        .0
+        .bind_request_forwarded_header_context(ctx, &forwarded_headers);
     let needs_discovery = ctx
         .extensions
         .get::<ResponsesState>()
@@ -1232,24 +1294,27 @@ pub(crate) async fn dispatch_after_budget_admission(
             .get::<ResponsesState>()
             .and_then(|state| serde_json::to_vec(&state.request_body).ok())
             .unwrap_or_default();
-        let action = discover_pending_connectors(ctx, &fallback).await?;
+        let action =
+            discover_pending_connectors(ctx, &fallback, &deferred.0.forward_headers, &forwarded_headers).await?;
         if !matches!(action, FilterAction::Continue) {
             return Ok(action);
         }
     }
-    deferred.0.dispatch(ctx).await
+    deferred.0.dispatch(ctx, &forwarded_headers).await
 }
 
 /// Load deferred connector tools when a hosted `tool_search_call` is pending.
 async fn discover_pending_connectors(
     ctx: &mut HttpFilterContext<'_>,
     body: &[u8],
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
 ) -> Result<FilterAction, FilterError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         warn!("ResponsesState missing when discovering deferred MCP connectors");
         return Ok(FilterAction::Continue);
     };
-    match discover_deferred_connectors(state).await {
+    match discover_deferred_connectors_with_forwarded_headers(state, forwarded_header_names, forwarded_headers).await {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
             let streaming = ctx
@@ -1799,7 +1864,7 @@ fn fit_result_or_limit_error(tool_call: McpCallRef<'_>, result: McpCallResult, r
 
 /// Controls execution of one homogeneous MCP call batch.
 #[derive(Clone, Copy)]
-struct McpExecutionOptions {
+struct McpExecutionOptions<'a> {
     /// Whether independent calls may execute concurrently.
     parallel: bool,
     /// Maximum number of calls concurrently in flight.
@@ -1812,6 +1877,10 @@ struct McpExecutionOptions {
     timeout: Duration,
     /// Whether MCP endpoints may resolve to loopback addresses.
     allow_loopback: bool,
+    /// Names reserved for trusted forwarding, including when values are absent.
+    forwarded_header_names: &'a [http::HeaderName],
+    /// Trusted request headers selected by operator configuration.
+    forwarded_headers: Option<&'a http::HeaderMap>,
 }
 
 /// Execute MCP tool calls — concurrently when `parallel` is true,
@@ -1819,7 +1888,7 @@ struct McpExecutionOptions {
 async fn execute_mcp_calls(
     mcp_calls: &[McpCallRef<'_>],
     tool_index: &McpToolIndex<'_>,
-    options: McpExecutionOptions,
+    options: McpExecutionOptions<'_>,
 ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
     let minimum_reservation = mcp_calls
         .len()
@@ -1850,14 +1919,10 @@ async fn execute_mcp_calls(
 /// Avoid detached tasks: dropping the request must also cancel every pending
 /// external side effect. Panics are converted to per-call errors so one faulty
 /// future does not discard successful siblings.
-#[expect(
-    clippy::too_many_lines,
-    reason = "task joining and ordered byte-budget commit are one lifecycle"
-)]
 async fn execute_parallel(
     mcp_calls: &[McpCallRef<'_>],
     tool_index: &McpToolIndex<'_>,
-    options: McpExecutionOptions,
+    options: McpExecutionOptions<'_>,
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     let mut remaining_calls = mcp_calls;
@@ -1865,16 +1930,9 @@ async fn execute_parallel(
         let chunk_size = remaining_calls.len().min(options.max_parallel_calls);
         let (chunk, rest) = remaining_calls.split_at(chunk_size);
         remaining_calls = rest;
-        let futures = chunk.iter().map(|tc| {
-            std::panic::AssertUnwindSafe(execute_single_call(
-                *tc,
-                tool_index,
-                options.max_result_bytes,
-                options.timeout,
-                options.allow_loopback,
-            ))
-            .catch_unwind()
-        });
+        let futures = chunk
+            .iter()
+            .map(|tc| std::panic::AssertUnwindSafe(execute_single_call(*tc, tool_index, &options)).catch_unwind());
         for (tc, outcome) in chunk.iter().zip(join_all(futures).await) {
             let result = match outcome {
                 Ok(Some(result)) => result,
@@ -1898,19 +1956,11 @@ async fn execute_parallel(
 async fn execute_sequential(
     mcp_calls: &[McpCallRef<'_>],
     tool_index: &McpToolIndex<'_>,
-    options: McpExecutionOptions,
+    options: McpExecutionOptions<'_>,
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     for tc in mcp_calls {
-        let result = if let Some(result) = execute_single_call(
-            *tc,
-            tool_index,
-            options.max_result_bytes,
-            options.timeout,
-            options.allow_loopback,
-        )
-        .await
-        {
+        let result = if let Some(result) = execute_single_call(*tc, tool_index, &options).await {
             result
         } else {
             warn!(tool = ?tc.name(), "sequential MCP call returned None, emitting error");
@@ -2057,9 +2107,7 @@ fn process_call_result(
 async fn execute_single_call(
     tool_call: McpCallRef<'_>,
     tool_index: &McpToolIndex<'_>,
-    max_result_bytes: usize,
-    timeout: Duration,
-    allow_loopback: bool,
+    options: &McpExecutionOptions<'_>,
 ) -> Option<McpCallResult> {
     let encoded_name = tool_call.name()?;
     let call_id = tool_call.call_id();
@@ -2077,6 +2125,9 @@ async fn execute_single_call(
         .unwrap_or("unknown");
     let headers = entry.get("headers");
     let authorization = entry.get("authorization").and_then(serde_json::Value::as_str);
+    let forwarded_headers = is_connector_tool_entry(entry)
+        .then_some(options.forwarded_headers)
+        .flatten();
     let (arguments, arguments_string) = match parse_call_arguments(
         tool_call,
         call_id,
@@ -2098,7 +2149,7 @@ async fn execute_single_call(
     // Limiting the wire/result payload to one quarter of the retained allowance
     // keeps every in-flight task within its aggregate reservation even at that
     // worst-case ownership point.
-    let payload_limit = result_payload_limit(max_result_bytes);
+    let payload_limit = result_payload_limit(options.max_result_bytes);
     if payload_limit == 0 {
         return Some(build_error_result(
             call_id,
@@ -2110,15 +2161,17 @@ async fn execute_single_call(
         ));
     }
 
-    let result = mcp_client::call_tool(
+    let result = mcp_client::call_tool_with_forwarded_headers(
         server_url,
         headers,
         authorization,
+        options.forwarded_header_names,
+        forwarded_headers,
         original_tool_name,
         arguments,
-        timeout,
+        options.timeout,
         payload_limit,
-        allow_loopback,
+        options.allow_loopback,
     )
     .await;
     Some(process_call_result(
