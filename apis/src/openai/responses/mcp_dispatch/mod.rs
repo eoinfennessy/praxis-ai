@@ -165,6 +165,20 @@ impl<'a> McpCallRef<'a> {
     }
 }
 
+/// Borrowed inputs for one bounded MCP execution batch.
+struct PendingMcpCallBatch<'a> {
+    /// Current Responses API state.
+    state: &'a ResponsesState,
+    /// MCP calls admitted for execution.
+    mcp_calls: &'a [McpCallRef<'a>],
+    /// Tool definitions used to resolve the calls.
+    tool_index: &'a McpToolIndex<'a>,
+    /// Maximum bytes retained by this execution batch.
+    max_total_result_bytes: usize,
+    /// Trusted request headers available to connector calls.
+    forwarded_headers: &'a http::HeaderMap,
+}
+
 /// Borrowed representation of MCP invocation arguments.
 #[derive(Clone, Copy)]
 enum McpArgumentsRef<'a> {
@@ -268,30 +282,30 @@ impl McpDispatchFilter {
     /// call here executes.
     async fn execute_pending_calls(
         &self,
-        state: &ResponsesState,
-        mcp_calls: &[McpCallRef<'_>],
-        tool_index: &McpToolIndex<'_>,
-        max_total_result_bytes: usize,
-        forwarded_headers: &http::HeaderMap,
+        batch: &PendingMcpCallBatch<'_>,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
-            count = mcp_calls.len(),
-            parallel = state.parallel_tool_calls,
+            count = batch.mcp_calls.len(),
+            parallel = batch.state.parallel_tool_calls,
             "executing pending MCP tool calls"
         );
-        let (per_result_limit, execution_batch_limit) =
-            admitted_result_limits(mcp_calls.len(), 0, self.max_result_bytes, max_total_result_bytes)?;
+        let (per_result_limit, execution_batch_limit) = admitted_result_limits(
+            batch.mcp_calls.len(),
+            0,
+            self.max_result_bytes,
+            batch.max_total_result_bytes,
+        )?;
         let options = McpExecutionOptions {
-            parallel: state.parallel_tool_calls,
+            parallel: batch.state.parallel_tool_calls,
             max_parallel_calls: self.max_parallel_calls,
             max_result_bytes: per_result_limit,
             max_total_result_bytes: execution_batch_limit,
             timeout: self.timeout,
             allow_loopback: self.allow_loopback,
             forwarded_header_names: &self.forward_headers,
-            forwarded_headers: Some(forwarded_headers),
+            forwarded_headers: Some(batch.forwarded_headers),
         };
-        execute_mcp_calls(mcp_calls, tool_index, options).await
+        execute_mcp_calls(batch.mcp_calls, batch.tool_index, options).await
     }
 
     /// Select only configured headers from the effective body-phase request.
@@ -448,16 +462,14 @@ impl McpDispatchFilter {
         else {
             return Ok(Self::aggregate_budget_action(ctx));
         };
-        let results = match self
-            .execute_pending_calls(
-                state,
-                &mcp_calls,
-                &tool_index,
-                max_total_result_bytes,
-                forwarded_headers,
-            )
-            .await
-        {
+        let batch = PendingMcpCallBatch {
+            state,
+            mcp_calls: &mcp_calls,
+            tool_index: &tool_index,
+            max_total_result_bytes,
+            forwarded_headers,
+        };
+        let results = match self.execute_pending_calls(&batch).await {
             Ok(results) => results,
             Err(_limit) if aggregate_constrained => return Ok(Self::aggregate_budget_action(ctx)),
             Err(_limit) => return Ok(Self::result_limit_action(ctx)),
