@@ -679,6 +679,10 @@ async fn pending_approval_payload_size_is_measured_without_fetching_columns() {
     let store = make_store().await;
     let record = make_pending("call_abc");
     store
+        .upsert_response(&make_response_record(RESP, "tenant_a", 1000))
+        .await
+        .expect("issuing response should be stored");
+    store
         .record_pending_approvals(
             &crate::test_utils::test_owner("tenant_a"),
             RESP,
