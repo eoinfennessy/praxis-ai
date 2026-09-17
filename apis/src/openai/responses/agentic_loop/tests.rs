@@ -3087,7 +3087,7 @@ fn streamed_provider_conversation_marks_persisted_history() {
         ..ResponsesState::default()
     };
 
-    super::collect_streaming_output_items(&mut state);
+    super::collect_streaming_output_items(&mut state).expect("streamed provider conversation should be retained");
 
     assert_eq!(
         state.provider_history_len,
