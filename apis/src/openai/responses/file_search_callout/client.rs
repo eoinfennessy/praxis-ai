@@ -326,54 +326,7 @@ impl FileSearchError {
             Self::Callout { .. } | Self::Deserialize { .. } | Self::AggregateLimit { .. } => (502, "server_error"),
         }
     }
-}
 
-impl fmt::Display for FileSearchError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Callout { message, store_id } => {
-                write!(f, "callout to store {store_id:?} failed: {message}")
-            },
-            Self::Deserialize {
-                body_bytes: _,
-                line,
-                column,
-                store_id,
-            } => {
-                write!(
-                    f,
-                    "invalid vector-store response from store {store_id:?} at line {line}, column {column}"
-                )
-            },
-            Self::AggregateLimit {
-                limit,
-                retained_payload: _,
-                store_id,
-            } => write!(
-                f,
-                "callout to store {store_id:?} failed: aggregate response body limit of {limit} bytes reached"
-            ),
-            Self::ResponseTooLarge {
-                actual,
-                limit,
-                store_id,
-            } => match actual {
-                Some(actual) => write!(
-                    f,
-                    "vector-store response from store {store_id:?} exceeded the {limit}-byte limit (observed {actual} bytes)"
-                ),
-                None => write!(
-                    f,
-                    "vector-store response from store {store_id:?} exceeded the {limit}-byte limit"
-                ),
-            },
-        }
-    }
-}
-
-impl std::error::Error for FileSearchError {}
-
-impl FileSearchError {
     /// Count strings retained by a batch failure while the batch is staged.
     fn staging_bytes(&self) -> Option<usize> {
         match self {
@@ -384,6 +337,42 @@ impl FileSearchError {
         }
     }
 }
+
+impl fmt::Display for FileSearchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Callout { message, store_id } => write!(f, "callout to store {store_id:?} failed: {message}"),
+            Self::Deserialize {
+                line, column, store_id, ..
+            } => write!(
+                f,
+                "invalid vector-store response from store {store_id:?} at line {line}, column {column}"
+            ),
+            Self::AggregateLimit { limit, store_id, .. } => write!(
+                f,
+                "callout to store {store_id:?} failed: aggregate response body limit of {limit} bytes reached"
+            ),
+            Self::ResponseTooLarge {
+                actual: Some(actual),
+                limit,
+                store_id,
+            } => write!(
+                f,
+                "vector-store response from store {store_id:?} exceeded the {limit}-byte limit (observed {actual} bytes)"
+            ),
+            Self::ResponseTooLarge {
+                actual: None,
+                limit,
+                store_id,
+            } => write!(
+                f,
+                "vector-store response from store {store_id:?} exceeded the {limit}-byte limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FileSearchError {}
 
 /// One failed vector-store search.
 #[derive(Debug)]
@@ -500,6 +489,49 @@ pub(crate) struct CalloutTransport<'a> {
     pub downstream: SubrequestRuntime,
 }
 
+/// Inputs shared by one bounded search fan-out.
+pub(super) struct SearchOptions<'headers, 'transport> {
+    /// Number of output call slots to allocate.
+    pub(super) call_count: usize,
+
+    /// Headers copied from the original request.
+    pub(super) request_headers: &'headers HeaderMap,
+
+    /// Maximum decoded payload retained by this request.
+    pub(super) max_decoded_bytes: usize,
+
+    /// Bound outbound transport for the callouts.
+    pub(super) transport: &'transport CalloutTransport<'transport>,
+}
+
+/// Per-search inputs shared with one sub-request.
+#[derive(Clone)]
+struct SearchExecution<'a> {
+    /// Start time shared by all calls in the fan-out.
+    execution_started: Instant,
+
+    /// Process-wide response admission held while decoding.
+    response_admission: Arc<ResponseAdmission>,
+
+    /// Shared filtered sub-request executor.
+    executor: &'a FilteredSubrequestExecutor,
+
+    /// Bound outbound filter chain.
+    outbound: &'a Arc<FilterPipeline>,
+
+    /// Headers prepared once for the fan-out.
+    outbound_headers: &'a HeaderMap,
+
+    /// Whether private upstream addresses are permitted.
+    allow_private: bool,
+
+    /// Maximum body size accepted by the decoder for this response.
+    max_decoded_bytes: usize,
+
+    /// Whether the retained-payload budget selected the response limit.
+    retained_payload_controls_limit: bool,
+}
+
 /// Client for vector store search API.
 pub(crate) struct FileSearchClient {
     /// Vector-store API base URL (trailing slash stripped).
@@ -546,8 +578,16 @@ impl FileSearchClient {
         request_headers: &HeaderMap,
         transport: &CalloutTransport<'_>,
     ) -> SearchBatch {
-        self.search_with_retained_limit(specs, call_count, request_headers, usize::MAX, transport)
-            .await
+        self.search_with_retained_limit(
+            specs,
+            SearchOptions {
+                call_count,
+                request_headers,
+                max_decoded_bytes: usize::MAX,
+                transport,
+            },
+        )
+        .await
     }
 
     /// Search with a request-scoped ceiling for decoded result payload.
@@ -564,11 +604,14 @@ impl FileSearchClient {
     pub(super) async fn search_with_retained_limit(
         &self,
         specs: &[SearchSpec<'_>],
-        call_count: usize,
-        request_headers: &HeaderMap,
-        max_decoded_bytes: usize,
-        transport: &CalloutTransport<'_>,
+        options: SearchOptions<'_, '_>,
     ) -> SearchBatch {
+        let SearchOptions {
+            call_count,
+            request_headers,
+            max_decoded_bytes,
+            transport,
+        } = options;
         let mut batch = SearchBatch::new(call_count);
         let mut consumed_response_bytes = 0_usize;
         let mut deadline_recorded = false;
@@ -637,19 +680,17 @@ impl FileSearchClient {
             };
             let remaining_decode_bytes = total_response_limit.saturating_sub(consumed_response_bytes);
             let per_response_decode_limit = self.max_response_bytes.min(remaining_decode_bytes);
-            let futures = chunk.iter().map(|spec| {
-                self.search_one(
-                    spec,
-                    execution_started,
-                    Arc::clone(&admission),
-                    &executor,
-                    transport.outbound,
-                    &outbound_headers,
-                    allow_private,
-                    per_response_decode_limit,
-                    retained_payload_controls_limit,
-                )
-            });
+            let execution = SearchExecution {
+                execution_started,
+                response_admission: Arc::clone(&admission),
+                executor: &executor,
+                outbound: transport.outbound,
+                outbound_headers: &outbound_headers,
+                allow_private,
+                max_decoded_bytes: per_response_decode_limit,
+                retained_payload_controls_limit,
+            };
+            let futures = chunk.iter().map(|spec| self.search_one(spec, execution.clone()));
             let chunk_results = futures::future::join_all(futures).await;
             let chunk_failed = merge_chunk_results(
                 &mut batch,
@@ -682,50 +723,47 @@ impl FileSearchClient {
     }
 
     /// Search a single vector store.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one sub-request threads the shared executor, chain, prepared headers, and two independent response admissions"
-    )]
     async fn search_one(
         &self,
         spec: &SearchSpec<'_>,
-        execution_started: Instant,
-        response_admission: Arc<ResponseAdmission>,
-        executor: &FilteredSubrequestExecutor,
-        outbound: &Arc<FilterPipeline>,
-        outbound_headers: &HeaderMap,
-        allow_private: bool,
-        max_decoded_bytes: usize,
-        retained_payload_controls_limit: bool,
+        execution: SearchExecution<'_>,
     ) -> Result<SearchResponse, FileSearchError> {
-        deadline_remaining(self.timeout, execution_started, spec.store_id)?;
-        let request = self.build_request(spec, execution_started)?;
-        deadline_remaining(self.timeout, execution_started, spec.store_id)?;
-        let body = self
-            .execute_request(
-                request,
-                spec.store_id,
-                execution_started,
-                executor,
-                outbound,
-                outbound_headers,
-                allow_private,
-            )
-            .await?;
-        if body.len() > max_decoded_bytes {
+        let body = self.fetch_search_body(spec, &execution).await?;
+        if body.len() > execution.max_decoded_bytes {
             return Err(aggregate_limit_error(
                 spec.store_id,
-                max_decoded_bytes,
-                retained_payload_controls_limit,
+                execution.max_decoded_bytes,
+                execution.retained_payload_controls_limit,
             ));
         }
         parse_response_body_with_deadline(
             body,
             spec.store_id,
             result_limit(spec.max_num_results),
-            execution_started,
+            execution.execution_started,
             self.timeout,
-            response_admission,
+            execution.response_admission,
+        )
+        .await
+    }
+
+    /// Build and execute one bounded vector-store request.
+    async fn fetch_search_body(
+        &self,
+        spec: &SearchSpec<'_>,
+        execution: &SearchExecution<'_>,
+    ) -> Result<Bytes, FileSearchError> {
+        deadline_remaining(self.timeout, execution.execution_started, spec.store_id)?;
+        let request = self.build_request(spec, execution.execution_started)?;
+        deadline_remaining(self.timeout, execution.execution_started, spec.store_id)?;
+        self.execute_request(
+            request,
+            spec.store_id,
+            execution.execution_started,
+            execution.executor,
+            execution.outbound,
+            execution.outbound_headers,
+            execution.allow_private,
         )
         .await
     }

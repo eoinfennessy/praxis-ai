@@ -330,10 +330,6 @@ impl HttpFilter for AgenticLoopFilter {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one ordered response extraction and loop-decision pipeline"
-    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -353,56 +349,82 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
-            return Ok(FilterAction::Continue);
-        };
-
-        if let Some(bytes) = body.as_ref() {
-            if let Err(failure) = extract_tool_calls_from_body(bytes, &mut state) {
-                return finish_response_failure(ctx, state, &failure, true);
-            }
-        } else {
-            match prepare_streamed_round(ctx, &mut state) {
-                Ok(true) => {},
-                Ok(false) => {
-                    set_action(ctx, ACTION_DONE)?;
-                    ctx.extensions.insert(state);
-                    return Ok(FilterAction::Continue);
-                },
-                Err(failure) => return finish_response_failure(ctx, state, &failure, true),
-            }
-        }
-
-        if is_finish_reason_length(&state) {
-            return finish_incomplete_round(ctx, state, body);
-        }
-
-        if has_mixed_function_call_ownership(&state) {
-            return reject_mixed_ownership_round(ctx, state);
-        }
-
-        if let Err(failure) = prepare_dispatcher_round(ctx, &mut state) {
-            let retained_budget_failure = state.retained_payload_failed;
-            return finish_response_failure(ctx, state, &failure, retained_budget_failure);
-        }
-
-        let stream_payload_bytes = retained_stream_payload_bytes(ctx).unwrap_or(usize::MAX);
-        if !state.can_replace_retained_payload(0, 0, stream_payload_bytes) {
-            if request_is_streaming(&state) {
-                state.discard_payload_for_budget_error();
-            }
-            return finish_response_failure(ctx, state, &retained_payload_failure(), true);
-        }
-
-        let result = evaluate_loop_decision(ctx, &mut state, body, &self.config)?;
-        ctx.extensions.insert(state);
-        Ok(result)
+        process_response_body(ctx, body, &self.config)
     }
 }
 
 /// Marker consumed by `openai_responses_proxy` after every loop instance has
 /// admitted its configured retained-payload limit.
 struct DeferredAgenticRequestFinish;
+
+/// Return response state to the request extensions across the large-state box
+/// allocation boundary without inflating the response hook's stack frame.
+#[inline(never)]
+fn restore_response_state(ctx: &mut HttpFilterContext<'_>, state: ResponsesState) {
+    ctx.extensions.insert(state);
+}
+
+/// Extract one provider round before applying ownership and budget decisions.
+fn process_response_body(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    config: &AgenticLoopConfig,
+) -> Result<FilterAction, FilterError> {
+    let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
+        return Ok(FilterAction::Continue);
+    };
+
+    if let Some(bytes) = body.as_ref() {
+        if let Err(failure) = extract_tool_calls_from_body(bytes, &mut state) {
+            return finish_response_failure(ctx, state, &failure, true);
+        }
+    } else {
+        match prepare_streamed_round(ctx, &mut state) {
+            Ok(true) => {},
+            Ok(false) => {
+                set_action(ctx, ACTION_DONE)?;
+                restore_response_state(ctx, state);
+                return Ok(FilterAction::Continue);
+            },
+            Err(failure) => return finish_response_failure(ctx, state, &failure, true),
+        }
+    }
+
+    continue_response_round(ctx, body, state, config)
+}
+
+/// Apply ownership, dispatcher, budget, and loop decisions to one extracted round.
+fn continue_response_round(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    mut state: ResponsesState,
+    config: &AgenticLoopConfig,
+) -> Result<FilterAction, FilterError> {
+    if is_finish_reason_length(&state) {
+        return finish_incomplete_round(ctx, state, body);
+    }
+
+    if has_mixed_function_call_ownership(&state) {
+        return reject_mixed_ownership_round(ctx, state);
+    }
+
+    if let Err(failure) = prepare_dispatcher_round(ctx, &mut state) {
+        let retained_budget_failure = state.retained_payload_failed;
+        return finish_response_failure(ctx, state, &failure, retained_budget_failure);
+    }
+
+    let stream_payload_bytes = retained_stream_payload_bytes(ctx).unwrap_or(usize::MAX);
+    if !state.can_replace_retained_payload(0, 0, stream_payload_bytes) {
+        if request_is_streaming(&state) {
+            state.discard_payload_for_budget_error();
+        }
+        return finish_response_failure(ctx, state, &retained_payload_failure(), true);
+    }
+
+    let result = evaluate_loop_decision(ctx, &mut state, body, config)?;
+    restore_response_state(ctx, state);
+    Ok(result)
+}
 
 /// Claim sole ownership of one IRR provider response while allowing every
 /// configured loop instance to participate in request-side budget admission.

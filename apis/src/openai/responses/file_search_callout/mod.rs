@@ -41,7 +41,8 @@ use tracing::warn;
 use self::{
     client::{
         CalloutTransport, FileSearchClient, FileSearchClientConfig, FileSearchError, MAX_QUERY_BYTES,
-        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec, request_error,
+        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchOptions, SearchSpec,
+        request_error,
     },
     config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client, require_inline_outbound_chain},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
@@ -424,7 +425,15 @@ impl FileSearchCalloutFilter {
                 .await
         } else {
             self.client
-                .search_with_retained_limit(&specs, plan.calls.len(), request_headers, max_decoded_bytes, transport)
+                .search_with_retained_limit(
+                    &specs,
+                    SearchOptions {
+                        call_count: plan.calls.len(),
+                        request_headers,
+                        max_decoded_bytes,
+                        transport,
+                    },
+                )
                 .await
         };
         batch.failures.extend(planning_failures);
