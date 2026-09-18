@@ -967,6 +967,32 @@ fn retained_request_payload_counts_store_input_snapshot() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_input_does_not_exhaust_agentic_payload_budget() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(b"{}"));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        Some(0),
+        "an owner-only store snapshot retains no request input payload"
+    );
+
+    let loop_filter = super::super::agentic_loop::AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let action = loop_filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an absent input must reach normal request validation instead of producing a payload-budget 413"
+    );
+}
+
 #[test]
 fn persistence_construction_is_rejected_before_payload_clones() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");

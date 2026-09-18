@@ -391,9 +391,13 @@ struct ResponseStoreRequestState {
 }
 
 /// Return payload retained by the response-store request snapshot.
+///
+/// A snapshot can contain only the persistence owner when the request has no
+/// `input` field. That retains no request payload and therefore counts as zero;
+/// `None` is reserved for a present input whose size could not be computed.
 pub(crate) fn retained_request_payload_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     if let Some(state) = ctx.extensions.get::<ResponseStoreRequestState>() {
-        return state.input.as_ref().and_then(retained_json_bytes);
+        return state.input.as_ref().map_or(Some(0), retained_json_bytes);
     }
     ctx.get_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA)
         .map_or(Some(0), |bytes| bytes.parse().ok())
