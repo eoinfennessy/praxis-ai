@@ -1215,6 +1215,7 @@ mod tests {
                 "responses_agentic_loop",
                 "responses_native_passthrough",
                 "responses_to_chat_completions",
+                "responses_client_tool_compat",
             ]
         );
         assert_eq!(
@@ -1251,6 +1252,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_client_tool_compat"],
             ]
         );
         assert_eq!(
@@ -1286,11 +1288,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 26);
-        assert_eq!(report.scenarios_total, 26);
-        assert_eq!(report.recordings_total, 31);
+        assert_eq!(report.features_total, 27);
+        assert_eq!(report.scenarios_total, 27);
+        assert_eq!(report.recordings_total, 32);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1315,6 +1318,7 @@ mod tests {
                 "responses/chat-unrepresentable-parameters",
                 "responses/chat-web-search",
                 "responses/chat-web-search-stream",
+                "responses/client-tool-compat",
                 "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
@@ -1323,7 +1327,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 26);
+        assert_eq!(manifest.features.len(), 27);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1471,6 +1475,10 @@ mod tests {
                 (
                     &"responses.chat.tools.function_echo".to_owned(),
                     &vec!["responses/chat-tool-echo".to_owned()]
+                ),
+                (
+                    &"responses.client_tool_compat.lower_restore".to_owned(),
+                    &vec!["responses/client-tool-compat".to_owned()]
                 ),
             ]
         );

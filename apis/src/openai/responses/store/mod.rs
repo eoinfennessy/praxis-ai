@@ -20,6 +20,7 @@ pub use self::filter::ResponseStoreFilter;
 pub(crate) use self::filter::{discard_retained_request_payload, retained_request_payload_bytes};
 
 #[cfg(test)]
+#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,

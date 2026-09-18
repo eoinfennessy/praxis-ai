@@ -32,6 +32,7 @@ mod approval;
 mod config;
 
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
@@ -1582,6 +1583,7 @@ fn is_mcp_tool_call(tool_call: &serde_json::Value, tool_index: &McpToolIndex<'_>
 /// Returns the unique match from a precomputed reverse index. Ambiguous lossy
 /// encodings fail closed rather than routing nondeterministically.
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 fn find_by_encoded_name<'a>(
     tool_index: &McpToolIndex<'a>,
     encoded_name: &str,
@@ -1607,6 +1609,7 @@ fn find_by_encoded_name<'a>(
 /// returned to the client before any member executes, so one approval-gated
 /// call cannot race with a sibling side effect.
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 fn partition_calls_by_approval(
     mcp_calls: Vec<McpCallRef<'_>>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
