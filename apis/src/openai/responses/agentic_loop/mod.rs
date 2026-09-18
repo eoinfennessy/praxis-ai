@@ -317,9 +317,10 @@ impl HttpFilter for AgenticLoopFilter {
         if let Some(action) = admit_retained_payload_budget(ctx, self.config.max_retained_bytes)? {
             return Ok(action);
         }
-        // Defer the sole request-side mutation until the proxy, which follows
-        // every loop instance in canonical step order. This lets every instance
-        // lower the shared budget before local completion or dispatch can commit.
+        // Defer the sole request-side mutation until the terminal request
+        // serializer, which follows every loop instance in canonical step order.
+        // This lets every instance lower the shared budget before local
+        // completion or dispatch can commit.
         if ctx.extensions.get::<IterationState>().is_some() {
             ctx.extensions.insert(DeferredAgenticRequestFinish);
             Ok(FilterAction::Continue)
@@ -353,8 +354,8 @@ impl HttpFilter for AgenticLoopFilter {
     }
 }
 
-/// Marker consumed by `openai_responses_proxy` after every loop instance has
-/// admitted its configured retained-payload limit.
+/// Marker consumed by the terminal request serializer after every loop instance
+/// has admitted its configured retained-payload limit.
 struct DeferredAgenticRequestFinish;
 
 /// Return response state to the request extensions across the large-state box

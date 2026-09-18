@@ -437,6 +437,19 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             return Ok(FilterAction::Continue);
         }
 
+        if super::mcp_dispatch::initial_dispatch_is_deferred(ctx) {
+            let action = super::mcp_dispatch::dispatch_after_budget_admission(ctx).await?;
+            if !matches!(action, FilterAction::Continue) {
+                return Ok(action);
+            }
+        }
+        if super::agentic_loop::request_finish_is_deferred(ctx) {
+            let action = super::agentic_loop::finish_request_after_deferred_dispatch(ctx)?;
+            if !matches!(action, FilterAction::Continue) {
+                return Ok(action);
+            }
+        }
+
         if let Some(action) = request_disposition(ctx) {
             return Ok(action);
         }
