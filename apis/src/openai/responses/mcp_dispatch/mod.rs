@@ -1421,7 +1421,15 @@ pub(crate) async fn dispatch_after_budget_admission(
         .extensions
         .get::<ResponsesState>()
         .is_some_and(|state| !state.tool_calls.is_empty() && !state.mcp_tool_map.is_empty());
-    if !needs_discovery && !needs_dispatch {
+    // Approval responses are control input rather than model tool calls. They
+    // still must pass through this dispatcher's resume path before the request
+    // can reach inference; otherwise an approval-only continuation skips
+    // correlation/consumption and is treated as an ordinary model turn.
+    let needs_approval_resume = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.iteration == 0 && state.messages.iter().any(is_approval_response));
+    if !needs_discovery && !needs_dispatch && !needs_approval_resume {
         return Ok(FilterAction::Continue);
     }
     let Some(callout) = mcp_client::McpCallout::from_context(ctx, Arc::clone(&deferred.0.outbound_pipeline)) else {
