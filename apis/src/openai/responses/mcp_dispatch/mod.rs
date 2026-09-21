@@ -353,10 +353,6 @@ impl McpDispatchFilter {
     /// Responses API scopes that budget to built-in tools); the whole batch has
     /// already been bounded by `max_calls_per_round` before this runs, so every
     /// call here executes.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "callout threads the per-request MCP subrequest executor through the dispatch batch"
-    )]
     async fn execute_pending_calls(
         &self,
         batch: &PendingMcpCallBatch<'_>,
