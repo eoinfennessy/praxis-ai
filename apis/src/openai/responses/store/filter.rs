@@ -155,17 +155,13 @@ impl ResponseStoreFilter {
                 revalidate_postgres_host(&self.config).map_err(|e| {
                     StoreError::Unavailable(format!("postgres host validation failed before connect: {e}"))
                 })?;
-                let ssl_root_cert = self.config.ssl_root_cert.as_ref().map(|s| {
-                    let secret: &str = s.expose_secret();
-                    secret
-                });
+                let tls = self.config.tls_config();
                 let store = Box::pin(PostgresResponseStore::new(
                     self.config.database_url.expose_secret(),
                     &self.config.responses_table,
                     &self.config.conversations_table,
                     None,
-                    self.config.ssl_mode,
-                    ssl_root_cert,
+                    &tls,
                     self.config.pool.as_ref(),
                 ))
                 .await;
@@ -510,9 +506,8 @@ impl ResponseCapture {
         let input = request_input
             .or_else(|| json.get("input").cloned())
             .unwrap_or(Value::Null);
-        let output = json.get("output").cloned().unwrap_or(Value::Null);
         let history_input = state_messages.map_or_else(|| input.clone(), Value::Array);
-        let messages = assemble_stored_messages(&history_input, &output);
+        let messages = assemble_stored_messages(history_input, json.get("output"));
 
         Self { input, messages }
     }
@@ -522,28 +517,26 @@ impl ResponseCapture {
 /// create request body.
 fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
     let bytes = body.as_ref().filter(|b| !b.is_empty())?;
-    let json: Value = match serde_json::from_slice(bytes) {
+    let mut json: Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {
             trace!(error = %e, "response store: invalid request JSON");
             return None;
         },
     };
-    json.get("input").cloned()
+    json.as_object_mut()?.remove("input")
 }
 
 /// Build the stored conversation history from response input and output.
-fn assemble_stored_messages(input: &Value, output: &Value) -> Value {
+fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
     let mut messages = Vec::new();
 
-    append_stored_input_items(&mut messages, input.clone());
+    append_stored_input_items(&mut messages, input);
 
-    if !output.is_null() {
-        if let Some(items) = output.as_array() {
-            messages.extend(items.iter().cloned());
-        } else {
-            messages.push(output.clone());
-        }
+    match output {
+        Some(Value::Array(items)) => messages.extend(items.iter().cloned()),
+        Some(output) if !output.is_null() => messages.push(output.clone()),
+        Some(_) | None => {},
     }
 
     Value::Array(messages)
@@ -704,6 +697,22 @@ fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
 /// Return whether the request uses streaming responses.
 fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.stream") == Some("true")
+}
+
+/// Return whether `openai_stream_events` has emitted the client-visible terminal
+/// `response.completed` frame as a *deferred, non-end-of-stream* chunk for the
+/// current logical stream (#937).
+///
+/// Set only by `emit_deferred_terminal`. When true, [`ResponsesState::response_object`]
+/// is already canonical and the terminal frame is in the non-end-of-stream chunk
+/// this filter is about to release, so the store persists before releasing it and
+/// then skips the redundant end-of-stream persist. A buffered local completion
+/// (`encode_local_completion`) leaves this unset so it still persists at
+/// end-of-stream, where its buffered body is written only after the store runs.
+fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.logical_stream_terminal_emitted)
 }
 
 /// Return whether the request references a previous response.
@@ -1030,7 +1039,37 @@ impl HttpFilter for ResponseStoreFilter {
 
         if is_streaming_request(ctx) {
             if !end_of_stream {
+                // #937: the deferred terminal `response.completed` frame reaches
+                // this pre-IRR filter as a non-end-of-stream chunk, before the
+                // empty end-of-stream callback where streaming persistence
+                // historically ran. Once stream_events marks the terminal frame
+                // emitted, `response_object` is canonical: persist synchronously
+                // BEFORE releasing this chunk so a client never observes
+                // completion for a non-durable record.
+                if streaming_terminal_emitted(ctx) {
+                    // `persist_from_streaming_state` returns `Continue` once the
+                    // record is durable (or persistence is legitimately skipped,
+                    // e.g. no store configured); we still release the frame
+                    // ourselves in that case. Anything else is a fail-closed
+                    // decision — a `Reject` when the immutable owner/request
+                    // state is missing (#1197), or an `Err` on a persistence
+                    // failure — and must be propagated so the client never
+                    // observes `response.completed` for an unpersisted record.
+                    match self.persist_from_streaming_state(ctx, body)? {
+                        FilterAction::Continue => {},
+                        action => return Ok(action),
+                    }
+                }
                 return Ok(FilterAction::Release);
+            }
+            // A deferred terminal frame (flag set) already persisted at the
+            // non-end-of-stream chunk above, so skip the redundant persist here.
+            // Everything else — a buffered local completion (whose terminal is
+            // delivered in this end-of-stream body) and a plain single-round
+            // stream — leaves the flag unset and persists here, before the body
+            // is written downstream.
+            if streaming_terminal_emitted(ctx) {
+                return Ok(FilterAction::Continue);
             }
             return self.persist_from_streaming_state(ctx, body);
         }

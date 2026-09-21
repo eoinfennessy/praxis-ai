@@ -2136,6 +2136,12 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 
+    // #937: deliberately do NOT set `logical_stream_terminal_emitted` here.
+    // Unlike `emit_deferred_terminal`, this local completion is returned to the
+    // store as a buffered `TerminalResponse` at end-of-stream (see
+    // `finish_deferred_local_response`), where the store already persists before
+    // the body is written. Marking the flag would make the store skip that
+    // end-of-stream persist and lose the record (#937 review regression).
     output.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":");
     serde_json::to_writer(&mut output, &state.response_object).ok()?;
     output.extend_from_slice(b",\"sequence_number\":");
@@ -2360,6 +2366,10 @@ fn emit_deferred_terminal(
         record_retained_payload_overflow(ctx, parser_state);
         return false;
     }
+    // #937: the deferred terminal is emitted in this non-end-of-stream chunk, so
+    // the response store must persist it before releasing the chunk. A buffered
+    // local completion persists at end-of-stream and leaves this flag unset.
+    state.logical_stream_terminal_emitted = true;
     canonicalize_logical_response(state, restore_previous_response_id);
     normalize_logical_payload(ctx, &mut terminal.metadata, parser_state.output_index_offset);
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {

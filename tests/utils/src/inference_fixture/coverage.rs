@@ -1232,9 +1232,12 @@ mod tests {
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
+                vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
@@ -1269,12 +1272,15 @@ mod tests {
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
@@ -1292,9 +1298,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 28);
-        assert_eq!(report.scenarios_total, 28);
-        assert_eq!(report.recordings_total, 33);
+        assert_eq!(report.features_total, 31);
+        assert_eq!(report.scenarios_total, 31);
+        assert_eq!(report.recordings_total, 36);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1305,12 +1311,15 @@ mod tests {
                 "messages/native-basic-nonstream",
                 "messages/native-basic-stream",
                 "messages/native-tool-use",
+                "messages/provider-parameter-passthrough",
                 "messages/typed-server-tools",
+                "messages/unrepresentable-parameters",
                 "messages/upstream-error",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-retained-overflow-stream",
                 "responses/agentic-status-less-function-call",
+                "responses/background-unsupported",
                 "responses/chat-basic-nonstream",
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
@@ -1328,7 +1337,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 28);
+        assert_eq!(manifest.features.len(), 31);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1372,6 +1381,14 @@ mod tests {
                     &vec!["messages/malformed-success".to_owned()]
                 ),
                 (
+                    &"messages.request.provider_parameter_passthrough".to_owned(),
+                    &vec!["messages/provider-parameter-passthrough".to_owned()]
+                ),
+                (
+                    &"messages.request.unrepresentable_parameters".to_owned(),
+                    &vec!["messages/unrepresentable-parameters".to_owned()]
+                ),
+                (
                     &"messages.native.request".to_owned(),
                     &vec![
                         "messages/native-basic-nonstream".to_owned(),
@@ -1408,6 +1425,10 @@ mod tests {
                 (
                     &"responses.native.tool_call".to_owned(),
                     &vec!["responses/native-tool-call".to_owned()]
+                ),
+                (
+                    &"responses.request.background_unsupported".to_owned(),
+                    &vec!["responses/background-unsupported".to_owned()]
                 ),
                 (
                     &"responses.native.continuation".to_owned(),
@@ -1534,7 +1555,7 @@ mod tests {
                 ("vllm", CoverageStatus::LiveCovered),
             ]
         );
-        for feature in &manifest.features[5..7] {
+        for feature in &manifest.features[5..9] {
             assert_eq!(
                 feature
                     .providers
@@ -1544,7 +1565,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[7..10] {
+        for feature in &manifest.features[9..12] {
             assert_eq!(
                 feature
                     .providers
@@ -1554,7 +1575,7 @@ mod tests {
                 vec![("anthropic", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[10..13] {
+        for feature in &manifest.features[12..15] {
             assert_eq!(
                 feature
                     .providers
@@ -1567,7 +1588,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[13..] {
+        for feature in &manifest.features[15..] {
             assert_eq!(
                 feature
                     .providers

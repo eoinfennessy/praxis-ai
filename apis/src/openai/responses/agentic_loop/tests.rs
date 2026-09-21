@@ -3365,7 +3365,6 @@ fn web_search_item(state: &ResponsesState, index: usize) -> &Value {
 
 fn pending_deferred_connector() -> DeferredMcpConnector {
     DeferredMcpConnector {
-        allow_loopback: true,
         authorization: None,
         allowed_tools: None,
         connector_id: "corp_drive".to_owned(),
