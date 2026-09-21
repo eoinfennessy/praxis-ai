@@ -321,7 +321,12 @@ impl WebSearchFilter {
         let callout = CalloutContext::from_filter_context(ctx);
         match self
             .search_client
-            .search_with_response_limit(&self.outbound, callout, query, Some(context_size), max_response_bytes)
+            .search(
+                &self.outbound,
+                callout.with_response_limit(max_response_bytes),
+                query,
+                Some(context_size),
+            )
             .await
         {
             SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),

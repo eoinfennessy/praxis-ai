@@ -93,6 +93,8 @@ pub(crate) struct CalloutContext {
     runtime: SubrequestRuntime,
     /// Current outbound recursion depth of the owning request.
     depth: u8,
+    /// Maximum response body retained for this callout.
+    max_response_bytes: usize,
 }
 
 impl CalloutContext {
@@ -111,6 +113,7 @@ impl CalloutContext {
                 ctx.request_start,
             ),
             depth: current_outbound_depth(ctx),
+            max_response_bytes: MAX_SEARCH_RESPONSE_BYTES,
         }
     }
 
@@ -122,7 +125,14 @@ impl CalloutContext {
         Self {
             runtime: SubrequestRuntime::new(None, false, None, Instant::now()),
             depth: 0,
+            max_response_bytes: MAX_SEARCH_RESPONSE_BYTES,
         }
+    }
+
+    /// Limit the response body retained for this callout.
+    pub(crate) fn with_response_limit(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
     }
 }
 
@@ -212,19 +222,6 @@ impl SearchClient {
         query: &str,
         context_size: Option<SearchContextSize>,
     ) -> SearchOutcome {
-        self.search_with_response_limit(outbound, callout, query, context_size, MAX_SEARCH_RESPONSE_BYTES)
-            .await
-    }
-
-    /// Execute a web search with a caller-selected response-body ceiling.
-    pub(crate) async fn search_with_response_limit(
-        &self,
-        outbound: &Arc<FilterPipeline>,
-        callout: CalloutContext,
-        query: &str,
-        context_size: Option<SearchContextSize>,
-        max_response_bytes: usize,
-    ) -> SearchOutcome {
         let size = context_size.unwrap_or(self.default_context_size);
         let count = size.result_count();
         debug!(
@@ -238,21 +235,7 @@ impl SearchClient {
             SearchProvider::Tavily => self.build_tavily_request(query, size),
             SearchProvider::You => self.build_you_request(query, count),
         };
-        self.execute_search_with_response_limit(outbound, callout, &url, request, max_response_bytes)
-            .await
-    }
-
-    /// Execute a search request with the default response ceiling.
-    #[cfg(test)]
-    async fn execute_search(
-        &self,
-        outbound: &Arc<FilterPipeline>,
-        callout: CalloutContext,
-        url: &str,
-        request: SubRequest,
-    ) -> SearchOutcome {
-        self.execute_search_with_response_limit(outbound, callout, url, request, MAX_SEARCH_RESPONSE_BYTES)
-            .await
+        self.execute_search(outbound, callout, &url, request).await
     }
 
     /// Execute a search request through the outbound chain and map the response
@@ -270,15 +253,14 @@ impl SearchClient {
     /// authority and its target to the origin-form path+query.
     ///
     /// [`PreparedTarget::bind`]: praxis_core::connectivity::PreparedTarget::bind
-    async fn execute_search_with_response_limit(
+    async fn execute_search(
         &self,
         outbound: &Arc<FilterPipeline>,
         callout: CalloutContext,
         url: &str,
         request: SubRequest,
-        max_response_bytes: usize,
     ) -> SearchOutcome {
-        let max_response_bytes = max_response_bytes.min(MAX_SEARCH_RESPONSE_BYTES);
+        let max_response_bytes = callout.max_response_bytes.min(MAX_SEARCH_RESPONSE_BYTES);
         let aggregate_constrained = max_response_bytes < MAX_SEARCH_RESPONSE_BYTES;
         let deadline = Instant::now() + self.timeout;
         let Some((prepared, extensions)) = self.prepare_staged_request(url, request, deadline).await else {
@@ -455,42 +437,58 @@ impl SearchClient {
     fn map_callout_success(&self, outcome: CalloutOutcome, aggregate_constrained: bool) -> SearchOutcome {
         match outcome {
             CalloutOutcome::Response(CalloutResponse::Buffered(response)) => self.map_search_result(&response),
-            CalloutOutcome::Response(CalloutResponse::Streaming { .. }) => {
-                warn!(
-                    provider = self.provider.as_str(),
-                    "search callout produced a streaming response; treating as failed"
-                );
-                SearchOutcome::Failed
-            },
+            CalloutOutcome::Response(CalloutResponse::Streaming { .. }) => self.map_streaming_response(),
             CalloutOutcome::ResponseTooLarge { actual, limit } => {
-                if aggregate_constrained {
-                    warn!(
-                        provider = self.provider.as_str(),
-                        ?actual,
-                        limit,
-                        "search response exceeded retained-payload allowance"
-                    );
-                    SearchOutcome::RetainedLimitExceeded
-                } else {
-                    warn!(
-                        provider = self.provider.as_str(),
-                        ?actual,
-                        limit,
-                        "search callout response exceeded the size limit; treating as failed"
-                    );
-                    SearchOutcome::Failed
-                }
+                self.map_oversized_response(actual, limit, aggregate_constrained)
             },
             // `CalloutOutcome` is `#[non_exhaustive]`: a future classified outcome
             // fails the callout closed rather than being read as a success.
-            _ => {
-                warn!(
-                    provider = self.provider.as_str(),
-                    "search callout produced an unrecognized outcome; treating as failed"
-                );
-                SearchOutcome::Failed
-            },
+            _ => self.map_unrecognized_response(),
         }
+    }
+
+    /// Treat an unexpected streaming response as a failed bounded callout.
+    fn map_streaming_response(&self) -> SearchOutcome {
+        warn!(
+            provider = self.provider.as_str(),
+            "search callout produced a streaming response; treating as failed"
+        );
+        SearchOutcome::Failed
+    }
+
+    /// Distinguish an aggregate retained-payload limit from the normal provider cap.
+    fn map_oversized_response(
+        &self,
+        actual: Option<usize>,
+        limit: usize,
+        aggregate_constrained: bool,
+    ) -> SearchOutcome {
+        if aggregate_constrained {
+            warn!(
+                provider = self.provider.as_str(),
+                ?actual,
+                limit,
+                "search response exceeded retained-payload allowance"
+            );
+            SearchOutcome::RetainedLimitExceeded
+        } else {
+            warn!(
+                provider = self.provider.as_str(),
+                ?actual,
+                limit,
+                "search callout response exceeded the size limit; treating as failed"
+            );
+            SearchOutcome::Failed
+        }
+    }
+
+    /// Fail closed for a future or otherwise unsupported classified outcome.
+    fn map_unrecognized_response(&self) -> SearchOutcome {
+        warn!(
+            provider = self.provider.as_str(),
+            "search callout produced an unrecognized outcome; treating as failed"
+        );
+        SearchOutcome::Failed
     }
 
     /// Map a buffered sub-request response to a [`SearchOutcome`].
