@@ -414,8 +414,8 @@ fn continue_response_round(
         return finish_response_failure(ctx, state, &failure, retained_budget_failure);
     }
 
-    let stream_payload_bytes = retained_stream_payload_bytes(ctx).unwrap_or(usize::MAX);
-    if !state.can_replace_retained_payload(0, 0, stream_payload_bytes) {
+    let stream_payload_bytes = retained_stream_payload_bytes(ctx);
+    if !stream_payload_bytes.is_some_and(|bytes| state.can_replace_retained_payload(0, 0, bytes)) {
         if request_is_streaming(&state) {
             state.discard_payload_for_budget_error();
         }
@@ -490,13 +490,13 @@ fn admit_retained_payload_budget(
     ctx: &mut HttpFilterContext<'_>,
     configured_limit: usize,
 ) -> Result<Option<FilterAction>, FilterError> {
-    let stream_payload_bytes = retained_stream_payload_bytes(ctx).unwrap_or(usize::MAX);
+    let stream_payload_bytes = retained_stream_payload_bytes(ctx);
     let store_payload_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
     let mut retained_overflow = None;
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
         state.apply_retained_payload_limit(configured_limit);
         state.set_retained_external_payload_bytes(store_payload_bytes);
-        if !state.can_replace_retained_payload(0, 0, stream_payload_bytes) {
+        if !stream_payload_bytes.is_some_and(|bytes| state.can_replace_retained_payload(0, 0, bytes)) {
             let initial = state.iteration == 0;
             let streaming = request_is_streaming(state);
             state.discard_payload_for_budget_error();
