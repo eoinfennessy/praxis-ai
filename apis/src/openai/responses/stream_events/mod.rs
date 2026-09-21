@@ -51,6 +51,10 @@ use crate::{
     },
 };
 
+/// Metadata message identifying a terminal retained-payload budget failure.
+const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes";
+
 /// A per-turn terminal event held until the agentic transition is known.
 struct DeferredTerminalEvent {
     /// Canonical event type.
@@ -540,9 +544,7 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     // later upstream frame without reparsing it so the first bounded budget
     // error remains authoritative and cannot be overwritten by an
     // event-after-terminal parse error.
-    if ctx.get_metadata("responses.stream_error_message")
-        == Some("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes")
-    {
+    if ctx.get_metadata("responses.stream_error_message") == Some(RETAINED_PAYLOAD_OVERFLOW_MESSAGE) {
         *body = None;
         ctx.insert_filter_state(state);
         return;
@@ -931,10 +933,7 @@ fn record_retained_payload_overflow(ctx: &mut HttpFilterContext<'_>, state: &mut
     state.completion_state = CompletionState::Error;
     state.completed_at.get_or_insert_with(Instant::now);
     ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata(
-        "responses.stream_error_message",
-        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
-    );
+    ctx.set_metadata("responses.stream_error_message", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
     ctx.set_metadata("responses.skip_persist", "true");
     crate::openai::responses::fs_arm_stream_stop(ctx);
 }
