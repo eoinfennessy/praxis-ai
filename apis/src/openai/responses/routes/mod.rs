@@ -196,7 +196,7 @@ pub(crate) struct MatchedResponsesRoute<'a> {
     /// Matched operation metadata.
     pub spec: &'static ResponsesOperationSpec,
     /// Borrowed path parameters, captured by the shared matcher.
-    params: RouteParams<'a>,
+    pub(crate) params: RouteParams<'a>,
 }
 
 impl<'a> MatchedResponsesRoute<'a> {

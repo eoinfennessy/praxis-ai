@@ -148,6 +148,7 @@ def _write_config(port: int) -> str:
                         "mode": "trusted_owner",
                         "header": OWNER_HEADER,
                     },
+                    {"filter": "openai_operation"},
                     _conversations_filter(),
                 ],
             }
@@ -180,6 +181,7 @@ def _write_tenant_config(port: int) -> str:
                 "name": "tenant-conversations-pipeline",
                 "filters": [
                     {"filter": "test_tenant_identity"},
+                    {"filter": "openai_operation"},
                     conversations_filter,
                 ],
             }
@@ -337,6 +339,24 @@ class TestOpenAIConversations:
         assert retrieved.object == "conversation"
         assert retrieved.metadata["topic"] == "demo"
         assert retrieved.created_at == conversation.created_at
+
+    def test_bodyless_retrieve_ignores_invalid_json_bytes(self, openai_client):
+        conversation = openai_client.conversations.create()
+        response = httpx.request(
+            "GET",
+            f"{str(openai_client.base_url).rstrip('/')}"
+            f"/conversations/{conversation.id}",
+            headers={
+                "Authorization": "Bearer not-needed",
+                OWNER_HEADER: _owner_assertion("alice"),
+                "Content-Type": "application/json",
+            },
+            content=b"not valid json",
+            timeout=10,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == conversation.id
 
     def test_conversation_retrieve_nonexistent(self, openai_client):
         with pytest.raises(NotFoundError) as exc_info:

@@ -259,12 +259,32 @@ fn unmatched_path_passes_through() {
     let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
     let proxy = start_proxy(&config);
 
-    let raw = http_send(
-        proxy.addr(),
+    for request in [
         "GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "PATCH /v1/conversations/conv_unsupported HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        "GET /v1/conversations//items HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        "GET /v1/conversations/conv_1/items/item_1/extra HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    ] {
+        let raw = http_send(proxy.addr(), request);
+        assert_eq!(parse_status(&raw), 200, "unmatched route should reach fallback");
+        assert_eq!(parse_body(&raw), "ok");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bodyless_operation_does_not_parse_invalid_body_bytes() {
+    let proxy = start_test_proxy();
+    let conv_id = create_conversation(&proxy, r#"{"metadata":{"bodyless":"ok"}}"#);
+    let invalid = "this is not json";
+    let request = format!(
+        "GET /v1/conversations/{conv_id} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{invalid}",
+        invalid.len()
     );
-    assert_eq!(parse_status(&raw), 200, "unmatched path should pass through");
-    assert_eq!(parse_body(&raw), "ok");
+
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200, "bodyless GET should ignore invalid body bytes");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["id"], conv_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
