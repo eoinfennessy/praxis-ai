@@ -6,10 +6,15 @@ name: Publish
 
 on:
   workflow_dispatch:
+    inputs:
+      commit:
+        description: Commit SHA to build (defaults to the dispatch ref's commit).
+        required: false
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ inputs.commit || github.sha }}
+  cancel-in-progress: false
 
 permissions: {}
 
@@ -27,6 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
 
       - name: Set up Docker Buildx

@@ -50,7 +50,9 @@ builds the multi-stage Alpine image, pushes it to
 `ghcr.io/praxis-proxy/ai`, and creates the GitHub Release.
 
 Reviewers can manually dispatch the **Publish** workflow when a container
-image is needed without creating a tagged GitHub Release.
+image is needed without creating a tagged GitHub Release. Its optional
+`commit` input selects the exact commit to build; when omitted, it builds the
+commit associated with the selected dispatch ref.
 
 [ghcr]: https://ghcr.io/praxis-proxy/ai
 
