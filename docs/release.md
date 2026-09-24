@@ -54,6 +54,9 @@ image is needed without creating a tagged GitHub Release. Its optional
 `commit` input selects the exact commit to build; when omitted, it builds the
 commit associated with the selected dispatch ref.
 
+The same workflow runs nightly from the latest commit on `main`, publishing
+the rolling `nightly` and `nightly-fips` tags.
+
 [ghcr]: https://ghcr.io/praxis-proxy/ai
 
 ### Image Tags
@@ -65,6 +68,7 @@ The release workflow produces these tags per run:
 | `sha-<hash>` | `sha-abc1234` | Git commit SHA |
 | `<version>` | `0.1.0` | Full semver (from git tag) |
 | `<major>.<minor>` | `0.1` | Major.minor shorthand |
+| `nightly` | `nightly` | Latest scheduled build from `main` |
 | `<any of the above>-fips` | `0.1.0-fips` | Same runs, for the FIPS image |
 
 The workflow also publishes a `sha-<hash>` tag for traceability.
