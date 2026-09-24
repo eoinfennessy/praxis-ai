@@ -22,7 +22,7 @@ use super::{
 };
 use crate::{
     openai::{
-        operation_classifier::{OpenAiOperationMatch, classify},
+        operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter, classify},
         responses::{DEFAULT_TENANT_ID, state::ResponsesState},
     },
     operation::{ApplicationProtocol, Transport},
@@ -1579,6 +1579,29 @@ async fn missing_classifier_match_fails_closed() {
 
     let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
         panic!("expected missing classifier to fail closed");
+    };
+    assert_eq!(rejection.status, 500);
+}
+
+#[tokio::test]
+async fn conversations_upgrade_cannot_bypass_the_classifier_dependency() {
+    let filter = build_test_filter();
+    let req = make_request(Method::GET, "/v1/conversations/conv_1");
+    let mut req = req;
+    req.headers.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+    req.headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+    let mut ctx = base_owned_filter_context(&req);
+
+    let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    let classifier = OpenaiOperationFilter::from_config(&config).unwrap();
+    drop(classifier.on_request(&mut ctx).await.unwrap());
+    assert!(
+        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        "the HTTP-only Conversations route must remain unclassified on a WebSocket handshake"
+    );
+
+    let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+        panic!("expected the local filter to reject an unclassified owned route");
     };
     assert_eq!(rejection.status, 500);
 }

@@ -190,6 +190,21 @@ async fn websocket_handshake_on_chat_completions_does_not_match() {
 }
 
 #[tokio::test]
+async fn websocket_handshake_on_conversations_is_not_classified() {
+    let filter = default_filter();
+    let mut request = req("GET", "/v1/conversations/conv_123");
+    request.headers = websocket_headers();
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        "Conversations is HTTP-only, so its route must not bypass transport classification on upgrade"
+    );
+}
+
+#[tokio::test]
 async fn classifies_a_responses_operation() {
     let filter = default_filter();
     let request = req("POST", "/v1/responses");
