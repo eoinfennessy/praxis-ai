@@ -1536,13 +1536,16 @@ async fn unmatched_path_continues() {
 }
 
 #[tokio::test]
-async fn conversations_route_without_classifier_match_continues() {
+async fn conversations_route_without_classifier_match_fails_closed() {
     let filter = build_test_filter();
     let req = make_request(Method::GET, "/v1/conversations/conv_unclassified");
     let mut ctx = base_owned_filter_context(&req);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected missing classifier to fail closed, got {action:?}");
+    };
+    assert_eq!(rejection.status, 500);
 }
 
 #[tokio::test]
@@ -1568,20 +1571,20 @@ async fn conversations_unknown_operation_id_fails_closed() {
 }
 
 #[tokio::test]
-async fn missing_classifier_match_continues() {
+async fn missing_classifier_match_fails_closed() {
     let filter = build_test_filter();
     let req = make_request(Method::GET, "/v1/conversations/conv_1");
     let mut ctx = make_owned_filter_context(&req);
     let _removed = ctx.extensions.remove::<OpenAiOperationMatch>();
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+        panic!("expected missing classifier to fail closed");
+    };
+    assert_eq!(rejection.status, 500);
 }
 
 #[tokio::test]
-async fn another_protocol_match_continues() {
+async fn another_protocol_match_fails_closed() {
     let filter = build_test_filter();
     let req = make_request(Method::GET, "/v1/conversations/conv_1");
     let mut ctx = make_owned_filter_context(&req);
@@ -1590,10 +1593,10 @@ async fn another_protocol_match_continues() {
         .unwrap()
         .application_protocol = ApplicationProtocol::new("openai_responses");
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+        panic!("expected an inconsistent classifier protocol to fail closed");
+    };
+    assert_eq!(rejection.status, 500);
 }
 
 #[tokio::test]

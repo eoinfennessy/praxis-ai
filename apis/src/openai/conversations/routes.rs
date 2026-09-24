@@ -227,6 +227,7 @@ macro_rules! conversation_operations {
             )+
         }
 
+        #[cfg(feature = "openai-conversations")]
         impl ConversationOperation {
             /// Application protocol that owns every Conversations operation.
             pub(crate) const fn application_protocol(self) -> ApplicationProtocol {
@@ -435,7 +436,7 @@ pub(crate) struct MatchedConversationRoute<'a> {
     pub(crate) params: RouteParams<'a>,
 }
 
-#[cfg(feature = "openai-conversations")]
+#[cfg(all(test, feature = "openai-conversations"))]
 impl<'a> MatchedConversationRoute<'a> {
     /// Return the borrowed conversation ID path segment.
     pub(crate) fn conversation_id(&self) -> Option<&'a str> {

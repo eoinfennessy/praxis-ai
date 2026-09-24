@@ -28,7 +28,7 @@ use super::config::revalidate_postgres_host;
 use super::{
     config::{ConversationsConfig, StorageBackend, validate_config},
     handlers,
-    routes::{APPLICATION_PROTOCOL, ConversationOperation},
+    routes::{APPLICATION_PROTOCOL, ConversationOperation, match_route},
 };
 #[cfg(feature = "store-postgres")]
 use crate::store::PostgresResponseStore;
@@ -533,6 +533,13 @@ impl HttpFilter for OpenaiConversationsFilter {
             // request that turns out to belong to another protocol. Release
             // that handle before allowing an unrelated request upstream.
             Self::discard_request_state(ctx);
+            if match_route(ctx.request.method.as_str(), ctx.request.uri.path()).is_some() {
+                // Conversations is a proxy-owned API. A missing classifier
+                // match means the dependency was absent, ordered later, or
+                // skipped by conditions (including an open failure mode), so
+                // forwarding here would silently bypass local handling.
+                return Ok(FilterAction::Reject(reject_classifier_unavailable()));
+            }
             if should_append_back(ctx) {
                 drop(self.get_or_init_store().await);
             }
@@ -810,6 +817,19 @@ fn reject_store_unavailable() -> Rejection {
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
 
+/// Build a 500 rejection when the required operation classifier did not run.
+fn reject_classifier_unavailable() -> Rejection {
+    let body = serde_json::json!({
+        "error": {
+            "message": "Internal server error.",
+            "type": "server_error",
+        }
+    });
+    Rejection::status(500)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_vec(&body).unwrap_or_default())
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
@@ -834,5 +854,14 @@ mod tests {
             .find(|(k, _)| k == "content-type")
             .map(|(_, v)| v.as_str());
         assert_eq!(ct, Some("application/json"), "should set application/json content-type");
+    }
+
+    #[test]
+    fn reject_classifier_unavailable_returns_500_server_error() {
+        let rejection = reject_classifier_unavailable();
+        assert_eq!(rejection.status, 500);
+        let body: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "Internal server error.");
     }
 }
