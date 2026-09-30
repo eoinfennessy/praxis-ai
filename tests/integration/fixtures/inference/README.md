@@ -52,6 +52,7 @@ The manifest declares **48 features** across **7 scopes**, linked to **44 scenar
 | `responses_agentic_loop` | `responses.agentic.status_less_function_call` | `synthetic_only` | `responses/agentic-status-less-function-call` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.irr_terminal_streaming` | `synthetic_only` | `responses/irr-terminal-streaming` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.deferred_mcp_connectors` | `synthetic_only` | `responses/agentic-deferred-mcp-connectors` | `synthetic`: `synthetic_only` |
+| `responses_agentic_loop` | `responses.agentic.retained_overflow` | `synthetic_only` | `responses/agentic-retained-overflow-stream` | `synthetic`: `synthetic_only` |
 | `responses_to_chat_completions` | `responses.chat.continuation` | `synthetic_only` | `responses/chat-basic-nonstream` | `synthetic`: `synthetic_only` |
 | `responses_to_chat_completions` | `responses.chat.reasoning.request` | `live_covered` | `responses/chat-reasoning-nonstream` | `vllm`: `live_covered` |
 | `responses_to_chat_completions` | `responses.chat.reasoning.response` | `live_covered` | `responses/chat-reasoning-nonstream` | `vllm`: `live_covered` |

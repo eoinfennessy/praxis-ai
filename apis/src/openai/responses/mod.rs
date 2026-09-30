@@ -77,6 +77,8 @@ pub(crate) mod usage;
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
+pub use agentic_loop::AgenticBudgetPolicy;
+#[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use file_resolve::FileResolveFilter;
@@ -332,6 +334,23 @@ impl ResponsesFormatFilter {
     }
 }
 
+/// Reject a known oversized create body before classification parses JSON.
+/// Reserve eight raw-body-sized copies for the parsed request and sibling state.
+#[cfg(feature = "openai-responses")]
+fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
+    if is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>()
+        && bytes.len() > policy.max_retained_bytes() / 8
+    {
+        return Some(FilterAction::Reject(error::responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+        )));
+    }
+    None
+}
+
 #[async_trait]
 impl HttpFilter for ResponsesFormatFilter {
     fn name(&self) -> &'static str {
@@ -368,6 +387,11 @@ impl HttpFilter for ResponsesFormatFilter {
             Some(b) => b.as_ref(),
             None => &[],
         };
+
+        #[cfg(feature = "openai-responses")]
+        if let Some(action) = initial_budget_rejection(ctx, bytes) {
+            return Ok(action);
+        }
 
         let (classified, websocket_handshake) = classify_request(ctx, bytes);
 

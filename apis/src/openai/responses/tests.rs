@@ -243,6 +243,26 @@ async fn on_request_body_rejects_invalid_json() {
     );
 }
 
+#[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn agentic_budget_rejects_raw_body_before_classification() {
+    let filter = make_filter("on_invalid: reject");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&config).unwrap());
+    let mut body = Some(Bytes::from("x".repeat(513)));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(
+        ctx.get_metadata("openai_responses_format.format").is_none(),
+        "classification must not parse or publish the oversized body"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Body Parsing Edge Cases
 // -----------------------------------------------------------------------------

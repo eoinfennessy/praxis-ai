@@ -3646,6 +3646,15 @@ impl ResponseStore for MockStore {
         Ok(EventLogStatus::default())
     }
 
+    async fn pending_approval_payload_bytes(
+        &self,
+        _owner: &StateOwner,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        Ok(0)
+    }
+
     async fn get_conversation(
         &self,
         tenant_id: &StateOwner,

@@ -1255,6 +1255,7 @@ mod tests {
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1313,6 +1314,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
@@ -1333,9 +1335,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 48);
-        assert_eq!(report.scenarios_total, 44);
-        assert_eq!(report.recordings_total, 49);
+        assert_eq!(report.features_total, 49);
+        assert_eq!(report.scenarios_total, 45);
+        assert_eq!(report.recordings_total, 50);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1358,6 +1360,7 @@ mod tests {
                 "messages/upstream-error-stream",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
+                "responses/agentic-retained-overflow-stream",
                 "responses/agentic-status-less-function-call",
                 "responses/background-unsupported",
                 "responses/chat-basic-nonstream",
@@ -1385,7 +1388,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 48);
+        assert_eq!(manifest.features.len(), 49);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1541,6 +1544,10 @@ mod tests {
                 (
                     &"responses.agentic.deferred_mcp_connectors".to_owned(),
                     &vec!["responses/agentic-deferred-mcp-connectors".to_owned()]
+                ),
+                (
+                    &"responses.agentic.retained_overflow".to_owned(),
+                    &vec!["responses/agentic-retained-overflow-stream".to_owned()]
                 ),
                 (
                     &"responses.chat.continuation".to_owned(),
@@ -1728,7 +1735,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[19..30] {
+        for feature in &manifest.features[19..31] {
             assert_eq!(
                 feature
                     .providers
@@ -1738,7 +1745,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[30..32] {
+        for feature in &manifest.features[31..33] {
             assert_eq!(
                 feature
                     .providers
@@ -1748,7 +1755,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[32..43] {
+        for feature in &manifest.features[33..44] {
             assert_eq!(
                 feature
                     .providers
@@ -1759,7 +1766,7 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[43]
+            manifest.features[44]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))

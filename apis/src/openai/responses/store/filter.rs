@@ -63,7 +63,13 @@ use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 use super::{
-    super::{DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, state::ResponsesState},
+    super::{
+        DEFAULT_STORE_NAME,
+        agentic_loop::AgenticBudgetPolicy,
+        bound_body_outcome,
+        error::responses_error_rejection,
+        state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
+    },
     config::{ResponseStoreConfig, validate_config},
 };
 use crate::{
@@ -101,6 +107,8 @@ const SSE_FRAMING_HEADROOM_BYTES: u64 = 1024;
 /// 400 message returned for `GET /v1/responses/{id}?stream=true` against a
 /// response that has no complete, replayable event log.
 const NO_REPLAY_LOG_MESSAGE: &str = "This response has no replayable event stream. Only responses created with stream=true and stored by the proxy can be replayed.";
+/// Metadata key for the response-store filter's request-lifetime input snapshot.
+const STORE_REQUEST_PAYLOAD_BYTES_METADATA: &str = "responses.store_request_payload_bytes";
 
 /// Persists Responses API responses to the configured response store backend.
 ///
@@ -198,7 +206,14 @@ impl ResponseStoreFilter {
     }
 
     /// Persist a streaming response from accumulated `ResponsesState`.
-    fn persist_from_streaming_state(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "checks aggregate admission before constructing the store record"
+    )]
+    fn persist_from_streaming_state(
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
         if should_skip_persist(ctx) {
             return Ok(FilterAction::Continue);
         }
@@ -211,6 +226,14 @@ impl ResponseStoreFilter {
         if !store_available(ctx) {
             trace!("skipping streaming persistence: store unavailable");
             return Ok(FilterAction::Continue);
+        }
+
+        let response_bytes = ctx
+            .extensions
+            .get::<ResponsesState>()
+            .and_then(|state| retained_json_bytes(&state.response_object));
+        if !response_bytes.is_some_and(|bytes| persistence_construction_fits(ctx, bytes)) {
+            return Ok(persistence_budget_failure(ctx, true, body));
         }
 
         // Capture the proxy-issued pending approvals before taking the context.
@@ -243,7 +266,7 @@ impl ResponseStoreFilter {
     /// Persist a non-streaming response from the buffered body bytes.
     fn persist_from_buffered_body(
         ctx: &mut HttpFilterContext<'_>,
-        body: &Option<Bytes>,
+        body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
         if should_skip_persist(ctx) {
             return Ok(FilterAction::Continue);
@@ -253,6 +276,10 @@ impl ResponseStoreFilter {
         };
         if !store_available(ctx) {
             return Ok(FilterAction::Continue);
+        }
+
+        if !persistence_construction_fits(ctx, bytes.len()) {
+            return Ok(persistence_budget_failure(ctx, false, body));
         }
 
         // Capture the proxy-issued pending approvals before taking the context.
@@ -593,6 +620,80 @@ struct ResponseStoreRequestState {
     error_event_detector: SseErrorEventDetector,
 }
 
+/// Compact size of the independently owned request input snapshot.
+pub(crate) fn retained_request_payload_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    if let Some(state) = ctx.extensions.get::<ResponseStoreRequestState>() {
+        return state.input.as_ref().map_or(Some(0), retained_json_bytes);
+    }
+    ctx.get_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA)
+        .map_or(Some(0), |bytes| bytes.parse().ok())
+}
+
+/// Release the store-owned input snapshot after any terminal budget failure.
+pub(crate) fn discard_retained_request_payload(ctx: &mut HttpFilterContext<'_>) {
+    let bytes = retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
+    ctx.extensions.remove::<ResponseStoreRequestState>();
+    ctx.set_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA, "0");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.release_external_payload_bytes(bytes);
+    }
+}
+
+/// Reserve record, history, and backend serialization owners before building them.
+pub(super) fn persistence_construction_fits(ctx: &HttpFilterContext<'_>, response_bytes: usize) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return true;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let Some(history_bytes) = retained_json_values_bytes(&state.persisted_messages) else {
+        return false;
+    };
+    let Some(input_bytes) = retained_request_payload_bytes(ctx) else {
+        return false;
+    };
+    let approval_bytes = state.pending_approvals.iter().try_fold(0_usize, |used, record| {
+        used.checked_add(record.approval_id.len())?
+            .checked_add(record.server_label.len())?
+            .checked_add(record.tool_name.len())?
+            .checked_add(record.arguments.len())?
+            .checked_add(record.target_fingerprint.len())
+    });
+    let additional = response_bytes
+        .checked_mul(5)
+        .and_then(|bytes| history_bytes.checked_mul(3)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(input_bytes))
+        .and_then(|bytes| approval_bytes?.checked_mul(2)?.checked_add(bytes));
+    additional.is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
+/// Reject persistence and emit the appropriate buffered or committed-stream error.
+fn persistence_budget_failure(
+    ctx: &mut HttpFilterContext<'_>,
+    streaming: bool,
+    body: &mut Option<Bytes>,
+) -> FilterAction {
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+    }
+    discard_retained_request_payload(ctx);
+    if streaming {
+        *body = super::super::stream_events::encode_local_error(
+            ctx,
+            "server_error",
+            "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during persistence",
+        );
+        return FilterAction::Continue;
+    }
+    FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during persistence",
+    ))
+}
+
 /// Capture the immutable owner once, before inference or a body-first consumer.
 fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
     if !request_will_persist_response(ctx) {
@@ -608,6 +709,8 @@ fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), Filt
 
 /// Retain request input alongside the already captured owner.
 fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) {
+    let retained_bytes = retained_json_bytes(&input).unwrap_or(usize::MAX);
+    ctx.set_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA, retained_bytes.to_string());
     let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
     state.input = Some(input);
     ctx.extensions.insert(state);
@@ -969,6 +1072,29 @@ fn pending_approvals_from_ctx(ctx: &HttpFilterContext<'_>) -> Vec<PendingApprova
 // HttpFilter Implementation
 // -----------------------------------------------------------------------------
 
+/// Reserve the original input snapshot before parsing another owned JSON tree.
+fn admit_request_input_snapshot(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) -> Result<(), FilterAction> {
+    if should_skip(ctx) || ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
+        return Ok(());
+    }
+    // Compact JSON cannot exceed the raw body, so the body length is a safe
+    // upper bound for the snapshot captured below.
+    let raw_bytes = body.as_ref().map_or(0, Bytes::len);
+    let admitted = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.can_retain_payload(raw_bytes));
+    if admitted {
+        return Ok(());
+    }
+    ctx.set_metadata("responses.skip_persist", "true");
+    Err(FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+    )))
+}
+
 #[async_trait]
 impl HttpFilter for ResponseStoreFilter {
     fn name(&self) -> &'static str {
@@ -1053,6 +1179,9 @@ impl HttpFilter for ResponseStoreFilter {
         if let Err(action) = capture_persistence_owner(ctx) {
             return Ok(action);
         }
+        if let Err(action) = admit_request_input_snapshot(ctx, body) {
+            return Ok(action);
+        }
         if !should_skip(ctx)
             && let Some(input) = extract_request_input(body)
         {
@@ -1105,6 +1234,17 @@ impl HttpFilter for ResponseStoreFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if Self::should_release_skipped_response_body(ctx) {
+            // A committed SSE error still needs the store filter's request
+            // state while chunks are being released. Drop its input snapshot
+            // only at EOS, after the wire terminal has been emitted.
+            if end_of_stream
+                && ctx
+                    .extensions
+                    .get::<ResponsesState>()
+                    .is_some_and(|state| state.retained_payload_failed)
+            {
+                discard_retained_request_payload(ctx);
+            }
             return Ok(FilterAction::Release);
         }
 
@@ -1130,7 +1270,7 @@ impl HttpFilter for ResponseStoreFilter {
                     // state is missing (#1197), or an `Err` on a persistence
                     // failure — and must be propagated so the client never
                     // observes `response.completed` for an unpersisted record.
-                    match Self::persist_from_streaming_state(ctx)? {
+                    match Self::persist_from_streaming_state(ctx, body)? {
                         FilterAction::Continue => {},
                         action => return Ok(action),
                     }
@@ -1144,7 +1284,7 @@ impl HttpFilter for ResponseStoreFilter {
             if ctx.extensions.get::<StreamingResponsePersistenceAttempted>().is_some() {
                 return Ok(FilterAction::Continue);
             }
-            return Self::persist_from_streaming_state(ctx);
+            return Self::persist_from_streaming_state(ctx, body);
         }
 
         if !end_of_stream {

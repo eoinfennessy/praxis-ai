@@ -45,7 +45,7 @@ use tracing::{debug, trace, warn};
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
-    DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
+    DEFAULT_STORE_NAME, agentic_loop::AgenticBudgetPolicy, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
     state::{ResponsesState, strip_local_compaction_marker},
@@ -53,7 +53,7 @@ use super::{
 use crate::{
     is_event_stream_content_type,
     state_owner::{StateOwner, require_state_owner},
-    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
+    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
 
 // -----------------------------------------------------------------------------
@@ -142,7 +142,11 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let record = match fetch_and_validate_previous(ctx, &owner, &prev_id).await {
+        let read_limit = match history_read_limit(ctx) {
+            Ok(limit) => limit,
+            Err(action) => return Ok(action),
+        };
+        let record = match fetch_and_validate_previous(ctx, &owner, &prev_id, read_limit).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
@@ -154,7 +158,9 @@ impl RehydrateFilter {
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let stored = stored_messages_for_response(record);
         let state = build_state(parsed_body, stored, previous_tools, previous_usage);
-        install_rehydrated_state(ctx, state);
+        if let Err(action) = install_rehydrated_state(ctx, state) {
+            return Ok(action);
+        }
         debug!(previous_response_id = %prev_id, "previous response validated, state populated");
         ctx.set_metadata("responses.previous_response_id", prev_id);
         Ok(FilterAction::Release)
@@ -175,13 +181,19 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let record = match fetch_conversation(ctx, &owner, &conv_id).await {
+        let read_limit = match history_read_limit(ctx) {
+            Ok(limit) => limit,
+            Err(action) => return Ok(action),
+        };
+        let record = match fetch_conversation(ctx, &owner, &conv_id, read_limit).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
         let stored = stored_messages_for_conversation(record);
         let state = build_state(parsed_body, stored, vec![], None);
-        install_rehydrated_state(ctx, state);
+        if let Err(action) = install_rehydrated_state(ctx, state) {
+            return Ok(action);
+        }
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
         Ok(FilterAction::Release)
     }
@@ -1153,8 +1165,9 @@ async fn fetch_and_validate_previous(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     prev_id: &str,
+    read_limit: Option<usize>,
 ) -> Result<ResponseRecord, FilterAction> {
-    let record = fetch_previous_response(ctx, owner, prev_id).await?;
+    let record = fetch_previous_response(ctx, owner, prev_id, read_limit).await?;
     validate_response_status(&record)?;
     Ok(record)
 }
@@ -1187,6 +1200,7 @@ async fn fetch_conversation(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     conv_id: &str,
+    read_limit: Option<usize>,
 ) -> Result<ConversationRecord, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
@@ -1198,10 +1212,11 @@ async fn fetch_conversation(
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_conversation(conv_id).await.map_err(|e| {
-        warn!(error = %e, "rehydrate: failed to fetch conversation");
-        reject_server_error("failed to fetch conversation")
-    })?;
+    let record = match read_limit {
+        Some(limit) => store.get_conversation_bounded(conv_id, limit).await,
+        None => store.get_conversation(conv_id).await,
+    }
+    .map_err(|error| map_history_read_error(&error))?;
 
     record.ok_or_else(|| {
         debug!(id = %conv_id, "rehydrate: conversation not found");
@@ -1288,11 +1303,56 @@ fn parse_body_and_extract_id(bytes: &[u8]) -> Result<(Value, Option<String>), Fi
 // Fetch & Validate
 // -----------------------------------------------------------------------------
 
+/// Reserve room for the validated request, its temporary rebuilt copy, the
+/// store snapshot, and replay/persistence histories before fetching payload.
+/// The store's bounded read checks encoded columns in SQL and decoded columns
+/// before JSON parsing, including compressed records.
+fn history_read_limit(ctx: &HttpFilterContext<'_>) -> Result<Option<usize>, FilterAction> {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return Ok(None);
+    };
+    let limit = policy.max_retained_bytes();
+    let state = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .ok_or_else(reject_retained_payload)?;
+    let current = state
+        .retained_payload_bytes_bounded(limit)
+        .ok_or_else(reject_retained_payload)?;
+    let parsed_copy = super::state::retained_json_bytes(&state.request_body).ok_or_else(reject_retained_payload)?;
+    let store_bytes = super::store::retained_request_payload_bytes(ctx).ok_or_else(reject_retained_payload)?;
+    let remaining = limit
+        .checked_sub(current.checked_mul(2).ok_or_else(reject_retained_payload)?)
+        .and_then(|bytes| bytes.checked_sub(parsed_copy))
+        .and_then(|bytes| bytes.checked_sub(store_bytes))
+        .ok_or_else(reject_retained_payload)?;
+    Ok(Some(remaining / 4))
+}
+
+/// Respond with the initial request's Responses-formatted budget error.
+fn reject_retained_payload() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+    ))
+}
+
+/// Convert a bounded store read failure to its request wire response.
+fn map_history_read_error(error: &StoreError) -> FilterAction {
+    if matches!(error, StoreError::PayloadTooLarge) {
+        return reject_retained_payload();
+    }
+    warn!(error = %error, "rehydrate: failed to fetch stored history");
+    reject_server_error("failed to fetch stored history")
+}
+
 /// Fetch the previous response record from the store.
 async fn fetch_previous_response(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     prev_id: &str,
+    read_limit: Option<usize>,
 ) -> Result<ResponseRecord, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
@@ -1304,10 +1364,11 @@ async fn fetch_previous_response(
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_response(prev_id).await.map_err(|e| {
-        warn!(error = %e, "rehydrate: failed to fetch previous response");
-        reject_server_error("failed to fetch previous response")
-    })?;
+    let record = match read_limit {
+        Some(limit) => store.get_response_bounded(prev_id, limit).await,
+        None => store.get_response(prev_id).await,
+    }
+    .map_err(|error| map_history_read_error(&error))?;
 
     record.ok_or_else(|| {
         debug!(id = %prev_id, "rehydrate: previous response not found");
@@ -1423,15 +1484,27 @@ fn mcp_tool_names(tools: &[Value]) -> Vec<String> {
 /// It also seeds [`ResponsesState::response_id`] from the `responses.response_id`
 /// metadata (assigned upstream), since the reconstructed state cannot derive it
 /// from the request body.
-fn install_rehydrated_state(ctx: &mut HttpFilterContext<'_>, mut state: ResponsesState) {
+fn install_rehydrated_state(ctx: &mut HttpFilterContext<'_>, mut state: ResponsesState) -> Result<(), FilterAction> {
     let store_persist_armed = ctx
         .extensions
         .get::<ResponsesState>()
         .is_some_and(|prev| prev.store_persist_armed);
     state.store_persist_armed = store_persist_armed;
     state.response_id = ctx.get_metadata("responses.response_id").map(ToOwned::to_owned);
+    if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+        state.apply_retained_payload_limit(policy.max_retained_bytes());
+        let store_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
+        state.set_retained_external_payload_bytes(store_bytes);
+        if !state.can_retain_payload(0) {
+            ctx.set_metadata("responses.skip_persist", "true");
+            super::store::discard_retained_request_payload(ctx);
+            ctx.extensions.remove::<ResponsesState>();
+            return Err(reject_retained_payload());
+        }
+    }
     write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
     ctx.extensions.insert(state);
+    Ok(())
 }
 
 /// Extract token usage from the previous response and set
