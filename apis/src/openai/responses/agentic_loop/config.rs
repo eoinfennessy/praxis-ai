@@ -102,6 +102,11 @@ pub(super) struct AgenticLoopConfig {
     /// bytes for owned strings and streaming buffers. When several loop filters
     /// touch one request, the smallest configured value wins. Valid from 4 `KiB`
     /// through the non-disableable 256 `MiB` ceiling; defaults to 64 `MiB`.
+    /// Initial Responses create bodies are capped at one eighth of the smallest
+    /// reachable budget; the default therefore allows 8 `MiB`, which may reject
+    /// larger bodies accepted previously. To admit bodies up to `B` bytes, set
+    /// the effective budget to at least `8 × B` and
+    /// `body_limits.max_request_bytes` to at least `B`.
     #[serde(default = "default_max_retained_bytes")]
     pub max_retained_bytes: RetainedBytes,
 }

@@ -256,7 +256,15 @@ async fn agentic_budget_rejects_raw_body_before_classification() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    let FilterAction::Reject(rejection) = action else {
+        panic!("oversized raw request body must be rejected");
+    };
+    assert_eq!(rejection.status, 413);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        error["error"]["message"],
+        "raw request body exceeds the 512-byte limit derived from openai_agentic_loop.max_retained_bytes"
+    );
     assert!(
         ctx.get_metadata("openai_responses_format.format").is_none(),
         "classification must not parse or publish the oversized body"

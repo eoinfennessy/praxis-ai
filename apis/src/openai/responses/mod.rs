@@ -334,19 +334,26 @@ impl ResponsesFormatFilter {
     }
 }
 
+#[cfg(feature = "openai-responses")]
+const INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER: usize = 8;
+
 /// Reject a known oversized create body before classification parses JSON.
-/// Reserve eight raw-body-sized copies for the parsed request and sibling state.
 #[cfg(feature = "openai-responses")]
 fn initial_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
     if is_responses_create(&ctx.request.method, ctx.request.uri.path())
         && let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>()
-        && bytes.len() > policy.max_retained_bytes() / 8
     {
-        return Some(FilterAction::Reject(error::responses_error_rejection(
-            413,
-            "invalid_request_error",
-            "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
-        )));
+        let raw_body_limit = policy.max_retained_bytes() / INITIAL_RAW_REQUEST_BODY_BUDGET_MULTIPLIER;
+        if bytes.len() > raw_body_limit {
+            let message = format!(
+                "raw request body exceeds the {raw_body_limit}-byte limit derived from openai_agentic_loop.max_retained_bytes"
+            );
+            return Some(FilterAction::Reject(error::responses_error_rejection(
+                413,
+                "invalid_request_error",
+                &message,
+            )));
+        }
     }
     None
 }

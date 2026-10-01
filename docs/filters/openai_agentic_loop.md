@@ -18,7 +18,7 @@ Retained-payload admission conservatively reserves space for independently owned
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `max_infer_iters` | integer | no | Maximum number of inference loop iterations (Praxis-only, not part of the OpenAI API spec). When the iteration counter reaches this limit, the loop returns a 508 Loop Detected error. Must be between 1 and [`MAX_ITERATIONS_CEILING`] (currently 100); defaults to 10. |
-| `max_retained_bytes` | RetainedBytes | no | Maximum aggregate payload bytes retained by the Responses agentic execution. Counts compact JSON for each independently owned value and raw bytes for owned strings and streaming buffers. When several loop filters touch one request, the smallest configured value wins. Valid from 4 `KiB` through the non-disableable 256 `MiB` ceiling; defaults to 64 `MiB`. |
+| `max_retained_bytes` | RetainedBytes | no | Maximum aggregate payload bytes retained by the Responses agentic execution. Counts compact JSON for each independently owned value and raw bytes for owned strings and streaming buffers. When several loop filters touch one request, the smallest configured value wins. Valid from 4 `KiB` through the non-disableable 256 `MiB` ceiling; defaults to 64 `MiB`. Initial Responses create bodies are capped at one eighth of the smallest reachable budget; the default therefore allows 8 `MiB`, which may reject larger bodies accepted previously. To admit bodies up to `B` bytes, set the effective budget to at least `8 × B` and `body_limits.max_request_bytes` to at least `B`. |
 
 ## Examples
 
