@@ -55,6 +55,22 @@ fn from_config_rejects_zero_max_infer_iters() {
     assert!(result.is_err(), "max_infer_iters=0 should be rejected");
 }
 
+#[test]
+fn from_config_rejects_out_of_range_retained_byte_budgets() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4095").unwrap();
+    let expected = "openai_agentic_loop: max_retained_bytes must be in 4096..=268435456, got 4095";
+
+    let filter_error = super::AgenticLoopFilter::from_config(&yaml)
+        .err()
+        .expect("filter config should reject an out-of-range byte budget");
+    assert!(filter_error.to_string().contains(expected));
+
+    let policy_error = super::AgenticBudgetPolicy::from_config(&yaml)
+        .err()
+        .expect("budget policy should reject an out-of-range byte budget");
+    assert!(policy_error.to_string().contains(expected));
+}
+
 // -----------------------------------------------------------------------------
 // Passthrough Without State
 // -----------------------------------------------------------------------------

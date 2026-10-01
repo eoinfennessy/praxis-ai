@@ -5,7 +5,7 @@
 
 use praxis_core::config::MAX_ITERATIONS_CEILING;
 use praxis_filter::FilterError;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 // -----------------------------------------------------------------------------
 // Defaults
@@ -32,8 +32,48 @@ fn default_max_infer_iters() -> u32 {
 }
 
 /// Serde default for `max_retained_bytes`.
-fn default_max_retained_bytes() -> usize {
-    DEFAULT_MAX_RETAINED_BYTES
+fn default_max_retained_bytes() -> RetainedBytes {
+    RetainedBytes::default()
+}
+
+/// A retained-payload budget constrained to the supported range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RetainedBytes(usize);
+
+impl RetainedBytes {
+    /// Return the validated byte budget.
+    pub(super) const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for RetainedBytes {
+    fn default() -> Self {
+        Self(DEFAULT_MAX_RETAINED_BYTES)
+    }
+}
+
+impl TryFrom<usize> for RetainedBytes {
+    type Error = String;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        if !(MIN_MAX_RETAINED_BYTES..=MAX_MAX_RETAINED_BYTES).contains(&value) {
+            return Err(format!(
+                "openai_agentic_loop: max_retained_bytes must be in {MIN_MAX_RETAINED_BYTES}..={MAX_MAX_RETAINED_BYTES}, got {value}"
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for RetainedBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = usize::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -63,14 +103,14 @@ pub(super) struct AgenticLoopConfig {
     /// touch one request, the smallest configured value wins. Valid from 4 `KiB`
     /// through the non-disableable 256 `MiB` ceiling; defaults to 64 `MiB`.
     #[serde(default = "default_max_retained_bytes")]
-    pub max_retained_bytes: usize,
+    pub max_retained_bytes: RetainedBytes,
 }
 
 impl Default for AgenticLoopConfig {
     fn default() -> Self {
         Self {
             max_infer_iters: DEFAULT_MAX_INFER_ITERS,
-            max_retained_bytes: DEFAULT_MAX_RETAINED_BYTES,
+            max_retained_bytes: RetainedBytes::default(),
         }
     }
 }
@@ -88,13 +128,6 @@ pub(super) fn build_config(cfg: AgenticLoopConfig) -> Result<AgenticLoopConfig, 
         )
         .into());
     }
-    if !(MIN_MAX_RETAINED_BYTES..=MAX_MAX_RETAINED_BYTES).contains(&cfg.max_retained_bytes) {
-        return Err(format!(
-            "openai_agentic_loop: max_retained_bytes must be in {MIN_MAX_RETAINED_BYTES}..={MAX_MAX_RETAINED_BYTES}, got {}",
-            cfg.max_retained_bytes
-        )
-        .into());
-    }
     Ok(cfg)
 }
 
@@ -109,11 +142,17 @@ mod tests {
 
     #[test]
     fn retained_byte_default_and_bounds() {
-        assert_eq!(parse("{}").max_retained_bytes, DEFAULT_MAX_RETAINED_BYTES);
-        assert!(build_config(parse("max_retained_bytes: 4095")).is_err());
-        assert!(build_config(parse("max_retained_bytes: 4096")).is_ok());
-        assert!(build_config(parse("max_retained_bytes: 268435456")).is_ok());
-        assert!(build_config(parse("max_retained_bytes: 268435457")).is_err());
+        assert_eq!(parse("{}").max_retained_bytes.get(), DEFAULT_MAX_RETAINED_BYTES);
+        assert!(serde_yaml::from_str::<AgenticLoopConfig>("max_retained_bytes: 4095").is_err());
+        assert!(serde_yaml::from_str::<AgenticLoopConfig>("max_retained_bytes: 4096").is_ok());
+        assert!(serde_yaml::from_str::<AgenticLoopConfig>("max_retained_bytes: 268435456").is_ok());
+        assert!(serde_yaml::from_str::<AgenticLoopConfig>("max_retained_bytes: 268435457").is_err());
+
+        let err = RetainedBytes::try_from(4095).unwrap_err();
+        assert_eq!(
+            err,
+            "openai_agentic_loop: max_retained_bytes must be in 4096..=268435456, got 4095"
+        );
     }
 
     #[test]

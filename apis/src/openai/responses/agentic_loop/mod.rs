@@ -160,8 +160,9 @@ impl AgenticBudgetPolicy {
         } else {
             parse_filter_config("openai_agentic_loop", config)?
         };
+        let cfg = build_config(cfg)?;
         Ok(Self {
-            max_retained_bytes: build_config(cfg)?.max_retained_bytes,
+            max_retained_bytes: cfg.max_retained_bytes.get(),
         })
     }
 
@@ -298,8 +299,8 @@ impl AgenticLoopFilter {
         } else {
             parse_filter_config("openai_agentic_loop", config)?
         };
-        let validated = build_config(cfg)?;
-        Ok(Box::new(Self { config: validated }))
+        let config = build_config(cfg)?;
+        Ok(Box::new(Self { config }))
     }
 }
 
@@ -330,7 +331,7 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if let Some(action) = admit_retained_payload_budget(ctx, self.config.max_retained_bytes)? {
+        if let Some(action) = admit_retained_payload_budget(ctx, self.config.max_retained_bytes.get())? {
             return Ok(action);
         }
 
@@ -372,7 +373,7 @@ impl HttpFilter for AgenticLoopFilter {
 
         // StreamBuffer pre-read reaches this hook before `on_request`. Admit the
         // starting state here so a deferred approval cannot execute first.
-        if let Some(action) = admit_retained_payload_budget(ctx, self.config.max_retained_bytes)? {
+        if let Some(action) = admit_retained_payload_budget(ctx, self.config.max_retained_bytes.get())? {
             return Ok(action);
         }
         // Defer the sole request-side mutation until the proxy, which follows
