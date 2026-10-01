@@ -2110,28 +2110,45 @@ async fn transient_frame_and_event_ownership_is_admitted_before_parsing() {
         "response.output_text.delta",
         &json!({"response_id": "resp_budget", "delta": "hello"}),
     );
+    let split_at = chunk.len() - 1;
+    let partial_chunk = chunk.slice(..split_at);
+    let terminating_chunk = chunk.slice(split_at..);
+
+    let mut partial = Some(partial_chunk);
+    filter.on_response_body(&mut ctx, &mut partial, false).unwrap();
+    assert!(partial.is_none(), "the incomplete frame must remain buffered");
+
+    let parser_state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let local_bytes = parser_state.retained_payload_bytes().unwrap();
+    let parser_scratch_bytes = parser_state.frame_parser.retained_bytes();
+    let persistent_local_bytes = local_bytes - parser_scratch_bytes;
+    assert!(local_bytes > 0, "the partial frame must be retained");
+
     let mut parser = SseFrameParser::new(65_536);
     let frames = parser.parse_chunk(&chunk).unwrap();
     let frame_bytes = super::retained_frame_payload_bytes(&frames).unwrap();
-    let event_bytes = frames
+    let event_construction_bytes = frames
         .iter()
         .filter(|frame| frame.data != b"[DONE]")
-        .map(|frame| frame.data.len())
+        .map(|frame| frame.data.len() + frame.event_type.as_ref().map_or(0, String::len))
         .sum::<usize>();
-    let local_bytes = ctx
-        .get_filter_state::<StreamEventsState>()
-        .unwrap()
-        .retained_payload_bytes()
-        .unwrap();
+    let parser_projection_peak = response_bytes + local_bytes + terminating_chunk.len() * 4;
+    let frame_and_event_ownership_peak =
+        response_bytes + persistent_local_bytes + frame_bytes + event_construction_bytes;
+    let limit = parser_projection_peak + 1;
+    assert!(
+        limit < frame_and_event_ownership_peak,
+        "the cap must admit parser projection but reject simultaneous frame/event ownership"
+    );
     ctx.extensions
         .get_mut::<ResponsesState>()
         .unwrap()
-        .apply_retained_payload_limit(response_bytes + local_bytes + frame_bytes + event_bytes - 1);
+        .apply_retained_payload_limit(limit);
 
-    let mut body = Some(chunk);
+    let mut body = Some(terminating_chunk);
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
-    assert!(body.is_none(), "the parser must reject the transient ownership peak");
+    assert!(body.is_none(), "the frame/event ownership peak must be rejected");
     assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
 }
 
