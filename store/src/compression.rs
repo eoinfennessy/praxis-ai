@@ -529,13 +529,23 @@ mod tests {
         let value = json!({"text": "x".repeat(16_384)});
         let raw = serde_json::to_vec(&value).unwrap();
         let compressed = zstd::bulk::compress(&raw, 3).unwrap();
-        assert!(compressed.len() < 4_096);
-        assert!(matches!(decode_bounded(&raw, 4_096), Err(StoreError::PayloadTooLarge)));
-        assert!(matches!(
-            decode_bounded(&compressed, 4_096),
-            Err(StoreError::PayloadTooLarge)
-        ));
-        assert_eq!(decode_bounded(&compressed, raw.len()).unwrap(), (value, raw.len()));
+        assert!(
+            compressed.len() < 4_096,
+            "compressed fixture must fit under the byte limit"
+        );
+        assert!(
+            matches!(decode_bounded(&raw, 4_096), Err(StoreError::PayloadTooLarge)),
+            "raw payload over the byte limit must be rejected"
+        );
+        assert!(
+            matches!(decode_bounded(&compressed, 4_096), Err(StoreError::PayloadTooLarge)),
+            "compressed payload that expands over the byte limit must be rejected"
+        );
+        assert_eq!(
+            decode_bounded(&compressed, raw.len()).unwrap(),
+            (value, raw.len()),
+            "compressed payload at the exact decoded byte limit must be accepted"
+        );
     }
 
     // -------------------------------------------------------------------------

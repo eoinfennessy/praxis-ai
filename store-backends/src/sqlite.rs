@@ -1970,10 +1970,13 @@ mod tests {
 
         record.messages = serde_json::json!([{"role": "assistant", "content": "x".repeat(16_384)}]);
         raw.upsert_response(&record).await.unwrap();
-        assert!(matches!(
-            raw.get_response_bounded(&owner, &record.id, 4_096).await,
-            Err(StoreError::PayloadTooLarge)
-        ));
+        assert!(
+            matches!(
+                raw.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized raw response messages must exceed the bounded read limit"
+        );
         // An oversized invalid column still reports the size failure: SQL
         // excludes the blob before JSON decoding can inspect it.
         sqlx::query("UPDATE bounded_responses_raw SET messages = ? WHERE id = ?")
@@ -1982,10 +1985,13 @@ mod tests {
             .execute(&raw.pool)
             .await
             .unwrap();
-        assert!(matches!(
-            raw.get_response_bounded(&owner, &record.id, 4_096).await,
-            Err(StoreError::PayloadTooLarge)
-        ));
+        assert!(
+            matches!(
+                raw.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized invalid raw messages must report the size limit before JSON decoding"
+        );
         let other = StateOwner::from_trusted_parts("other", "issuer", "subject").unwrap();
         assert!(
             raw.get_response_bounded(&other, &record.id, 4_096)
@@ -2002,10 +2008,13 @@ mod tests {
             .execute(&raw.pool)
             .await
             .unwrap();
-        assert!(matches!(
-            raw.get_response_bounded(&owner, &record.id, 4_096).await,
-            Err(StoreError::PayloadTooLarge)
-        ));
+        assert!(
+            matches!(
+                raw.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "an oversized model column must count toward the raw response snapshot limit"
+        );
 
         let codec = StoreCompressionConfig {
             algorithm: praxis_ai_store::CompressionAlgorithm::Zstd,
@@ -2022,10 +2031,13 @@ mod tests {
         .await
         .unwrap();
         compressed.upsert_response(&record).await.unwrap();
-        assert!(matches!(
-            compressed.get_response_bounded(&owner, &record.id, 4_096).await,
-            Err(StoreError::PayloadTooLarge)
-        ));
+        assert!(
+            matches!(
+                compressed.get_response_bounded(&owner, &record.id, 4_096).await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "a compressed response whose decoded payload exceeds the limit must be rejected"
+        );
 
         let conversation = ConversationRecord {
             conversation_id: "conv_bounded".to_owned(),
@@ -2035,11 +2047,14 @@ mod tests {
             messages: serde_json::json!([{"role": "assistant", "content": "x".repeat(16_384)}]),
         };
         raw.upsert_conversation(&conversation).await.unwrap();
-        assert!(matches!(
-            raw.get_conversation_bounded(&owner, &conversation.conversation_id, 4_096)
-                .await,
-            Err(StoreError::PayloadTooLarge)
-        ));
+        assert!(
+            matches!(
+                raw.get_conversation_bounded(&owner, &conversation.conversation_id, 4_096)
+                    .await,
+                Err(StoreError::PayloadTooLarge)
+            ),
+            "oversized raw conversation messages must exceed the bounded read limit"
+        );
     }
 
     #[test]

@@ -767,7 +767,10 @@ async fn pending_approval_payload_size_is_measured_without_fetching_columns() {
         + record.arguments.len()
         + record.target_fingerprint.len();
 
-    assert_eq!(bytes, expected);
+    assert_eq!(
+        bytes, expected,
+        "missing approval IDs must contribute zero bytes to the payload total"
+    );
 }
 
 #[tokio::test]

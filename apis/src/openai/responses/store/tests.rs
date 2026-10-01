@@ -784,7 +784,8 @@ fn retained_request_payload_counts_store_input_snapshot() {
 
     assert_eq!(
         super::filter::retained_request_payload_bytes(&ctx),
-        crate::openai::responses::state::retained_json_bytes(&input)
+        crate::openai::responses::state::retained_json_bytes(&input),
+        "the retained request charge must match the store input snapshot size"
     );
 }
 
@@ -801,13 +802,18 @@ fn discarded_store_snapshot_releases_its_aggregate_charge() {
 
     super::filter::discard_retained_request_payload(&mut ctx);
 
-    assert_eq!(super::filter::retained_request_payload_bytes(&ctx), Some(0));
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        Some(0),
+        "discarding the store snapshot must release its request payload charge"
+    );
     assert_eq!(
         ctx.extensions
             .get::<ResponsesState>()
             .unwrap()
             .retained_external_payload_bytes,
-        0
+        0,
+        "discarding the store snapshot must release its external payload charge"
     );
 }
 
@@ -826,21 +832,33 @@ fn failed_stream_releases_store_snapshot_at_end_of_stream() {
     let mut body = None;
 
     let chunk_action = filter.on_response_body(&mut ctx, &mut body, false).unwrap();
-    assert!(matches!(chunk_action, FilterAction::Release));
+    assert!(
+        matches!(chunk_action, FilterAction::Release),
+        "a failed retained budget must release the response chunk"
+    );
     assert_eq!(
         super::filter::retained_request_payload_bytes(&ctx),
-        Some(snapshot_bytes)
+        Some(snapshot_bytes),
+        "the store snapshot charge remains retained until end of stream"
     );
 
     let eos_action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(eos_action, FilterAction::Release));
-    assert_eq!(super::filter::retained_request_payload_bytes(&ctx), Some(0));
+    assert!(
+        matches!(eos_action, FilterAction::Release),
+        "a failed retained budget must release the end-of-stream action"
+    );
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        Some(0),
+        "end of stream must release the aggregate store snapshot charge"
+    );
     assert_eq!(
         ctx.extensions
             .get::<ResponsesState>()
             .unwrap()
             .retained_external_payload_bytes,
-        0
+        0,
+        "end of stream must release the external store snapshot charge"
     );
 }
 
@@ -867,7 +885,10 @@ fn persistence_construction_is_rejected_before_payload_clones() {
     let response_bytes = crate::openai::responses::state::retained_json_bytes(&state.response_object).unwrap();
     ctx.extensions.insert(state);
 
-    assert!(!super::filter::persistence_construction_fits(&ctx, response_bytes));
+    assert!(
+        !super::filter::persistence_construction_fits(&ctx, response_bytes),
+        "persistence construction must be rejected when its retained bytes exceed the budget"
+    );
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(
         !state.retained_payload_failed,

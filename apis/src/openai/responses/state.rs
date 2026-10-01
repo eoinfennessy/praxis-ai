@@ -1817,7 +1817,11 @@ mod tests {
         state.persisted_messages.push(item.clone());
         state.accumulated_output.push(item);
 
-        assert_eq!(state.retained_payload_bytes().unwrap() - baseline, bytes * 4);
+        assert_eq!(
+            state.retained_payload_bytes().unwrap() - baseline,
+            bytes * 4,
+            "each of the four owned JSON copies contributes its bytes"
+        );
     }
 
     #[cfg(feature = "store")]
@@ -2671,10 +2675,16 @@ mod tests {
         state.apply_retained_payload_limit(current + staging - 1);
 
         let mut body = None;
-        assert!(state.finalize_response_body(&mut body).is_err());
-        assert!(state.retained_payload_failed);
+        assert!(
+            state.finalize_response_body(&mut body).is_err(),
+            "citation staging above the retained budget must fail finalization"
+        );
+        assert!(
+            state.retained_payload_failed,
+            "citation staging budget failure must mark retained payload as failed"
+        );
         assert_eq!(state.accumulated_output, vec![item], "preflight commits no output move");
-        assert!(body.is_none());
+        assert!(body.is_none(), "failed citation preflight must not produce a body");
     }
 
     #[test]
@@ -2691,8 +2701,14 @@ mod tests {
         state.apply_retained_payload_limit(state.retained_payload_bytes().unwrap());
 
         let mut body = None;
-        assert!(state.finalize_response_body(&mut body).is_err());
-        assert!(state.retained_payload_failed);
+        assert!(
+            state.finalize_response_body(&mut body).is_err(),
+            "serialization reservation above the retained budget must fail finalization"
+        );
+        assert!(
+            state.retained_payload_failed,
+            "serialization reservation failure must mark retained payload as failed"
+        );
         assert!(
             state.response_object.is_null(),
             "canonical response must not be committed"
@@ -2701,7 +2717,10 @@ mod tests {
             state.accumulated_output.is_empty(),
             "failed request payload is released"
         );
-        assert!(body.is_none());
+        assert!(
+            body.is_none(),
+            "failed serialization reservation must not produce a body"
+        );
     }
 
     #[test]
