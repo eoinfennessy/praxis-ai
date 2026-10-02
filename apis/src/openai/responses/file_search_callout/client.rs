@@ -579,6 +579,14 @@ impl FileSearchClient {
             return batch;
         }
         let per_response_limit = self.max_response_bytes.min(total_response_limit);
+        // A retained aggregate cap can tighten the total without changing the
+        // configured per-call ceiling. Only a tightened per-call ceiling makes
+        // `ResponseTooLarge` an aggregate-budget failure.
+        let retained_payload_controls_per_response_limit = retained_payload_controls_per_call(
+            self.max_response_bytes,
+            total_response_limit,
+            retained_payload_controls_limit,
+        );
         let execution_timeout = transport
             .identity
             .deadline(execution_started, self.timeout)
@@ -654,7 +662,7 @@ impl FileSearchClient {
                     &outbound_headers,
                     allow_private,
                     per_response_limit,
-                    retained_payload_controls_limit,
+                    retained_payload_controls_per_response_limit,
                 )
             });
             let chunk_results = futures::future::join_all(futures).await;
@@ -706,7 +714,7 @@ impl FileSearchClient {
         outbound_headers: &HeaderMap,
         allow_private: bool,
         per_response_limit: usize,
-        retained_payload_controls_limit: bool,
+        retained_payload_controls_per_response_limit: bool,
     ) -> Result<SearchResponse, FileSearchError> {
         deadline_remaining(execution_timeout, execution_started, spec.store_id)?;
         let request = self.build_request(spec, execution_started, execution_timeout)?;
@@ -725,7 +733,7 @@ impl FileSearchClient {
             )
             .await
             .map_err(|error| match error {
-                FileSearchError::ResponseTooLarge { .. } if retained_payload_controls_limit => {
+                FileSearchError::ResponseTooLarge { .. } if retained_payload_controls_per_response_limit => {
                     aggregate_limit_error(spec.store_id, per_response_limit, true)
                 },
                 other => other,
@@ -2278,7 +2286,17 @@ fn retained_response_body_limit(configured_limit: usize, available_bytes: usize)
         return (configured_limit, false);
     }
     let retained_limit = available_bytes / RESPONSE_DECODE_MEMORY_MULTIPLIER;
-    (configured_limit.min(retained_limit), retained_limit <= configured_limit)
+    (configured_limit.min(retained_limit), retained_limit < configured_limit)
+}
+
+/// Identify when the retained allowance, rather than `max_response_bytes`,
+/// set the executor's per-call body cap.
+const fn retained_payload_controls_per_call(
+    configured_per_call: usize,
+    effective_total: usize,
+    retained_controls_total: bool,
+) -> bool {
+    retained_controls_total && effective_total < configured_per_call
 }
 
 /// Merge response results without retaining more than the final top-k.
@@ -2333,7 +2351,8 @@ mod tests {
         FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_BODY_BUDGET_UNIT_BYTES,
         RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchBatch, SearchFailure, SearchResult, SearchSpec,
         VectorStoreSearchRequest, append_unprocessed_deadline_failures, deserialize_search_results, merge_top_results,
-        parse_response_body, response_admission_units, retained_response_body_limit,
+        parse_response_body, response_admission_units, retained_payload_controls_per_call,
+        retained_response_body_limit,
     };
 
     const MINIMAL_RESULT: &[u8] = br#"{"content":[],"file_id":"","filename":"","score":0}"#;
@@ -2400,6 +2419,10 @@ mod tests {
         assert_eq!(retained_response_body_limit(8_192, usize::MAX), (8_192, false));
         assert_eq!(retained_response_body_limit(8_192, 4_096), (2_048, true));
         assert_eq!(retained_response_body_limit(1_024, 4_096), (1_024, false));
+        assert_eq!(retained_response_body_limit(1_024, 2_048), (1_024, false));
+        assert!(!retained_payload_controls_per_call(512, 1_024, true));
+        assert!(retained_payload_controls_per_call(2_048, 1_024, true));
+        assert!(!retained_payload_controls_per_call(2_048, 1_024, false));
     }
 
     #[test]

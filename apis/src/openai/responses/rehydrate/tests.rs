@@ -51,6 +51,22 @@ fn declares_dual_phase_body_access() {
     assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
+#[test]
+fn rehydrated_state_keeps_store_input_charge_without_agentic_policy() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("responses.store_request_payload_bytes", "123");
+    install_rehydrated_state(&mut ctx, ResponsesState::default()).expect("rehydration should install state");
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_external_payload_bytes,
+        123,
+        "the store input remains owned after rehydration replaces ResponsesState",
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Bypass
 // -----------------------------------------------------------------------------

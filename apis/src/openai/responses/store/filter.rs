@@ -642,6 +642,10 @@ impl SseErrorEventDetector {
 struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
     input: Option<Value>,
+    /// Compact size of `input`, computed once when the snapshot is captured.
+    /// Re-serializing a large prompt for every SSE chunk would run on the
+    /// synchronous downstream response path.
+    input_retained_bytes: usize,
     /// Owner captured before inference begins.
     owner: Option<StateOwner>,
     /// Incremental SSE decoder over the outbound stream, lazily created on the
@@ -670,9 +674,7 @@ struct ResponseStoreRequestState {
 impl ResponseStoreRequestState {
     /// Count the sibling-owned input, replay rows, and unfinished decoder data.
     fn retained_payload_bytes(&self) -> Option<usize> {
-        self.input
-            .as_ref()
-            .map_or(Some(0), retained_json_bytes)?
+        self.input_retained_bytes
             .checked_add(usize::try_from(self.event_bytes).ok()?)?
             .checked_add(self.event_name_bytes)?
             .checked_add(self.pending_wire_bytes.checked_mul(2)?)
@@ -796,6 +798,7 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Resul
     let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
     let previous = state.retained_payload_bytes().unwrap_or(usize::MAX);
     state.input = Some(input);
+    state.input_retained_bytes = retained_bytes;
     let next = state.retained_payload_bytes().unwrap_or(usize::MAX);
     let admitted = ctx.extensions.get_mut::<ResponsesState>().is_none_or(|responses| {
         responses.can_replace_retained_payload(previous, next, 0)
@@ -2119,6 +2122,7 @@ mod encode_replay_event_tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "checks input, replay, and replacement charges")]
     fn ordinary_stream_store_charges_input_before_replay_rows() {
         let filter =
             ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
@@ -2147,6 +2151,16 @@ mod encode_replay_event_tests {
                 .unwrap()
                 .retained_external_payload_bytes,
             retained,
+        );
+        let replacement = json!("replacement input");
+        capture_request_input(&mut ctx, replacement).unwrap();
+        assert_eq!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .unwrap()
+                .retained_external_payload_bytes,
+            super::retained_request_payload_bytes(&ctx).unwrap(),
+            "replacing the cached input charge must preserve replay row charges",
         );
     }
 

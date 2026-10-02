@@ -1493,10 +1493,12 @@ fn install_rehydrated_state(ctx: &mut HttpFilterContext<'_>, mut state: Response
         .is_some_and(|prev| prev.store_persist_armed);
     state.store_persist_armed = store_persist_armed;
     state.response_id = ctx.get_metadata("responses.response_id").map(ToOwned::to_owned);
+    // Rehydration replaces the whole state bag. The store's request input is
+    // still owned by its filter state even when no agentic policy is present.
+    let store_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
+    state.set_retained_external_payload_bytes(store_bytes);
     if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
         state.apply_retained_payload_limit(policy.max_retained_bytes());
-        let store_bytes = super::store::retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
-        state.set_retained_external_payload_bytes(store_bytes);
         if !state.can_retain_payload(0) {
             ctx.set_metadata("responses.skip_persist", "true");
             super::store::discard_retained_request_payload(ctx);

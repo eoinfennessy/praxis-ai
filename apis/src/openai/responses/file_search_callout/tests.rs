@@ -1338,6 +1338,28 @@ async fn core_limit_fails_closed_on_oversized_response_maps_to_413() {
 }
 
 #[tokio::test]
+async fn per_call_overflow_remains_fail_open_when_aggregate_budget_only_tightens_total() {
+    let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, &"x".repeat(4_096)));
+    let filter = make_filter(
+        server.port,
+        "on_failure: open\nmax_response_bytes: 256\nmax_total_response_bytes: 8192\n",
+    );
+    let mut state = one_pending_state(&["vs-a"]);
+    state.apply_retained_payload_limit(4_096);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert_eq!(server.requests().len(), 1);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.dispatch_failure.is_none(),
+        "the per-call limit must honor on_failure: open"
+    );
+    assert!(!state.retained_payload_failed);
+    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
+}
+
+#[tokio::test]
 async fn whole_call_timeout_covers_slow_response_body() {
     let server = MockServer::slow_body(&json!({"data": []}), Duration::from_millis(500));
     let filter = make_filter(server.port, "timeout_ms: 50\n");
