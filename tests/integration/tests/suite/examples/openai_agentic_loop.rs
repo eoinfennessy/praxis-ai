@@ -308,6 +308,10 @@ fn store_replay_rows_exhaust_shared_retained_budget() {
     let frames = parse_sse_frames(&body);
     assert_eq!(event_count(&frames, "error"), 1, "{body}");
     assert_eq!(event_count(&frames, "response.completed"), 0, "{body}");
+    assert!(
+        !body.contains("[DONE]"),
+        "a failed stream must not emit a success sentinel: {body}"
+    );
     assert_eq!(model_requests.lock().unwrap().len(), 1);
     let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_store_replay_budget", None);
     assert_eq!(status, 404, "failed stream must not be stored");

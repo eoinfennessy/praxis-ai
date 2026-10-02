@@ -1042,7 +1042,31 @@ impl ResponsesState {
 
     /// Count retained payload, returning `None` immediately above `max_bytes`.
     pub(crate) fn retained_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, true)
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, false)
+    }
+
+    /// Request and history owners cannot change while one upstream stream is
+    /// being parsed. Measure them once per round; the stream meter measures all
+    /// other owners after each chunk.
+    pub(crate) fn stream_stable_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        let mut meter = PayloadMeter::new(max_bytes);
+        meter.json(&self.request_body)?;
+        for values in [
+            &self.input,
+            &self.messages,
+            &self.persisted_messages,
+            &self.previous_tools,
+            &self.tools,
+        ] {
+            meter.json_values(values)?;
+        }
+        Some(meter.used())
+    }
+
+    /// Count the owners which may change during a streaming response. The
+    /// stream-local meter adds the cached request/history charge separately.
+    pub(crate) fn stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true)
     }
 
     /// Count payload owned directly by this state, excluding sibling-filter
@@ -1053,7 +1077,7 @@ impl ResponsesState {
     /// response-store snapshots and other sibling-filter owners must not change
     /// that independent compatibility limit.
     pub(crate) fn retained_payload_bytes_bounded_without_external(&self, max_bytes: usize) -> Option<usize> {
-        self.retained_payload_bytes_bounded_inner(max_bytes, false)
+        self.retained_payload_bytes_bounded_inner(max_bytes, false, false)
     }
 
     /// Shared implementation for aggregate and state-only payload accounting.
@@ -1062,14 +1086,30 @@ impl ResponsesState {
         clippy::cognitive_complexity,
         reason = "exhaustive accounting for the request-scoped state bag"
     )]
-    fn retained_payload_bytes_bounded_inner(&self, max_bytes: usize, include_external: bool) -> Option<usize> {
+    fn retained_payload_bytes_bounded_inner(
+        &self,
+        max_bytes: usize,
+        include_external: bool,
+        skip_stream_stable: bool,
+    ) -> Option<usize> {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
             meter.raw(self.retained_external_payload_bytes)?;
         }
 
+        if !skip_stream_stable {
+            meter.json(&self.request_body)?;
+            for values in [
+                &self.input,
+                &self.messages,
+                &self.persisted_messages,
+                &self.previous_tools,
+                &self.tools,
+            ] {
+                meter.json_values(values)?;
+            }
+        }
         for value in [
-            &self.request_body,
             &self.response_object,
             &self.local_completion_response_template,
             &self.tool_choice,
@@ -1079,13 +1119,8 @@ impl ResponsesState {
         }
         for values in [
             &self.accumulated_output,
-            &self.input,
-            &self.messages,
-            &self.persisted_messages,
-            &self.previous_tools,
             &self.tool_calls,
             &self.tool_search_calls,
-            &self.tools,
             &self.web_search_calls,
         ] {
             meter.json_values(values)?;

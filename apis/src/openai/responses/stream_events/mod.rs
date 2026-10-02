@@ -23,6 +23,7 @@ mod local_tools;
 use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
     hash::{Hash as _, Hasher as _},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -148,6 +149,9 @@ pub(super) struct StreamEventsState {
     /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
     /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
     stream_failed: bool,
+    /// The immutable request and history charge for this upstream round.
+    /// Initialized on the first response chunk, after all request filters ran.
+    shared_stable_bytes: OnceLock<usize>,
 }
 
 impl StreamEventsState {
@@ -281,6 +285,7 @@ impl OpenaiStreamEventsFilter {
             local_tool_items: std::collections::HashMap::new(),
             client_tool_items: Vec::new(),
             stream_failed: false,
+            shared_stable_bytes: OnceLock::new(),
         }
     }
 
@@ -538,6 +543,14 @@ impl HttpFilter for OpenaiStreamEventsFilter {
             return Ok(FilterAction::Continue);
         }
 
+        // The store can discover an aggregate overflow after this filter has
+        // emitted an earlier chunk. Suppress every later provider frame and
+        // its finalizer so only the store's in-band error reaches the client.
+        if ctx.get_metadata("responses.store_stream_budget_failed") == Some("true") {
+            *body = None;
+            return Ok(FilterAction::Continue);
+        }
+
         process_chunk(ctx, body);
 
         if end_of_stream {
@@ -745,7 +758,7 @@ fn parse_and_accumulate(
     // counter in ResponsesState. Reuse one shared JSON measurement for every
     // pre-commit admission in this chunk; measure again after commit mutates
     // the shared response tree.
-    let shared_budget = shared_retained_budget(ctx);
+    let shared_budget = shared_retained_budget(ctx, state);
     // The incoming chunk is framework-owned, but parsing can temporarily own
     // both the current line and the copied data/event field before the line is
     // cleared. An invalid UTF-8 event field can expand each input byte to the
@@ -938,16 +951,25 @@ fn projected_tool_call_key_bytes(payload: &Value) -> Option<usize> {
 /// Return whether shared response state, filter-local parser state, and one
 /// transient construction/staging buffer fit the active aggregate budget.
 fn stream_payload_fits(ctx: &HttpFilterContext<'_>, state: &StreamEventsState, staging_bytes: usize) -> bool {
-    stream_payload_fits_with_budget(state, staging_bytes, shared_retained_budget(ctx))
+    stream_payload_fits_with_budget(state, staging_bytes, shared_retained_budget(ctx, state))
 }
 
 /// Snapshot the shared retained JSON total once for pre-commit checks.
 /// `None` means no aggregate budget is active; the inner `None` signals that
 /// the current retained state already exceeds the limit.
-fn shared_retained_budget(ctx: &HttpFilterContext<'_>) -> Option<(usize, Option<usize>)> {
+fn shared_retained_budget(ctx: &HttpFilterContext<'_>, stream: &StreamEventsState) -> Option<(usize, Option<usize>)> {
     let responses = ctx.extensions.get::<ResponsesState>()?;
     let limit = responses.retained_payload_limit()?;
-    Some((limit, responses.retained_payload_bytes_bounded(limit)))
+    let stable = *stream.shared_stable_bytes.get_or_init(|| {
+        responses
+            .stream_stable_payload_bytes_bounded(limit)
+            .unwrap_or(usize::MAX)
+    });
+    let current = limit
+        .checked_sub(stable)
+        .and_then(|remaining| responses.stream_changing_payload_bytes_bounded(remaining))
+        .and_then(|changing| stable.checked_add(changing));
+    Some((limit, current))
 }
 
 /// Check a staging projection against a previously measured shared state.
@@ -1079,9 +1101,25 @@ fn canonical_logical_output_bytes(state: &ResponsesState) -> Option<usize> {
 /// so this admission must happen before canonicalization, not only after the
 /// terminal has been mutated.
 fn canonicalization_staging_bytes(state: &ResponsesState, existing_output_bytes: usize) -> Option<usize> {
-    canonical_logical_output_bytes(state)
-        .and_then(|output_bytes| output_bytes.checked_mul(2))
-        .and_then(|output_bytes| existing_output_bytes.checked_add(output_bytes))
+    let output = if state.accumulated_output.is_empty() {
+        state.output_items()
+    } else {
+        &state.accumulated_output
+    };
+    let output_bytes = canonical_logical_output_bytes(state)?;
+    // Annotation staging includes the cleaned text and projected citation
+    // objects. Both the terminal and response_object retain the expanded
+    // output after canonicalization, so reserve two expanded copies as well
+    // as the temporary annotation owner.
+    let annotation_bytes = crate::openai::responses::file_search_callout::citations::annotation_staging_bytes(
+        output,
+        &state.citation_files,
+    )
+    .ok()?;
+    output_bytes
+        .checked_mul(2)?
+        .checked_add(annotation_bytes.checked_mul(3)?)?
+        .checked_add(existing_output_bytes)
 }
 
 /// Abort an offending chunk after aggregate admission fails. The caller drops

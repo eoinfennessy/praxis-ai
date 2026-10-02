@@ -757,6 +757,12 @@ fn persistence_budget_failure(
     }
     discard_retained_request_payload(ctx);
     if streaming {
+        ctx.set_metadata("responses.store_stream_budget_failed", "true");
+        crate::openai::responses::fs_end_stream_with_error_ctx(
+            ctx,
+            "server_error",
+            "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during persistence",
+        );
         *body = super::super::stream_events::encode_local_error(
             ctx,
             "server_error",
@@ -785,12 +791,27 @@ fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), Filt
 }
 
 /// Retain request input alongside the already captured owner.
-fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) {
+fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Result<(), FilterAction> {
     let retained_bytes = retained_json_bytes(&input).unwrap_or(usize::MAX);
-    ctx.set_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA, retained_bytes.to_string());
     let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+    let previous = state.retained_payload_bytes().unwrap_or(usize::MAX);
     state.input = Some(input);
+    let next = state.retained_payload_bytes().unwrap_or(usize::MAX);
+    let admitted = ctx.extensions.get_mut::<ResponsesState>().is_none_or(|responses| {
+        responses.can_replace_retained_payload(previous, next, 0)
+            && responses.replace_retained_external_payload_bytes(previous, next)
+    });
     ctx.extensions.insert(state);
+    if !admitted {
+        ctx.set_metadata("responses.skip_persist", "true");
+        return Err(FilterAction::Reject(responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes",
+        )));
+    }
+    ctx.set_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA, retained_bytes.to_string());
+    Ok(())
 }
 
 /// Extract the original Responses API request input from the buffered
@@ -1261,8 +1282,9 @@ impl HttpFilter for ResponseStoreFilter {
         }
         if !should_skip(ctx)
             && let Some(input) = extract_request_input(body)
+            && let Err(action) = capture_request_input(ctx, input)
         {
-            capture_request_input(ctx, input);
+            return Ok(action);
         }
         if should_init_store_for_request(ctx) {
             if !store_available(ctx) {
@@ -1314,6 +1336,10 @@ impl HttpFilter for ResponseStoreFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if ctx.get_metadata("responses.store_stream_budget_failed") == Some("true") {
+            *body = None;
+            return Ok(FilterAction::Continue);
+        }
         if Self::should_release_skipped_response_body(ctx) {
             // A committed SSE error still needs the store filter's request
             // state while chunks are being released. Drop its input snapshot
@@ -1997,9 +2023,13 @@ mod encode_replay_event_tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use bytes::Bytes;
-    use praxis_filter::sse::SseDecoder;
+    use praxis_filter::{HttpFilter as _, sse::SseDecoder};
+    use serde_json::json;
 
-    use super::{ResponseEventRecord, ResponseStoreFilter, StateOwner, encode_replay_event};
+    use super::{
+        ResponseEventRecord, ResponseStoreFilter, StateOwner, capture_request_input, encode_replay_event,
+        persistence_budget_failure,
+    };
     use crate::openai::responses::state::ResponsesState;
 
     /// Build a minimal event record carrying `payload` for the encoder under test.
@@ -2086,6 +2116,59 @@ mod encode_replay_event_tests {
             128 + store_bytes,
             "replay accounting must preserve other sibling-filter charges"
         );
+    }
+
+    #[test]
+    fn ordinary_stream_store_charges_input_before_replay_rows() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.extensions.insert(ResponsesState::default());
+        let input = json!("plain store input");
+        let input_bytes = super::retained_json_bytes(&input).unwrap();
+        capture_request_input(&mut ctx, input).unwrap();
+        assert_eq!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .unwrap()
+                .retained_external_payload_bytes,
+            input_bytes,
+        );
+        let frame = Bytes::from_static(
+            b"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1}\n\n",
+        );
+        assert!(filter.capture_stream_events(&mut ctx, &Some(frame)));
+        let retained = super::retained_request_payload_bytes(&ctx).unwrap();
+        assert!(retained > input_bytes);
+        assert_eq!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .unwrap()
+                .retained_external_payload_bytes,
+            retained,
+        );
+    }
+
+    #[test]
+    fn store_budget_error_suppresses_later_provider_terminal() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        ctx.extensions.insert(ResponsesState::default());
+        let mut first = Some(Bytes::from_static(b"event: response.in_progress\ndata: {}\n\n"));
+        drop(persistence_budget_failure(&mut ctx, true, &mut first));
+        assert!(String::from_utf8_lossy(first.as_ref().unwrap()).contains("event: error"));
+        assert_eq!(
+            ctx.filter_results
+                .get("openai_agentic_loop")
+                .and_then(|result| result.get("action")),
+            Some("done"),
+        );
+        let mut later = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut later, true).unwrap());
+        assert!(later.is_none(), "a provider terminal after the error must be withheld");
     }
 
     /// Once replay is abandoned at its independent cap, later wire chunks do

@@ -320,6 +320,89 @@ fn deferred_terminal_preflights_canonical_output_owners() {
 }
 
 #[test]
+fn deferred_terminal_reserves_citation_expansion_before_rewriting() {
+    let (_filter, mut ctx) = make_armed_context();
+    let mut parser_state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let item = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "<|file-known|>".repeat(1_000)}],
+    });
+    let mut state = ResponsesState {
+        accumulated_output: vec![item],
+        response_object: json!({"id": "resp_citations", "object": "response", "status": "completed", "output": []}),
+        citation_files: [("file-known".to_owned(), "x".repeat(1_024))].into(),
+        ..ResponsesState::default()
+    };
+    let output_bytes = super::canonical_logical_output_bytes(&state).unwrap();
+    let expanded_staging = super::canonicalization_staging_bytes(&state, 0).unwrap();
+    assert!(
+        expanded_staging > output_bytes * 10,
+        "citation objects must be included in the preflight"
+    );
+    let terminal = super::DeferredTerminalEvent {
+        event_type: "response.completed".to_owned(),
+        payload: json!({"type": "response.completed", "response": {"id": "resp_citations", "output": []}}),
+    };
+    let baseline = state.retained_payload_bytes().unwrap();
+    state
+        .apply_retained_payload_limit(baseline + output_bytes * 2 + terminal.retained_payload_bytes().unwrap() + 1_000);
+    ctx.extensions.insert(state);
+    let mut terminal = terminal;
+    let mut output = Vec::new();
+    assert!(super::emit_deferred_terminal(&mut ctx, &mut terminal, &mut parser_state, &mut output).is_err());
+    assert!(output.is_empty());
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_failed);
+}
+
+#[test]
+fn streaming_budget_cache_counts_stable_owners_once_per_round() {
+    let (_filter, mut ctx) = make_armed_context();
+    let stream = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let mut responses = ResponsesState {
+        request_body: json!({"input": "p".repeat(32_768)}),
+        input: vec![json!({"text": "history"})],
+        response_object: json!({"output": []}),
+        ..ResponsesState::default()
+    };
+    responses.apply_retained_payload_limit(1_000_000);
+    ctx.extensions.insert(responses);
+    let initial = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+    assert_eq!(
+        initial,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().response_object = json!({"output": [{"text": "new"}]});
+    let next = super::shared_retained_budget(&ctx, &stream).unwrap().1.unwrap();
+    assert_eq!(
+        next,
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .retained_payload_bytes()
+            .unwrap()
+    );
+    assert!(stream.shared_stable_bytes.get().copied().unwrap() > 32_768);
+}
+
+#[test]
+fn store_budget_error_drops_later_stream_events() {
+    let (filter, mut ctx) = make_armed_context();
+    ctx.set_metadata("responses.store_stream_budget_failed", "true");
+    let mut body = Some(Bytes::from_static(
+        b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+    ));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+    assert!(body.is_none());
+    assert_eq!(ctx.get_metadata("responses.stream_completion"), Some("open"));
+}
+
+#[test]
 fn reentry_arm_preserves_response_template_for_local_completion() {
     let filter = make_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
@@ -4829,6 +4912,7 @@ fn parse_error_sets_metadata() {
         local_tool_items: std::collections::HashMap::new(),
         client_tool_items: Vec::new(),
         stream_failed: false,
+        shared_stable_bytes: std::sync::OnceLock::new(),
     });
 
     let large_chunk =
@@ -4882,6 +4966,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
             item_id: Some("call_1".to_owned()),
         }],
         stream_failed: false,
+        shared_stable_bytes: std::sync::OnceLock::new(),
     });
 
     validate_stream_end(&mut ctx);
