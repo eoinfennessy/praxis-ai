@@ -54,6 +54,7 @@ use crate::{
     },
 };
 
+/// Client-visible terminal message for an exhausted agentic payload budget.
 const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes";
 
@@ -740,6 +741,11 @@ fn parse_and_accumulate(
     if let Some(error) = accumulation_budget_exceeded(state, ctx) {
         return Err(error);
     }
+    // Parsing changes only the stream-local buffers and a numeric accumulation
+    // counter in ResponsesState. Reuse one shared JSON measurement for every
+    // pre-commit admission in this chunk; measure again after commit mutates
+    // the shared response tree.
+    let shared_budget = shared_retained_budget(ctx);
     // The incoming chunk is framework-owned, but parsing can temporarily own
     // both the current line and the copied data/event field before the line is
     // cleared. An invalid UTF-8 event field can expand each input byte to the
@@ -750,7 +756,7 @@ fn parse_and_accumulate(
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     };
-    if !stream_payload_fits(ctx, state, parser_projection_bytes) {
+    if !stream_payload_fits_with_budget(state, parser_projection_bytes, shared_budget) {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     }
@@ -777,7 +783,7 @@ fn parse_and_accumulate(
     let parse_staging_bytes = frame_payload_bytes
         .zip(event_construction_bytes)
         .and_then(|(frames, events)| frames.checked_add(events));
-    if !parse_staging_bytes.is_some_and(|bytes| stream_payload_fits(ctx, state, bytes)) {
+    if !parse_staging_bytes.is_some_and(|bytes| stream_payload_fits_with_budget(state, bytes, shared_budget)) {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     }
@@ -793,7 +799,7 @@ fn parse_and_accumulate(
             used.checked_add(retained_event_payload_bytes(event)?)
         })
     });
-    if !construction_bytes.is_some_and(|staging| stream_payload_fits(ctx, state, staging)) {
+    if !construction_bytes.is_some_and(|staging| stream_payload_fits_with_budget(state, staging, shared_budget)) {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
     }
@@ -805,7 +811,7 @@ fn parse_and_accumulate(
     if !construction_bytes
         .and_then(|staging| staging.checked_add(projected_state_clone_bytes?))
         .and_then(|staging| staging.checked_add(logical_output_upper_bound.checked_mul(2)?))
-        .is_some_and(|staging| stream_payload_fits(ctx, state, staging))
+        .is_some_and(|staging| stream_payload_fits_with_budget(state, staging, shared_budget))
     {
         record_retained_payload_overflow(ctx, state);
         return Ok(None);
@@ -932,15 +938,35 @@ fn projected_tool_call_key_bytes(payload: &Value) -> Option<usize> {
 /// Return whether shared response state, filter-local parser state, and one
 /// transient construction/staging buffer fit the active aggregate budget.
 fn stream_payload_fits(ctx: &HttpFilterContext<'_>, state: &StreamEventsState, staging_bytes: usize) -> bool {
+    stream_payload_fits_with_budget(state, staging_bytes, shared_retained_budget(ctx))
+}
+
+/// Snapshot the shared retained JSON total once for pre-commit checks.
+/// `None` means no aggregate budget is active; the inner `None` signals that
+/// the current retained state already exceeds the limit.
+fn shared_retained_budget(ctx: &HttpFilterContext<'_>) -> Option<(usize, Option<usize>)> {
+    let responses = ctx.extensions.get::<ResponsesState>()?;
+    let limit = responses.retained_payload_limit()?;
+    Some((limit, responses.retained_payload_bytes_bounded(limit)))
+}
+
+/// Check a staging projection against a previously measured shared state.
+fn stream_payload_fits_with_budget(
+    state: &StreamEventsState,
+    staging_bytes: usize,
+    shared_budget: Option<(usize, Option<usize>)>,
+) -> bool {
     let Some(local_bytes) = state.retained_payload_bytes() else {
         return false;
     };
     let Some(external_bytes) = local_bytes.checked_add(staging_bytes) else {
         return false;
     };
-    ctx.extensions
-        .get::<ResponsesState>()
-        .is_none_or(|responses| responses.can_replace_retained_payload(0, 0, external_bytes))
+    match shared_budget {
+        None => true,
+        Some((limit, Some(current))) => current.checked_add(external_bytes).is_some_and(|total| total <= limit),
+        Some((_, None)) => false,
+    }
 }
 
 /// Return an allocation-safe upper bound for one normalized SSE event.

@@ -338,8 +338,9 @@ pub(crate) struct ResponsesState {
     pub(crate) retained_payload_limit: Option<usize>,
 
     /// Payload retained by request-lifetime sibling filter state that is not
-    /// represented directly in this bag (currently the response-store input
-    /// snapshot). The loop owner refreshes this before initial admission.
+    /// represented directly in this bag (the response-store input snapshot,
+    /// captured SSE replay rows, and the store decoder's unfinished record).
+    /// The loop owner refreshes this before initial admission.
     pub(crate) retained_external_payload_bytes: usize,
 
     /// Whether aggregate admission failed and only a terminal error may remain.
@@ -987,6 +988,22 @@ impl ResponsesState {
         self.retained_external_payload_bytes = bytes;
     }
 
+    /// Update one sibling owner's charge without dropping charges held by
+    /// other filters during the same request.
+    pub(crate) fn replace_retained_external_payload_bytes(&mut self, previous: usize, next: usize) -> bool {
+        let Some(total) = self
+            .retained_external_payload_bytes
+            .checked_sub(previous)
+            .and_then(|remaining| remaining.checked_add(next))
+        else {
+            self.retained_external_payload_bytes = usize::MAX;
+            self.fail_retained_payload_budget();
+            return false;
+        };
+        self.retained_external_payload_bytes = total;
+        true
+    }
+
     /// Transfer an owned payload out of this bag while keeping it charged to
     /// the request-wide meter for the lifetime of its filter-local owner.
     pub(crate) fn retain_external_payload_bytes(&mut self, bytes: usize) -> bool {
@@ -1442,7 +1459,7 @@ impl ResponsesState {
         };
         let preflight_staging = usage_staging.and_then(|usage| annotation_staging.checked_add(usage));
         if !preflight_staging.is_some_and(|staging| self.can_retain_payload(staging)) {
-            self.fail_retained_payload_budget();
+            self.discard_payload_for_budget_error();
             return Err(finalize_rejection(
                 "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during final construction",
             ));
@@ -2683,11 +2700,18 @@ mod tests {
             state.retained_payload_failed,
             "citation staging budget failure must mark retained payload as failed"
         );
-        assert_eq!(state.accumulated_output, vec![item], "preflight commits no output move");
+        assert!(
+            state.accumulated_output.is_empty(),
+            "failed finalization releases retained output"
+        );
         assert!(body.is_none(), "failed citation preflight must not produce a body");
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "asserts each payload owner is released after reservation fails"
+    )]
     fn finalize_response_body_discards_canonical_tree_when_serialization_reservation_fails() {
         let mut state = ResponsesState {
             response_object: json!({"object": "response", "output": []}),

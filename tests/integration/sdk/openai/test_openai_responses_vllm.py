@@ -5051,6 +5051,30 @@ def retained_tool_search_client(tmp_path, request):
     proxy_port = _free_port()
     with open("examples/configs/openai/responses/agentic-loop-overflow-fixture.yaml") as f:
         config = f.read()
+    legacy_request_filters = (
+        "      - filter: openai_responses_format\n"
+        "        on_invalid: reject\n"
+        "        headers:\n"
+        "          format: x-praxis-ai-format\n"
+        "          model: x-praxis-ai-model\n"
+        "          stream: x-praxis-ai-stream\n\n"
+        "      - filter: openai_responses_validate\n"
+    )
+    if legacy_request_filters not in config:
+        raise RuntimeError("retained overflow fixture's request filters changed")
+    consolidated_request_filter = (
+        "      - filter: openai_responses_request\n"
+        "        on_invalid: reject\n"
+        "        headers:\n"
+        "          format: x-praxis-ai-format\n"
+        "          model: x-praxis-ai-model\n"
+        "          stream: x-praxis-ai-stream\n"
+    )
+    config = config.replace(
+        legacy_request_filters,
+        consolidated_request_filter,
+        1,
+    )
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{proxy_port}")
     config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
     # This request uses store=False; omit the fixture's optional SQLite filters
@@ -5112,6 +5136,20 @@ class TestAgenticLoopVLLM:
             )
 
         assert exc_info.value.status_code == 413
+
+    def test_consolidated_request_rejects_raw_body_before_sdk_inference(
+        self, retained_tool_search_client
+    ):
+        """The consolidated request filter rejects before JSON or model dispatch."""
+        with pytest.raises(APIStatusError) as exc_info:
+            retained_tool_search_client.responses.create(
+                model=VLLM_MODEL,
+                input="x" * 2_000,
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 413
+        assert RetainedToolSearchBackendHandler.requests == 0
 
     def test_hosted_tool_search_retained_copies_reject_through_sdk(
         self, retained_tool_search_client

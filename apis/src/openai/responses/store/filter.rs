@@ -310,19 +310,49 @@ impl ResponseStoreFilter {
     /// Parse-only: it never blocks, mutates, or withholds the client bytes. The
     /// terminal seam ([`Self::persist_from_streaming_state`]) drains this state
     /// and writes the whole log in one `append_events` after the record is
-    /// durable. A bound overrun or a poisoned decoder sets the sticky
-    /// over-budget flag, which abandons the log (the response stays retrievable
-    /// as plain JSON but becomes non-replayable).
-    fn capture_stream_events(&self, ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) {
+    /// durable. The store's own replay bound or a poisoned decoder abandons
+    /// replay; exhausting an active agentic budget emits a terminal error and
+    /// prevents successful persistence.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "preflights and accounts for replay capture alongside shared state"
+    )]
+    fn capture_stream_events(&self, ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) -> bool {
         let Some(chunk) = body.as_ref().filter(|b| !b.is_empty()) else {
-            return;
+            return true;
         };
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+        let previously_retained = state.retained_payload_bytes();
+        // The decoder can simultaneously hold an unfinished record, completed
+        // records, and a newly captured replay row. Reserve their peak before
+        // feeding the chunk or making another owned payload copy.
+        let admitted = state.events_over_budget
+            || state
+                .pending_wire_bytes
+                .checked_add(chunk.len())
+                .and_then(|bytes| bytes.checked_mul(4))
+                .is_some_and(|peak| {
+                    ctx.extensions
+                        .get::<ResponsesState>()
+                        .is_none_or(|responses| responses.can_retain_payload(peak))
+                });
+        if !admitted {
+            ctx.extensions.insert(state);
+            return false;
+        }
         state.error_event_detector.push(chunk);
         if !state.events_over_budget {
             self.accumulate_events(&mut state, chunk);
         }
+        state.track_pending_wire_bytes(chunk);
+        let retained = state.retained_payload_bytes();
+        let admitted = previously_retained.zip(retained).is_some_and(|(previous, next)| {
+            ctx.extensions.get_mut::<ResponsesState>().is_none_or(|responses| {
+                responses.replace_retained_external_payload_bytes(previous, next) && responses.can_retain_payload(0)
+            })
+        });
         ctx.extensions.insert(state);
+        admitted
     }
 
     /// Decode `chunk` and append each contained SSE event, stopping and marking
@@ -359,6 +389,8 @@ impl ResponseStoreFilter {
             state.events_over_budget = true;
             state.events.clear();
             state.event_bytes = 0;
+            state.event_name_bytes = 0;
+            state.event_decoder = None;
         }
     }
 
@@ -377,9 +409,11 @@ impl ResponseStoreFilter {
             state.events_over_budget = true;
             state.events.clear();
             state.event_bytes = 0;
+            state.event_name_bytes = 0;
             return false;
         }
         state.event_bytes = next_bytes;
+        state.event_name_bytes = state.event_name_bytes.saturating_add(event.event_type.len());
         state.events.push(event);
         true
     }
@@ -473,6 +507,10 @@ fn take_persist_context(ctx: &mut HttpFilterContext<'_>) -> Result<PersistContex
         .extensions
         .remove::<ResponseStoreRequestState>()
         .ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
+    ctx.set_metadata(
+        STORE_REQUEST_PAYLOAD_BYTES_METADATA,
+        capture.retained_payload_bytes().unwrap_or(usize::MAX).to_string(),
+    );
     let owner = capture
         .owner
         .ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
@@ -613,6 +651,15 @@ struct ResponseStoreRequestState {
     events: Vec<CapturedEvent>,
     /// Running total of captured payload bytes, for the byte bound.
     event_bytes: u64,
+    /// Raw bytes in independently owned captured event names.
+    event_name_bytes: usize,
+    /// Upper bound on raw bytes after the last complete LF-delimited record.
+    /// The retained meter charges this twice because the decoder may keep a
+    /// field value and the current line independently. CR-delimited records
+    /// are deliberately overcounted.
+    pending_wire_bytes: usize,
+    /// Whether the previous wire byte was LF, including across chunk edges.
+    last_wire_byte_was_lf: bool,
     /// Sticky flag: capture exceeded a bound or the decoder was poisoned, so the
     /// partial log is abandoned and the response becomes non-replayable.
     events_over_budget: bool,
@@ -620,16 +667,46 @@ struct ResponseStoreRequestState {
     error_event_detector: SseErrorEventDetector,
 }
 
-/// Compact size of the independently owned request input snapshot.
+impl ResponseStoreRequestState {
+    /// Count the sibling-owned input, replay rows, and unfinished decoder data.
+    fn retained_payload_bytes(&self) -> Option<usize> {
+        self.input
+            .as_ref()
+            .map_or(Some(0), retained_json_bytes)?
+            .checked_add(usize::try_from(self.event_bytes).ok()?)?
+            .checked_add(self.event_name_bytes)?
+            .checked_add(self.pending_wire_bytes.checked_mul(2)?)
+    }
+
+    /// Track a safe upper bound for the decoder's unfinished record.
+    fn track_pending_wire_bytes(&mut self, chunk: &[u8]) {
+        if self.events_over_budget {
+            self.pending_wire_bytes = 0;
+            self.event_decoder = None;
+            return;
+        }
+        for &byte in chunk {
+            if byte == b'\n' && self.pending_wire_bytes > 0 && self.last_wire_byte_was_lf {
+                self.pending_wire_bytes = 0;
+            } else {
+                self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(1);
+            }
+            self.last_wire_byte_was_lf = byte == b'\n';
+        }
+    }
+}
+
+/// Count the store-owned request snapshot, captured replay rows, and decoder
+/// data charged to the request-wide agentic budget.
 pub(crate) fn retained_request_payload_bytes(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     if let Some(state) = ctx.extensions.get::<ResponseStoreRequestState>() {
-        return state.input.as_ref().map_or(Some(0), retained_json_bytes);
+        return state.retained_payload_bytes();
     }
     ctx.get_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA)
         .map_or(Some(0), |bytes| bytes.parse().ok())
 }
 
-/// Release the store-owned input snapshot after any terminal budget failure.
+/// Release all store-owned request payload after a terminal budget failure.
 pub(crate) fn discard_retained_request_payload(ctx: &mut HttpFilterContext<'_>) {
     let bytes = retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
     ctx.extensions.remove::<ResponseStoreRequestState>();
@@ -1227,6 +1304,10 @@ impl HttpFilter for ResponseStoreFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "stream persistence and terminal handling share one callback"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -1252,7 +1333,9 @@ impl HttpFilter for ResponseStoreFilter {
             // Capture this chunk's SSE events into request-scoped state before
             // any persist seam below drains that state. Parse-only; the
             // client-visible bytes are never withheld or altered.
-            self.capture_stream_events(ctx, body);
+            if !self.capture_stream_events(ctx, body) {
+                return Ok(persistence_budget_failure(ctx, true, body));
+            }
 
             if !end_of_stream {
                 // Deferred and locally encoded terminals can both reach this
@@ -1911,10 +1994,13 @@ fn encode_replay_event(event: &ResponseEventRecord, output: &mut Vec<u8>) {
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod encode_replay_event_tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
     use bytes::Bytes;
     use praxis_filter::sse::SseDecoder;
 
-    use super::{ResponseEventRecord, StateOwner, encode_replay_event};
+    use super::{ResponseEventRecord, ResponseStoreFilter, StateOwner, encode_replay_event};
+    use crate::openai::responses::state::ResponsesState;
 
     /// Build a minimal event record carrying `payload` for the encoder under test.
     fn record_with_payload(event_type: &str, payload: &[u8]) -> ResponseEventRecord {
@@ -1964,5 +2050,61 @@ mod encode_replay_event_tests {
         let (event, data) = decode_single(&out);
         assert_eq!(event.as_deref(), Some("response.output_text.delta"));
         assert_eq!(data, payload.to_vec());
+    }
+
+    /// Many individually small replay rows must still exhaust the shared
+    /// request budget before the store retains another row.
+    #[test]
+    fn replay_capture_charges_aggregate_event_payload() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState::default();
+        responses.apply_retained_payload_limit(4_096);
+        assert!(responses.retain_external_payload_bytes(128));
+        ctx.extensions.insert(responses);
+
+        let mut accepted = 0;
+        for sequence in 0..100 {
+            let frame = Bytes::from(format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":{sequence},\"delta\":\"x\"}}\n\n"
+            ));
+            if !filter.capture_stream_events(&mut ctx, &Some(frame)) {
+                break;
+            }
+            accepted += 1;
+        }
+        assert!(accepted > 1 && accepted < 100, "aggregate budget must stop small rows");
+        let store_bytes = super::retained_request_payload_bytes(&ctx).unwrap();
+        assert!(store_bytes > 0, "the store must retain at least one replay row");
+        assert_eq!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .unwrap()
+                .retained_external_payload_bytes,
+            128 + store_bytes,
+            "replay accounting must preserve other sibling-filter charges"
+        );
+    }
+
+    /// Once replay is abandoned at its independent cap, later wire chunks do
+    /// not create store-owned payload and must not consume the agentic budget.
+    #[test]
+    fn abandoned_replay_stops_charging_new_chunks() {
+        let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(1).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        let mut responses = ResponsesState::default();
+        responses.apply_retained_payload_limit(4_096);
+        ctx.extensions.insert(responses);
+        for sequence in 0..2 {
+            let frame = Bytes::from(format!(
+                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"sequence_number\":{sequence},\"delta\":\"x\"}}\n\n"
+            ));
+            assert!(filter.capture_stream_events(&mut ctx, &Some(frame)));
+        }
+        assert!(filter.capture_stream_events(&mut ctx, &Some(Bytes::from(vec![b'x'; 3_000]))));
+        assert_eq!(super::retained_request_payload_bytes(&ctx), Some(0));
     }
 }

@@ -376,6 +376,7 @@ impl HttpFilter for AgenticLoopFilter {
         if let Some(action) = admit_retained_payload_budget(ctx, self.config.max_retained_bytes.get())? {
             return Ok(action);
         }
+        replay_continuation_headers_before_request_filters(ctx);
         // Defer the sole request-side mutation until the proxy, which follows
         // every loop instance in canonical step order. This lets every instance
         // lower the shared budget before local completion or dispatch can commit.
@@ -463,8 +464,8 @@ impl HttpFilter for AgenticLoopFilter {
     }
 }
 
-/// Marker consumed by `openai_responses_proxy` after every loop instance has
-/// admitted its configured retained-payload limit.
+/// Marker consumed by the selected native or translated protocol adapter after
+/// every loop instance has admitted its configured retained-payload limit.
 struct DeferredAgenticRequestFinish;
 
 /// Claim sole ownership of one IRR provider response while allowing every
@@ -510,7 +511,7 @@ fn finish_request_after_dispatch(ctx: &mut HttpFilterContext<'_>) -> Result<Filt
         return finish_deferred_local_response(ctx, state);
     }
 
-    prepare_iteration(ctx, &mut state);
+    prepare_iteration(&mut state);
     trace!(
         iteration = state.iteration,
         "openai_agentic_loop request dispatch complete"
@@ -841,9 +842,9 @@ fn end_stream_with_error(
 // -----------------------------------------------------------------------------
 
 /// Prepare state for the current iteration: clear stale tool calls and, on
-/// re-entry, reset `tool_choice`, replay the client's end-to-end headers, and
-/// set `Content-Type` (subrequests do not inherit the original client header).
-fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState) {
+/// re-entry, reset `tool_choice`. Header replay has already happened during
+/// body pre-read, before request filters and routing inspect the headers.
+fn prepare_iteration(state: &mut ResponsesState) {
     state.tool_calls.clear();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
@@ -852,9 +853,30 @@ fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState
         let original = std::mem::replace(&mut state.tool_choice, json!("auto"));
         state.original_tool_choice.get_or_insert(original);
         set_request_body_field(state, "tool_choice", json!("auto"));
-        preserve_original_request_headers(ctx);
-        queue_continuation_header(ctx, CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
+}
+
+/// Replay continuation headers during body pre-read, once per IRR round.
+/// Core applies these mutations before request filters and routing run.
+fn replay_continuation_headers_before_request_filters(ctx: &mut HttpFilterContext<'_>) {
+    let Some(iteration) = ctx
+        .extensions
+        .get::<IterationState>()
+        .map(IterationState::iteration)
+        .or_else(|| ctx.extensions.get::<ResponsesState>().map(|state| state.iteration))
+    else {
+        return;
+    };
+    if iteration == 0 {
+        return;
+    }
+    let marker = iteration.to_string();
+    if ctx.get_metadata("responses.agentic_headers_replayed_iteration") == Some(marker.as_str()) {
+        return;
+    }
+    preserve_original_request_headers(ctx);
+    queue_continuation_header(ctx, CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    ctx.set_metadata("responses.agentic_headers_replayed_iteration", marker);
 }
 
 /// Restore end-to-end client headers after the iterative router isolates a

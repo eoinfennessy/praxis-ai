@@ -355,6 +355,10 @@ impl ResponsesToChatCompletionsFilter {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "selected adapter also completes deferred local dispatch"
+)]
 #[async_trait]
 impl HttpFilter for ResponsesToChatCompletionsFilter {
     fn name(&self) -> &'static str {
@@ -464,6 +468,25 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
         if let Some(outcome) = request_disposition(ctx) {
             return Ok(outcome);
+        }
+
+        // The translated adapter is the selected-upstream waypoint for this
+        // IRR step. Complete the same deferred local work as the native proxy
+        // before serializing the provider-visible continuation.
+        #[cfg(feature = "openai-mcp-tools")]
+        if super::mcp_dispatch::initial_dispatch_is_deferred(ctx) {
+            match super::mcp_dispatch::dispatch_after_budget_admission(ctx, body).await? {
+                FilterAction::Continue => {},
+                FilterAction::Reject(rejection) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+                _ => return Err("responses_to_chat_completions: invalid deferred dispatch outcome".into()),
+            }
+        }
+        if super::agentic_loop::request_finish_is_deferred(ctx) {
+            match super::agentic_loop::finish_request_after_deferred_dispatch(ctx)? {
+                FilterAction::Continue => {},
+                FilterAction::Reject(rejection) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+                _ => return Err("responses_to_chat_completions: invalid deferred loop outcome".into()),
+            }
         }
 
         let serialized = match self.translated_request_bytes(ctx)? {

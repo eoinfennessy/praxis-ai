@@ -3,7 +3,13 @@
 
 //! Unit tests for the consolidated Responses create request processor.
 
-#![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests"
+)]
 
 use bytes::Bytes;
 use praxis_filter::{
@@ -102,7 +108,7 @@ async fn a_create_request_publishes_validated_facts_and_state_from_one_parse() {
 }
 
 #[tokio::test]
-async fn create_request_rejects_state_over_retained_payload_budget() {
+async fn create_request_rejects_raw_body_before_state_allocation() {
     let filter = default_filter();
     let request = create_request();
     let mut ctx = make_filter_context_without_subrequest_client(&request);
@@ -122,7 +128,7 @@ async fn create_request_rejects_state_over_retained_payload_budget() {
     let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
     assert_eq!(
         error["error"]["message"],
-        "request and rehydrated state exceed openai_agentic_loop.max_retained_bytes"
+        "raw request body exceeds the 512-byte limit derived from openai_agentic_loop.max_retained_bytes"
     );
     assert!(
         ctx.extensions.get::<ResponsesState>().is_none(),

@@ -581,10 +581,6 @@ fn scan_json_value(body: &[u8], start: usize) -> Result<usize, &'static str> {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "request and selected-upstream body phases share one filter implementation"
-)]
 #[async_trait]
 impl HttpFilter for ResponsesProxyFilter {
     fn name(&self) -> &'static str {

@@ -2872,7 +2872,7 @@ fn appends_streamed_provider_compaction_to_replay_state() {
         ..ResponsesState::default()
     };
 
-    super::collect_streaming_output_items(&mut state);
+    super::collect_streaming_output_items(&mut state).unwrap();
 
     assert_eq!(state.messages[1]["type"], "compaction");
     assert_eq!(state.persisted_messages[1]["id"], "cmp_streamed");

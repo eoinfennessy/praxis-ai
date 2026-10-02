@@ -3,6 +3,8 @@
 # Controlled inference fixture configuration with a small aggregate state
 # budget. The synthetic upstream first commits a small Responses SSE event and
 # then supplies an output item whose construction buffers exceed this limit.
+# MCP resolution and dispatch are included so the functional test proves that
+# a pending tool call cannot run after the committed-stream budget failure.
 
 listeners:
   - name: ai-gateway
@@ -33,6 +35,8 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
+      - filter: openai_mcp_tool_resolve
+
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 2
@@ -40,6 +44,7 @@ filter_chains:
           - name: inference
             filters:
               - filter: openai_stream_events
+              - filter: openai_mcp_dispatch
               - filter: openai_agentic_loop
                 max_infer_iters: 1
                 max_retained_bytes: 16384

@@ -102,6 +102,10 @@ impl OpenaiResponsesRequestFilter {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "request classification and early budget admission share one filter callback"
+)]
 #[async_trait]
 impl HttpFilter for OpenaiResponsesRequestFilter {
     fn name(&self) -> &'static str {
@@ -150,6 +154,14 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
                 "optional request body absent, publishing operation identity only"
             );
             return publish_bodyless_operation(ctx, &self.config);
+        }
+
+        // The consolidated path owns the same pre-parse admission boundary as
+        // the legacy format filter. Reject before JSON and state allocate.
+        if matched.operation == ResponsesOperation::CreateResponse
+            && let Some(action) = super::initial_budget_rejection(ctx, body.as_deref().unwrap_or_default())
+        {
+            return Ok(action);
         }
 
         // The one parse feeds classification, promotion, and state alike. A body

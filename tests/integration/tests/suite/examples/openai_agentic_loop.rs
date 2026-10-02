@@ -184,16 +184,50 @@ fn committed_stream_retained_overflow_emits_one_error_and_is_not_stored() {
             serde_json::json!({
                 "output_index": 0,
                 "item": {
+                    "id": "fc_stream_retained",
+                    "type": "function_call",
+                    "call_id": "call_stream_retained",
+                    "name": "weather__get_weather",
+                    "arguments": "",
+                    "status": "in_progress"
+                },
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.output_item.done",
+            serde_json::json!({
+                "output_index": 0,
+                "item": {
+                    "id": "fc_stream_retained",
+                    "type": "function_call",
+                    "call_id": "call_stream_retained",
+                    "name": "weather__get_weather",
+                    "arguments": "{}",
+                    "status": "completed"
+                },
+                "sequence_number": 2
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "output_index": 1,
+                "item": {
                     "id": "msg_stream_retained",
                     "type": "message",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": "x".repeat(6_000)}]
                 },
-                "sequence_number": 1
+                "sequence_number": 3
             }),
         ),
     ];
     let (model_port, model_requests, _model_thread) = start_streaming_model(vec![response]);
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("get_weather")],
+        ..McpMockConfig::default()
+    });
     let db = TempSqlite::new("agentic_stream_retained_overflow");
     let config = load_overflow_fixture_config(free_port(), model_port, db.url());
     let proxy = start_proxy(&config);
@@ -201,7 +235,14 @@ fn committed_stream_retained_overflow_emits_one_error_and_is_not_stored() {
         "model": "gpt-4.1",
         "input": "Trigger the retained overflow.",
         "stream": true,
-        "store": true
+        "store": true,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+            "allowed_tools": ["get_weather"],
+            "require_approval": "never"
+        }]
     });
 
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
@@ -214,7 +255,61 @@ fn committed_stream_retained_overflow_emits_one_error_and_is_not_stored() {
     assert_eq!(event_count(&frames, "response.completed"), 0, "{body}");
     assert!(!body.contains("[DONE]"), "{body}");
     assert_eq!(model_requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "overflow must stop the pending tool call"
+    );
     let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_stream_retained", None);
+    assert_eq!(status, 404, "failed stream must not be stored");
+}
+
+#[test]
+fn store_replay_rows_exhaust_shared_retained_budget() {
+    let mut response = vec![sse_event(
+        "response.created",
+        serde_json::json!({
+            "response": {"id": "resp_store_replay_budget", "object": "response", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    )];
+    for sequence in 1..80 {
+        response.push(sse_event(
+            "response.in_progress",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_store_replay_budget",
+                    "object": "response",
+                    "status": "in_progress",
+                    "output": [],
+                    "metadata": {"padding": "x".repeat(180)}
+                },
+                "sequence_number": sequence
+            }),
+        ));
+    }
+    response.push(sse_event(
+        "response.completed",
+        serde_json::json!({
+            "response": {"id": "resp_store_replay_budget", "object": "response", "status": "completed", "output": []},
+            "sequence_number": 80
+        }),
+    ));
+    let (model_port, model_requests, _model_thread) = start_streaming_model(vec![response]);
+    let db = TempSqlite::new("agentic_store_replay_budget");
+    let config = load_overflow_fixture_config(free_port(), model_port, db.url());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({"model": "gpt-4.1", "input": "Budget replay.", "stream": true, "store": true});
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+    let body = parse_body(&raw);
+    let frames = parse_sse_frames(&body);
+    assert_eq!(event_count(&frames, "error"), 1, "{body}");
+    assert_eq!(event_count(&frames, "response.completed"), 0, "{body}");
+    assert_eq!(model_requests.lock().unwrap().len(), 1);
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_store_replay_budget", None);
     assert_eq!(status, 404, "failed stream must not be stored");
 }
 

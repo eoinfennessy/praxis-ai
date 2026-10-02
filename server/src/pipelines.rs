@@ -182,11 +182,13 @@ fn build_listener_pipelines(
         #[cfg(not(feature = "store"))]
         let _ = &gate_store_traffic;
 
+        #[cfg(feature = "openai-responses")]
+        let budget_policy = agentic_budget_policy(&entries, &chains)?;
         let mut pipeline =
             FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
         #[cfg(feature = "openai-responses")]
-        if let Some(policy) = agentic_budget_policy(&entries, &chains)? {
+        if let Some(policy) = budget_policy {
             pipeline.add_pipeline_extension(Box::new(policy));
         }
         attach(listener, &mut pipeline);
@@ -533,6 +535,49 @@ mod tests {
         .unwrap();
         let policy = agentic_budget_policy(&entries, &HashMap::new()).unwrap().unwrap();
         assert_eq!(policy.max_retained_bytes(), 4096);
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn branch_only_agentic_budget_is_discovered_before_branch_consumption() {
+        let config = Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+        branch_chains:
+          - name: bounded
+            rejoin: terminal
+            chains:
+              - name: bounded-inline
+                filters:
+                  - filter: openai_agentic_loop
+                    max_retained_bytes: 4096
+                  - filter: static_response
+                    status: 200
+      - filter: static_response
+        status: 200
+"#,
+        )
+        .unwrap();
+        let chains: HashMap<&str, &[FilterEntry]> = config
+            .filter_chains
+            .iter()
+            .map(|chain| (chain.name.as_str(), chain.filters.as_slice()))
+            .collect();
+        let entries = &config.filter_chains[0].filters;
+        assert_eq!(
+            agentic_budget_policy(entries, &chains)
+                .unwrap()
+                .unwrap()
+                .max_retained_bytes(),
+            4096,
+        );
     }
 
     #[test]
