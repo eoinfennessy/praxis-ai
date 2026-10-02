@@ -114,6 +114,7 @@ pub(crate) mod test_utils {
     ///
     /// Avoids initializing the system-trust connector, which some restricted
     /// test environments cannot load.
+    #[cfg(feature = "openai-responses")]
     #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
     #[allow(
         clippy::too_many_lines,

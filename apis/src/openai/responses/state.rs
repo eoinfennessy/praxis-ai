@@ -434,10 +434,6 @@ pub(crate) struct ResponsesState {
     /// definitions from the internally resolved endpoint. Holds the
     /// pipeline-local URL and credentials; never serialized to the
     /// inference backend, client responses, or persisted records.
-    #[cfg_attr(
-        all(not(test), not(feature = "openai-mcp-tools")),
-        expect(dead_code, reason = "deferred connectors are consumed only by MCP dispatch")
-    )]
     pub deferred_mcp: Vec<DeferredMcpConnector>,
 
     /// Slot policy under which configured MCP connector state was resolved.
@@ -556,10 +552,6 @@ pub(crate) struct ResponsesState {
     /// `response_conditions`-gated store filter, a non-2xx status, etc.); that
     /// narrower residual is unsupported for approval pipelines and still fails
     /// closed at resume.
-    #[cfg_attr(
-        all(not(test), not(feature = "store")),
-        expect(dead_code, reason = "read only by the store, rehydrate, and MCP approval paths")
-    )]
     pub store_persist_armed: bool,
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
@@ -845,10 +837,6 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Configured MCP endpoint URL. Never written to backend requests,
     /// client-visible responses, logs, or persisted response state.
-    #[cfg_attr(
-        not(feature = "openai-mcp-tools"),
-        expect(dead_code, reason = "only MCP dispatch dials deferred connectors")
-    )]
     pub server_url: String,
 
     /// Per-server timeout for the deferred `tools/list` call.
@@ -990,6 +978,7 @@ impl ResponsesState {
 
     /// Update one sibling owner's charge without dropping charges held by
     /// other filters during the same request.
+    #[cfg(feature = "store")]
     pub(crate) fn replace_retained_external_payload_bytes(&mut self, previous: usize, next: usize) -> bool {
         let Some(total) = self
             .retained_external_payload_bytes

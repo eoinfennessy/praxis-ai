@@ -1508,6 +1508,7 @@ fn install_rehydrated_state(ctx: &mut HttpFilterContext<'_>, mut state: Response
     }
     write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
     ctx.extensions.insert(state);
+    super::store::mark_retained_request_payload_charged(ctx);
     Ok(())
 }
 

@@ -331,6 +331,13 @@ impl ResponseStoreFilter {
                 .pending_wire_bytes
                 .checked_add(chunk.len())
                 .and_then(|bytes| bytes.checked_mul(4))
+                .and_then(|peak| {
+                    if state.charged_retained_bytes.is_some() {
+                        Some(peak)
+                    } else {
+                        previously_retained?.checked_add(peak)
+                    }
+                })
                 .is_some_and(|peak| {
                     ctx.extensions
                         .get::<ResponsesState>()
@@ -346,11 +353,9 @@ impl ResponseStoreFilter {
         }
         state.track_pending_wire_bytes(chunk);
         let retained = state.retained_payload_bytes();
-        let admitted = previously_retained.zip(retained).is_some_and(|(previous, next)| {
-            ctx.extensions.get_mut::<ResponsesState>().is_none_or(|responses| {
-                responses.replace_retained_external_payload_bytes(previous, next) && responses.can_retain_payload(0)
-            })
-        });
+        let admitted = previously_retained
+            .zip(retained)
+            .is_some_and(|(_, next)| charge_store_payload(ctx, &mut state, next));
         ctx.extensions.insert(state);
         admitted
     }
@@ -646,6 +651,9 @@ struct ResponseStoreRequestState {
     /// Re-serializing a large prompt for every SSE chunk would run on the
     /// synchronous downstream response path.
     input_retained_bytes: usize,
+    /// Store bytes already charged to `ResponsesState`. The store can run
+    /// before another filter creates that state.
+    charged_retained_bytes: Option<usize>,
     /// Owner captured before inference begins.
     owner: Option<StateOwner>,
     /// Incremental SSE decoder over the outbound stream, lazily created on the
@@ -708,12 +716,43 @@ pub(crate) fn retained_request_payload_bytes(ctx: &HttpFilterContext<'_>) -> Opt
         .map_or(Some(0), |bytes| bytes.parse().ok())
 }
 
+/// Charge a store-owned snapshot when shared response state is present. A
+/// resolver can create that state after the store captured its input, so the
+/// first update charges the whole snapshot instead of replacing a missing one.
+fn charge_store_payload(ctx: &mut HttpFilterContext<'_>, store: &mut ResponseStoreRequestState, next: usize) -> bool {
+    let Some(responses) = ctx.extensions.get_mut::<ResponsesState>() else {
+        store.charged_retained_bytes = None;
+        return true;
+    };
+    let admitted = if let Some(charged) = store.charged_retained_bytes {
+        responses.can_replace_retained_payload(charged, next, 0)
+            && responses.replace_retained_external_payload_bytes(charged, next)
+    } else {
+        responses.can_retain_payload(next) && responses.retain_external_payload_bytes(next)
+    };
+    if admitted {
+        store.charged_retained_bytes = Some(next);
+    }
+    admitted
+}
+
+/// Record a store charge seeded while admitting the agentic budget or
+/// installing rehydrated state.
+pub(crate) fn mark_retained_request_payload_charged(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(store) = ctx.extensions.get_mut::<ResponseStoreRequestState>() {
+        store.charged_retained_bytes = store.retained_payload_bytes();
+    }
+}
+
 /// Release all store-owned request payload after a terminal budget failure.
 pub(crate) fn discard_retained_request_payload(ctx: &mut HttpFilterContext<'_>) {
     let bytes = retained_request_payload_bytes(ctx).unwrap_or(usize::MAX);
-    ctx.extensions.remove::<ResponseStoreRequestState>();
+    let charged = match ctx.extensions.remove::<ResponseStoreRequestState>() {
+        Some(store) => store.charged_retained_bytes,
+        None => Some(bytes),
+    };
     ctx.set_metadata(STORE_REQUEST_PAYLOAD_BYTES_METADATA, "0");
-    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+    if let (Some(bytes), Some(state)) = (charged, ctx.extensions.get_mut::<ResponsesState>()) {
         state.release_external_payload_bytes(bytes);
     }
 }
@@ -796,14 +835,10 @@ fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), Filt
 fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) -> Result<(), FilterAction> {
     let retained_bytes = retained_json_bytes(&input).unwrap_or(usize::MAX);
     let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
-    let previous = state.retained_payload_bytes().unwrap_or(usize::MAX);
     state.input = Some(input);
     state.input_retained_bytes = retained_bytes;
     let next = state.retained_payload_bytes().unwrap_or(usize::MAX);
-    let admitted = ctx.extensions.get_mut::<ResponsesState>().is_none_or(|responses| {
-        responses.can_replace_retained_payload(previous, next, 0)
-            && responses.replace_retained_external_payload_bytes(previous, next)
-    });
+    let admitted = charge_store_payload(ctx, &mut state, next);
     ctx.extensions.insert(state);
     if !admitted {
         ctx.set_metadata("responses.skip_persist", "true");
@@ -2161,6 +2196,54 @@ mod encode_replay_event_tests {
                 .retained_external_payload_bytes,
             super::retained_request_payload_bytes(&ctx).unwrap(),
             "replacing the cached input charge must preserve replay row charges",
+        );
+    }
+
+    #[test]
+    fn stream_store_charges_input_when_response_state_is_created_later() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        capture_request_input(&mut ctx, json!("input captured before MCP resolution")).unwrap();
+        ctx.extensions.insert(ResponsesState::default());
+
+        let frame = Bytes::from_static(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":1}\n\n",
+        );
+        assert!(filter.capture_stream_events(&mut ctx, &Some(frame)));
+        assert_eq!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .unwrap()
+                .retained_external_payload_bytes,
+            super::retained_request_payload_bytes(&ctx).unwrap(),
+        );
+    }
+
+    #[test]
+    fn stream_store_replaces_charge_seeded_by_agentic_admission() {
+        let filter =
+            ResponseStoreFilter::with_bounds(NonZeroU32::new(1_024).unwrap(), NonZeroU64::new(1_048_576).unwrap());
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context_without_subrequest_client(&request);
+        capture_request_input(&mut ctx, json!("input captured before admission")).unwrap();
+        let input_bytes = super::retained_request_payload_bytes(&ctx).unwrap();
+        let mut responses = ResponsesState::default();
+        responses.set_retained_external_payload_bytes(input_bytes);
+        ctx.extensions.insert(responses);
+        super::mark_retained_request_payload_charged(&mut ctx);
+
+        let frame = Bytes::from_static(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"sequence_number\":1}\n\n",
+        );
+        assert!(filter.capture_stream_events(&mut ctx, &Some(frame)));
+        assert_eq!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .unwrap()
+                .retained_external_payload_bytes,
+            super::retained_request_payload_bytes(&ctx).unwrap(),
         );
     }
 

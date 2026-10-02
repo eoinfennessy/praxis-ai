@@ -644,8 +644,14 @@ impl HttpFilter for ResponsesProxyFilter {
 
     #[expect(
         clippy::too_many_lines,
-        clippy::large_stack_frames,
         reason = "selected-upstream body processing now admits deferred first-turn MCP dispatch"
+    )]
+    #[cfg_attr(
+        feature = "openai-mcp-tools",
+        expect(
+            clippy::large_stack_frames,
+            reason = "deferred MCP dispatch expands this async frame"
+        )
     )]
     async fn on_selected_upstream_request_body(
         &self,

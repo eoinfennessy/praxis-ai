@@ -552,6 +552,10 @@ fn admit_retained_payload_budget(
             retained_overflow = Some((initial, streaming));
         }
     }
+    #[cfg(feature = "store")]
+    if ctx.extensions.get::<ResponsesState>().is_some() {
+        super::store::mark_retained_request_payload_charged(ctx);
+    }
     let Some((initial, streaming)) = retained_overflow else {
         return Ok(None);
     };
