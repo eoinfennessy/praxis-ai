@@ -255,6 +255,7 @@ fn decompress_zstd(frame: &[u8]) -> Result<Vec<u8>, StoreError> {
         ));
     }
     Ok(json)
+}
 
 /// Decode one stored JSON column without allocating beyond `max_bytes` of
 /// serialized payload. Returns the decoded byte count for aggregate reads.

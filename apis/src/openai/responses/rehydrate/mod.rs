@@ -45,7 +45,9 @@ use tracing::{debug, trace, warn};
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
-    DEFAULT_STORE_NAME, agentic_loop::AgenticBudgetPolicy, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
+    DEFAULT_STORE_NAME,
+    agentic_loop::AgenticBudgetPolicy,
+    append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
     state::{ResponsesState, strip_local_compaction_marker},
