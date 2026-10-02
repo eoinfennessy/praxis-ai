@@ -1773,7 +1773,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
         );
-        for feature in &manifest.features[44..48] {
+        for feature in &manifest.features[45..49] {
             assert_eq!(
                 feature
                     .providers
