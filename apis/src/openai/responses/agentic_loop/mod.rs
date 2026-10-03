@@ -1093,6 +1093,7 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     for item in &mut state.persisted_messages {
         mark(item);
     }
+    state.mark_replay_stable_payload_changed();
     state.tool_search_calls.clear();
 }
 
@@ -1531,6 +1532,7 @@ fn terminalize_file_search_item(state: &mut ResponsesState, index: usize) {
     {
         object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
         object.remove("results");
+        state.mark_replay_stable_payload_changed();
     }
 }
 
