@@ -1251,13 +1251,17 @@ fn buffered_response_retention_fits(state: &ResponsesState, response: &Value) ->
             {
                 4
             },
-            Some("reasoning" | "web_search_call") => 3,
+            Some("reasoning" | "web_search_call" | "compaction") => 3,
             Some("file_search_call") => 2,
             Some("tool_search_call") => tool_search_retained_copies(item),
             _ => 1,
         };
+        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
+            .filter(|id| !state.provider_compaction_ids.contains(*id))
+            .map_or(0, str::len);
         let Some(total) = bytes
             .checked_mul(copies)
+            .and_then(|bytes| bytes.checked_add(id_bytes))
             .and_then(|bytes| copied_item_bytes.checked_add(bytes))
         else {
             return false;
@@ -1707,12 +1711,19 @@ fn streaming_collection_retention_fits(state: &ResponsesState) -> bool {
             return false;
         };
         let copies = match item.get("type").and_then(Value::as_str) {
-            Some("function_call" | "reasoning" | "web_search_call") => 3,
+            Some("function_call" | "reasoning" | "web_search_call" | "compaction") => 3,
             Some("file_search_call") => 2,
             Some("tool_search_call") => tool_search_retained_copies(item),
             _ => 1,
         };
-        let Some(total) = bytes.checked_mul(copies).and_then(|bytes| added.checked_add(bytes)) else {
+        let id_bytes = ResponsesState::provider_compaction_id_from_message(item)
+            .filter(|id| !state.provider_compaction_ids.contains(*id))
+            .map_or(0, str::len);
+        let Some(total) = bytes
+            .checked_mul(copies)
+            .and_then(|bytes| bytes.checked_add(id_bytes))
+            .and_then(|bytes| added.checked_add(bytes))
+        else {
             return false;
         };
         added = total;
