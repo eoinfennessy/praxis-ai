@@ -549,6 +549,8 @@ struct RestorePreviousResponseIdStream {
 struct RestoreStableBudget {
     /// Logical agentic round when the stable owners were measured.
     iteration: u32,
+    /// Revision for in-place request/history mutations between stream chunks.
+    revision: u64,
     /// Lengths of every stable collection, including history appended during a round.
     collection_lengths: [usize; 6],
     /// Serialized bytes retained by the request and history owners.
@@ -557,9 +559,10 @@ struct RestoreStableBudget {
 
 impl RestoreStableBudget {
     /// Capture the current stable collection shape and its measured charge.
-    fn new(state: &ResponsesState, bytes: usize) -> Self {
+    fn new(state: &ResponsesState, revision: u64, bytes: usize) -> Self {
         Self {
             iteration: state.iteration,
+            revision,
             collection_lengths: Self::collection_lengths(state),
             bytes,
         }
@@ -567,7 +570,9 @@ impl RestoreStableBudget {
 
     /// Detect a new round or any append to a stable request/history collection.
     fn matches(self, state: &ResponsesState) -> bool {
-        self.iteration == state.iteration && self.collection_lengths == Self::collection_lengths(state)
+        self.iteration == state.iteration
+            && state.replay_stable_payload_revision == Some(self.revision)
+            && self.collection_lengths == Self::collection_lengths(state)
     }
 
     /// Read the sizes of the collections charged by the stable meter.
@@ -805,11 +810,14 @@ fn streaming_restore_fits(
     let Some(limit) = state.retained_payload_limit() else {
         return true;
     };
+    let Some(revision) = state.replay_stable_payload_revision else {
+        return false;
+    };
     if stable_budget.is_none_or(|cache| !cache.matches(state)) {
         let Some(stable) = state.stream_stable_payload_bytes_bounded(limit) else {
             return false;
         };
-        *stable_budget = Some(RestoreStableBudget::new(state, stable));
+        *stable_budget = Some(RestoreStableBudget::new(state, revision, stable));
     }
     let Some(stable) = stable_budget.as_ref().map(|cache| cache.bytes) else {
         return false;

@@ -2180,6 +2180,23 @@ fn streaming_restore_cache_rechecks_history_and_changing_stream_owners() {
         !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
         "the changing meter must include parser bytes and canonical output"
     );
+
+    state.retained_stream_parser_bytes = 0;
+    state.accumulated_output.clear();
+    state.messages[0] = json!("h".repeat(33_000));
+    state.mark_replay_stable_payload_changed();
+    assert!(!cached.matches(&state));
+    assert!(
+        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        "an in-place history replacement must invalidate the cached charge"
+    );
+
+    state.messages[0] = json!("h".repeat(32_000));
+    state.replay_stable_payload_revision = None;
+    assert!(
+        !streaming_restore_fits(Some(&state), &mut stable_budget, 0, 16),
+        "an exhausted revision must fail closed"
+    );
 }
 
 #[tokio::test]
