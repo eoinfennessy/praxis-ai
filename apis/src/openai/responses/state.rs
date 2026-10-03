@@ -347,6 +347,11 @@ pub(crate) struct ResponsesState {
     /// Semantic and framing payload published by the Chat stream translator.
     pub(crate) retained_chat_converter_bytes: usize,
 
+    /// Revision of request/history/output owners cached by response-store
+    /// replay admission. In-place changes do not alter collection lengths.
+    /// `None` means the counter overflowed and replay must fail closed.
+    pub(crate) replay_stable_payload_revision: Option<u64>,
+
     /// Whether aggregate admission failed and only a terminal error may remain.
     pub(crate) retained_payload_failed: bool,
 
@@ -907,6 +912,7 @@ impl Default for ResponsesState {
             retained_external_payload_bytes: 0,
             retained_stream_parser_bytes: 0,
             retained_chat_converter_bytes: 0,
+            replay_stable_payload_revision: Some(0),
             retained_payload_failed: false,
             citation_files: HashMap::new(),
             context_management: None,
@@ -1404,6 +1410,15 @@ impl ResponsesState {
     /// Require the proxy to serialize provider-visible request state.
     pub(crate) fn mark_request_body_for_rebuild(&mut self) {
         self.request_body_rebuild = RequestBodyRebuild::Required;
+        self.mark_replay_stable_payload_changed();
+    }
+
+    /// Invalidate the store replay meter after an in-place mutation of a
+    /// cached request, history, tool, or accumulated output owner.
+    pub(crate) fn mark_replay_stable_payload_changed(&mut self) {
+        self.replay_stable_payload_revision = self
+            .replay_stable_payload_revision
+            .and_then(|revision| revision.checked_add(1));
     }
 
     /// Borrow the public output owned by [`Self::response_object`].
