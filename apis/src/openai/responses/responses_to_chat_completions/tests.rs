@@ -67,6 +67,71 @@ fn later_stream_round_reserves_original_tool_choice_echo() {
 }
 
 #[test]
+fn batched_tool_deltas_stop_before_repeated_ids_fill_the_wire_buffer() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hi", "stream": true}));
+    state.apply_retained_payload_limit(8 * 1024 * 1024);
+    let mut converter = super::stream::StreamConverter::new("resp_batched".to_owned(), 1, wide_stream_limits());
+    converter.set_echo_projection(&state.request_body, &state.tools, None);
+    context.extensions.insert(state);
+    let initial = format!(
+        "data: {}\n\n",
+        json!({
+            "id": "chat_batched", "model": "m", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "i".repeat(32_768), "type": "function",
+                "function": {"name": "f", "arguments": "{"}
+            }]}}]
+        })
+    );
+    assert!(super::converter_construction_fits(
+        &context,
+        &mut converter,
+        initial.len()
+    ));
+    let mut out = Vec::new();
+    {
+        let state = context.extensions.get::<ResponsesState>().unwrap();
+        let inputs = super::SnapshotInputs {
+            request_body: &state.request_body,
+            tools: &state.tools,
+            original_tool_choice: None,
+            now: 1,
+        };
+        converter.push_into(initial.as_bytes(), &inputs, &mut out).unwrap();
+    }
+    assert!(!converter.callback_budget_failed());
+    context
+        .extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .retained_chat_converter_bytes = converter.retained_payload_bytes().unwrap();
+    let delta = format!(
+        "data: {}\n\n",
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 0, "function": {"arguments": "x"}
+        }]}}]})
+    );
+    let batch = delta.repeat(512);
+    assert!(
+        super::converter_construction_fits(&context, &mut converter, batch.len()),
+        "the aggregate preflight alone cannot see the repeated ID wire expansion"
+    );
+    out.clear();
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    let inputs = super::SnapshotInputs {
+        request_body: &state.request_body,
+        tools: &state.tools,
+        original_tool_choice: None,
+        now: 1,
+    };
+    converter.push_into(batch.as_bytes(), &inputs, &mut out).unwrap();
+    assert!(converter.callback_budget_failed());
+    assert!(out.is_empty(), "the offending callback must not expose partial deltas");
+}
+
+#[test]
 fn default_config_parses() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();

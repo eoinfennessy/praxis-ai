@@ -1002,6 +1002,48 @@ fn malformed_json_emits_failed_without_leaking_bytes() {
 }
 
 #[test]
+fn failure_terminal_budget_clears_same_callback_output_on_chunk_or_eof() {
+    let body = json!({
+        "model": "gpt-4.1-mini", "input": "hi", "stream": true,
+        "instructions": "x".repeat(16_384)
+    });
+    let inputs = SnapshotInputs {
+        request_body: &body,
+        tools: &[],
+        original_tool_choice: None,
+        now: NOW,
+    };
+    let first = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n";
+    let delta = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n\n";
+
+    for error_at_eof in [false, true] {
+        let mut conv = converter(wide_limits());
+        let mut initial_output = Vec::new();
+        conv.push_into(first, &inputs, &mut initial_output).unwrap();
+        assert!(!initial_output.is_empty());
+        conv.set_callback_output_limit(2_500);
+
+        let mut callback = Vec::from(delta.as_slice());
+        callback.extend_from_slice(if error_at_eof {
+            b"data: {malformed".as_slice()
+        } else {
+            b"data: {malformed\n\n".as_slice()
+        });
+        let mut out = Vec::new();
+        conv.push_into(&callback, &inputs, &mut out).unwrap();
+        if error_at_eof {
+            assert!(!out.is_empty(), "the valid delta should be staged before EOF");
+            conv.finish_into(&inputs, &mut out).unwrap();
+        }
+        assert!(
+            conv.callback_budget_failed(),
+            "failure closeout must report aggregate exhaustion"
+        );
+        assert!(out.is_empty(), "no partial delta may escape the failed callback");
+    }
+}
+
+#[test]
 fn parse_failure_after_partial_output_emits_empty_failed_snapshot() {
     // A message item streams (announced but never completed), then a malformed
     // chunk fails the stream mid-flight. The failed snapshot must not manufacture

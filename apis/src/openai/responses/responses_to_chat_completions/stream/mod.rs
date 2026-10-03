@@ -113,6 +113,10 @@ struct EmitState {
     sequence_number: u64,
     /// Count of events emitted so far.
     events_emitted: usize,
+    /// Maximum encoded bytes this callback may stage before returning them.
+    callback_output_limit: usize,
+    /// Sticky until the owning filter emits its one aggregate-budget error.
+    callback_budget_failed: bool,
 }
 
 /// Errors produced while translating a stream.
@@ -161,6 +165,8 @@ enum ConvertError {
     FrameLimit,
     /// The accumulated semantic byte ceiling was exceeded.
     ByteLimit,
+    /// This callback's aggregate-budget wire staging allowance was exhausted.
+    AggregateBudget,
     /// A single tool call exceeded the argument byte limit.
     ToolArgumentLimit,
     /// The tool-call count limit was exceeded.
@@ -474,6 +480,16 @@ impl StreamConverter {
         self.shared_stable_bytes
     }
 
+    /// Set the maximum wire staging this callback can safely allocate.
+    pub(super) fn set_callback_output_limit(&mut self, bytes: usize) {
+        self.emit.callback_output_limit = bytes;
+    }
+
+    /// Whether bounded event encoding stopped the current callback.
+    pub(super) const fn callback_budget_failed(&self) -> bool {
+        self.emit.callback_budget_failed
+    }
+
     /// Create a converter for a streaming response.
     pub(super) fn new(response_id: String, created_at: u64, limits: StreamLimits) -> Self {
         Self {
@@ -485,6 +501,8 @@ impl StreamConverter {
             emit: EmitState {
                 sequence_number: 0,
                 events_emitted: 0,
+                callback_output_limit: usize::MAX,
+                callback_budget_failed: false,
             },
             lifecycle_started: false,
             initial_metadata_checked: false,
@@ -509,21 +527,51 @@ impl StreamConverter {
     /// Returns `None` when the chunk produced no complete event. Recoverable
     /// translation failures emit a `response.failed` terminal instead of
     /// propagating; only internal serialization failures return [`FilterError`].
+    #[cfg(test)]
     pub(super) fn push(&mut self, chunk: &[u8], inputs: &SnapshotInputs<'_>) -> Result<Option<Vec<u8>>, FilterError> {
         let mut out = Vec::new();
-        if let Err(error) = self.try_push(chunk, inputs, &mut out) {
-            self.handle_failure(&error, inputs, &mut out)?;
-        }
+        self.push_into(chunk, inputs, &mut out)?;
         Ok((!out.is_empty()).then_some(out))
     }
 
+    /// Translate into the callback's existing wire buffer, so push and EOF
+    /// closeout share one bounded allocation when delivered together.
+    pub(super) fn push_into(
+        &mut self,
+        chunk: &[u8],
+        inputs: &SnapshotInputs<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), FilterError> {
+        if let Err(error) = self.try_push(chunk, inputs, out) {
+            if matches!(error, ConvertError::AggregateBudget) {
+                self.emit.callback_budget_failed = true;
+                out.clear();
+                return Ok(());
+            }
+            self.handle_failure(&error, inputs, out)?;
+        }
+        Ok(())
+    }
+
     /// Finalize the stream at end of upstream body.
+    #[cfg(test)]
     pub(super) fn finish(&mut self, inputs: &SnapshotInputs<'_>) -> Result<Option<Vec<u8>>, FilterError> {
         let mut out = Vec::new();
-        if let Err(error) = self.try_finish(inputs, &mut out) {
-            self.handle_failure(&error, inputs, &mut out)?;
-        }
+        self.finish_into(inputs, &mut out)?;
         Ok((!out.is_empty()).then_some(out))
+    }
+
+    /// Finalize into the callback's existing bounded wire buffer.
+    pub(super) fn finish_into(&mut self, inputs: &SnapshotInputs<'_>, out: &mut Vec<u8>) -> Result<(), FilterError> {
+        if let Err(error) = self.try_finish(inputs, out) {
+            if matches!(error, ConvertError::AggregateBudget) {
+                self.emit.callback_budget_failed = true;
+                out.clear();
+                return Ok(());
+            }
+            self.handle_failure(&error, inputs, out)?;
+        }
+        Ok(())
     }
 
     /// Translate one chunk, appending events to `out`.
@@ -1625,6 +1673,14 @@ impl StreamConverter {
         match self.emit_failed(inputs, failure_message(error), out) {
             Ok(()) => Ok(()),
             Err(ConvertError::Serialize(serialize_error)) => Err(serialize_filter_error(&serialize_error)),
+            Err(ConvertError::AggregateBudget) => {
+                // The failure resource can exceed the callback's shared wire
+                // allowance after earlier events. Discard those events too;
+                // the outer filter emits its one bounded budget error.
+                self.emit.callback_budget_failed = true;
+                out.clear();
+                Ok(())
+            },
             Err(other) => {
                 warn!(error = ?other, "failed to emit response.failed terminal event");
                 Ok(())
@@ -1833,8 +1889,8 @@ impl StreamConverter {
     }
 }
 
-/// Encode one event, injecting the sequence number and enforcing the event and
-/// per-frame size caps.
+/// Encode one event, injecting the sequence number and enforcing the event,
+/// aggregate callback, and per-frame size caps.
 ///
 /// `limits.max_stream_events` bounds the *total* number of Responses SSE events
 /// emitted for one response, including its single terminal event. The terminal is
@@ -1845,8 +1901,12 @@ impl StreamConverter {
 /// so this bound keeps a client-visible stream within their budget and never
 /// silently skips persistence.
 ///
+/// The aggregate callback allowance preflights the event's encoded upper bound
+/// before growing `out`, so a batch of small provider frames cannot repeat a
+/// retained large field into an unbounded wire buffer.
+///
 /// `limits.max_emitted_sse_frame_bytes` bounds the *complete* encoded frame. The
-/// frame is encoded into `out` first, then measured; if it exceeds the ceiling it
+/// frame is encoded into `out`, then measured; if it exceeds the ceiling it
 /// is truncated back off `out` and [`ConvertError::FrameSizeLimit`] is returned,
 /// so nothing partial reaches the client and the sequence counters are left
 /// untouched. Measuring the fully encoded frame (rather than approximating from
@@ -1862,6 +1922,16 @@ fn emit_event(
 ) -> Result<(), ConvertError> {
     if capped && emit.events_emitted.saturating_add(1) >= limits.max_stream_events {
         return Err(ConvertError::EventLimit);
+    }
+    if emit.callback_output_limit != usize::MAX {
+        let frame_bytes = event.encoded_len_upper_bound().ok_or(ConvertError::AggregateBudget)?;
+        if out
+            .len()
+            .checked_add(frame_bytes)
+            .is_none_or(|bytes| bytes > emit.callback_output_limit)
+        {
+            return Err(ConvertError::AggregateBudget);
+        }
     }
     let start = out.len();
     if let Err(error) = events::encode(event, emit.sequence_number, out) {
@@ -2043,6 +2113,7 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::FrameSizeLimit => "upstream stream exceeded the per-event size limit",
         ConvertError::FrameLimit => "upstream stream exceeded the frame limit",
         ConvertError::ByteLimit => "upstream stream exceeded the response size limit",
+        ConvertError::AggregateBudget => "streaming response exceeded the retained payload budget",
         ConvertError::ToolArgumentLimit => "upstream tool-call arguments exceeded the size limit",
         ConvertError::ToolCountLimit => "upstream stream exceeded the tool-call limit",
         ConvertError::Timeout => "upstream stream exceeded the time limit",

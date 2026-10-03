@@ -50,10 +50,19 @@ fn load_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::c
 }
 
 fn load_small_budget_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
+    load_budget_config(proxy_port, model_port, db_url, 16_384)
+}
+
+fn load_budget_config(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read composed example");
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url).replace(
         "max_infer_iters: 4",
-        "max_infer_iters: 4\n                max_retained_bytes: 16384",
+        &format!("max_infer_iters: 4\n                max_retained_bytes: {max_retained_bytes}"),
     );
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     praxis_core::config::Config::from_yaml(&yaml).expect("parse small-budget composed config")
@@ -882,6 +891,58 @@ fn escape_heavy_translated_closeout_fails_before_success() {
     let response_id = created["response"]["id"].as_str().expect("response id");
     let (status, _) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
     assert_eq!(status, 404, "escaped overflow must not be stored");
+}
+
+#[test]
+fn batched_tool_deltas_cannot_repeat_a_large_id_past_the_shared_budget() {
+    let large_id = format!("call_{}", "i".repeat(32_768));
+    let initial = format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "id": "chatcmpl_repeated_id", "object": "chat.completion.chunk", "model": "gpt-4.1",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": large_id, "type": "function",
+                "function": {"name": "tool", "arguments": "{"}
+            }]}}]
+        })
+    );
+    let delta = format!(
+        "data: {}\n\n",
+        serde_json::json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "function": {"arguments": "x"}
+            }]}}]
+        })
+    );
+    let model = Backend::chunked(vec![initial, delta.repeat(512), "data: [DONE]\n\n".to_owned()])
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let db = TempSqlite::new("compat_chat_repeated_id_budget");
+    let config = load_budget_config(free_port(), model.port(), db.url(), 8 * 1024 * 1024);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1", "stream": true, "store": true, "input": "Use the tool."
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200, "{raw}");
+    let body = parse_body(&raw);
+    assert!(body.contains("event: response.created\n"), "{body}");
+    assert_eq!(body.matches("event: error\n").count(), 1, "{body}");
+    assert!(!body.contains("event: response.completed\n"), "{body}");
+    assert!(!body.contains("event: response.failed\n"), "{body}");
+    let created = body
+        .split("\n\n")
+        .find(|frame| frame.starts_with("event: response.created\n"))
+        .expect("response.created frame");
+    let data = created
+        .lines()
+        .find_map(|line| line.strip_prefix("data: "))
+        .expect("created payload");
+    let created: serde_json::Value = serde_json::from_str(data).unwrap();
+    let response_id = created["response"]["id"].as_str().expect("response id");
+    let (status, _) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    assert_eq!(status, 404, "budget-exhausted batched stream must not be stored");
 }
 
 // -----------------------------------------------------------------------------

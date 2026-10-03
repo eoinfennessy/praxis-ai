@@ -357,13 +357,19 @@ impl ResponsesToChatCompletionsFilter {
         };
 
         let mut out = Vec::new();
-        if let Some(chunk) = body.take()
-            && let Some(events) = converter.push(&chunk, &inputs)?
-        {
-            out.extend_from_slice(&events);
+        if let Some(chunk) = body.take() {
+            converter.push_into(&chunk, &inputs, &mut out)?;
+            if converter.callback_budget_failed() {
+                record_converter_budget_failure(ctx, body);
+                return Ok(FilterAction::Continue);
+            }
         }
-        if end_of_stream && let Some(events) = converter.finish(&inputs)? {
-            out.extend_from_slice(&events);
+        if end_of_stream {
+            converter.finish_into(&inputs, &mut out)?;
+            if converter.callback_budget_failed() {
+                record_converter_budget_failure(ctx, body);
+                return Ok(FilterAction::Continue);
+            }
         }
 
         let measured = converter.retained_payload_bytes();
@@ -402,32 +408,55 @@ fn converter_construction_fits(
         return false;
     };
     if state.retained_payload_limit().is_none() {
+        converter.set_callback_output_limit(usize::MAX);
         return true;
     }
     let retained = converter.retained_payload_bytes();
     let projected = retained.and_then(|bytes| incoming_bytes.checked_mul(4)?.checked_add(bytes));
     let staging = retained.zip(projected).and_then(|(retained_bytes, bytes)| {
-        let (request_echo, tools_echo, choice_echo) = converter.echo_projection()?;
-        // A terminal may be inside push or arrive at EOF. Text, refusal, and
-        // arguments can each appear in done, item, and terminal frames; JSON
-        // control escapes can expand one byte to six. Reserve twelve encoded
-        // copies: four closeout/terminal frames, plus the old and new Vec
-        // allocations that can coexist while the output buffer grows.
-        let terminal_wire = converter.terminal_wire_bytes(incoming_bytes, retained_bytes)?;
-        bytes
-            .checked_mul(5)?
-            .checked_add(terminal_wire.checked_mul(12)?)?
-            // The first callback retains created and in_progress frames in the
-            // same output Vec while each event clones a request-echo resource.
-            // Reserve those value owners and Vec capacity growth as well.
-            .checked_add(request_echo.checked_mul(8)?)?
-            .checked_add(tools_echo.checked_mul(6)?)?
-            .checked_add(choice_echo.checked_mul(8)?)?
-            .checked_add(1_024)
+        converter_callback_staging(converter, incoming_bytes, retained_bytes, bytes)
     });
-    projected
-        .zip(staging)
-        .is_some_and(|(bytes, scratch)| converter_budget_fits(state, converter, bytes, scratch))
+    projected.zip(staging).is_some_and(|(bytes, (scratch, wire))| {
+        let Some(remaining) = converter_budget_remaining(state, converter, bytes, scratch) else {
+            return false;
+        };
+        // Only the wire allowance may fund the callback Vec. The non-wire
+        // resource/event owners remain reserved while old and new Vec
+        // allocations can coexist during growth.
+        let Some(available) = wire.checked_add(remaining) else {
+            return false;
+        };
+        converter.set_callback_output_limit(available / 3);
+        true
+    })
+}
+
+/// Reserve semantic/resource owners separately from the callback's wire Vec.
+fn converter_callback_staging(
+    converter: &StreamConverter,
+    incoming_bytes: usize,
+    retained_bytes: usize,
+    projected_bytes: usize,
+) -> Option<(usize, usize)> {
+    let (request_echo, tools_echo, choice_echo) = converter.echo_projection()?;
+    // A terminal may be inside push or arrive at EOF. Text, refusal, and
+    // arguments can appear in four closeout frames, with sixfold JSON escape
+    // expansion. Reserve those frames and simultaneous old/new Vec capacity.
+    let terminal_wire = converter.terminal_wire_bytes(incoming_bytes, retained_bytes)?;
+    let non_wire = projected_bytes
+        .checked_mul(5)?
+        // Lifecycle events clone request echoes into resource/event Values.
+        .checked_add(request_echo.checked_mul(2)?)?
+        .checked_add(tools_echo.checked_mul(2)?)?
+        .checked_add(choice_echo.checked_mul(2)?)?
+        .checked_add(1_024)?;
+    let wire = terminal_wire
+        .checked_mul(12)?
+        .checked_add(request_echo.checked_mul(6)?)?
+        .checked_add(tools_echo.checked_mul(6)?)?
+        .checked_add(choice_echo.checked_mul(6)?)?
+        .checked_add(1_024)?;
+    Some((non_wire.checked_add(wire)?, wire))
 }
 
 /// Replace the converter's old published charge without reserializing stable
@@ -438,12 +467,21 @@ fn converter_budget_fits(
     replacement_bytes: usize,
     staging_bytes: usize,
 ) -> bool {
+    converter_budget_remaining(state, converter, replacement_bytes, staging_bytes).is_some()
+}
+
+/// Remaining aggregate capacity after replacing the converter owner and
+/// reserving the callback's independent staging owners.
+fn converter_budget_remaining(
+    state: &ResponsesState,
+    converter: &mut StreamConverter,
+    replacement_bytes: usize,
+    staging_bytes: usize,
+) -> Option<usize> {
     let Some(limit) = state.retained_payload_limit() else {
-        return true;
+        return Some(usize::MAX);
     };
-    let Some(stable) = converter.shared_stable_bytes(state, limit) else {
-        return false;
-    };
+    let stable = converter.shared_stable_bytes(state, limit)?;
     limit
         .checked_sub(stable)
         .and_then(|remaining| remaining.checked_add(state.retained_chat_converter_bytes))
@@ -452,7 +490,7 @@ fn converter_budget_fits(
         .and_then(|total| total.checked_sub(state.retained_chat_converter_bytes))
         .and_then(|total| total.checked_add(replacement_bytes))
         .and_then(|total| total.checked_add(staging_bytes))
-        .is_some_and(|total| total <= limit)
+        .and_then(|total| limit.checked_sub(total))
 }
 
 /// A translated stream has committed HTTP 200. Keep only the bounded logical
