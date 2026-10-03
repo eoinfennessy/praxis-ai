@@ -42,6 +42,7 @@ use super::{
     enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
+    stream_events::RETAINED_PAYLOAD_OVERFLOW_MESSAGE,
 };
 use crate::{
     classifier::is_responses_create,
@@ -297,11 +298,11 @@ impl ResponsesToChatCompletionsFilter {
         // opt-out as always memory-safe.
         ctx.response_body_mode = BodyMode::Stream;
         prepare_transformed_stream_headers(ctx);
-        ctx.insert_filter_state(StreamConverter::new(
-            response_id,
-            created_at,
-            self.config.stream_limits(),
-        ));
+        let mut converter = StreamConverter::new(response_id, created_at, self.config.stream_limits());
+        if let Some(state) = ctx.extensions.get::<ResponsesState>() {
+            converter.set_echo_projection(&state.request_body, &state.tools, state.original_tool_choice.as_ref());
+        }
+        ctx.insert_filter_state(converter);
         Ok(FilterAction::Continue)
     }
 
@@ -311,14 +312,35 @@ impl ResponsesToChatCompletionsFilter {
     /// partial provider framing is never forwarded. Recoverable translation
     /// failures surface as a `response.failed` event from the converter, so only
     /// internal serialization failures propagate as [`FilterError`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "converter admission and translation share one callback lifetime"
+    )]
     fn transform_stream_response(
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.retained_payload_failed)
+        {
+            ctx.remove_filter_state::<StreamConverter>();
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.retained_chat_converter_bytes = 0;
+            }
+            *body = None;
+            return Ok(FilterAction::Continue);
+        }
         let Some(mut converter) = ctx.remove_filter_state::<StreamConverter>() else {
             return Ok(FilterAction::Continue);
         };
+        let incoming_bytes = body.as_ref().map_or(0, Bytes::len);
+        if !converter_construction_fits(ctx, &mut converter, incoming_bytes) {
+            record_converter_budget_failure(ctx, body);
+            return Ok(FilterAction::Continue);
+        }
         let now = ctx.time_source.now().as_secs();
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Err("responses_to_chat_completions: missing Responses state for streaming translation".into());
@@ -344,12 +366,107 @@ impl ResponsesToChatCompletionsFilter {
             out.extend_from_slice(&events);
         }
 
+        let measured = converter.retained_payload_bytes();
+        let admitted = ctx.extensions.get_mut::<ResponsesState>().is_some_and(|state| {
+            measured.is_some_and(|bytes| {
+                converter_budget_fits(state, &mut converter, bytes, out.len()) && {
+                    state.retained_chat_converter_bytes = if end_of_stream { 0 } else { bytes };
+                    true
+                }
+            })
+        });
+        if !admitted {
+            record_converter_budget_failure(ctx, body);
+            return Ok(FilterAction::Continue);
+        }
+
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
             ctx.insert_filter_state(converter);
         }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Reserve independently retained converter state and the peak produced by a
+/// provider callback before parsing it. A callback may decode a frame, append
+/// semantic text/arguments, stage SSE output, and build a terminal snapshot
+/// from that semantic state and request echoes at once. The multipliers are
+/// deliberately conservative upper bounds for those simultaneous owners.
+fn converter_construction_fits(
+    ctx: &HttpFilterContext<'_>,
+    converter: &mut StreamConverter,
+    incoming_bytes: usize,
+) -> bool {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return false;
+    };
+    if state.retained_payload_limit().is_none() {
+        return true;
+    }
+    let retained = converter.retained_payload_bytes();
+    let projected = retained.and_then(|bytes| incoming_bytes.checked_mul(4)?.checked_add(bytes));
+    let staging = retained.zip(projected).and_then(|(retained_bytes, bytes)| {
+        let (request_echo, tools_echo, choice_echo) = converter.echo_projection()?;
+        // A terminal may be inside push or arrive at EOF. Text, refusal, and
+        // arguments can each appear in done, item, and terminal frames; JSON
+        // control escapes can expand one byte to six. Reserve twelve encoded
+        // copies: four closeout/terminal frames, plus the old and new Vec
+        // allocations that can coexist while the output buffer grows.
+        let terminal_wire = converter.terminal_wire_bytes(incoming_bytes, retained_bytes)?;
+        bytes
+            .checked_mul(5)?
+            .checked_add(terminal_wire.checked_mul(12)?)?
+            // The first callback retains created and in_progress frames in the
+            // same output Vec while each event clones a request-echo resource.
+            // Reserve those value owners and Vec capacity growth as well.
+            .checked_add(request_echo.checked_mul(8)?)?
+            .checked_add(tools_echo.checked_mul(6)?)?
+            .checked_add(choice_echo.checked_mul(8)?)?
+            .checked_add(1_024)
+    });
+    projected
+        .zip(staging)
+        .is_some_and(|(bytes, scratch)| converter_budget_fits(state, converter, bytes, scratch))
+}
+
+/// Replace the converter's old published charge without reserializing stable
+/// request/history trees for every provider chunk.
+fn converter_budget_fits(
+    state: &ResponsesState,
+    converter: &mut StreamConverter,
+    replacement_bytes: usize,
+    staging_bytes: usize,
+) -> bool {
+    let Some(limit) = state.retained_payload_limit() else {
+        return true;
+    };
+    let Some(stable) = converter.shared_stable_bytes(state, limit) else {
+        return false;
+    };
+    limit
+        .checked_sub(stable)
+        .and_then(|remaining| remaining.checked_add(state.retained_chat_converter_bytes))
+        .and_then(|measurement_limit| state.stream_changing_payload_bytes_bounded_with_cached_output(measurement_limit))
+        .and_then(|changing| stable.checked_add(changing))
+        .and_then(|total| total.checked_sub(state.retained_chat_converter_bytes))
+        .and_then(|total| total.checked_add(replacement_bytes))
+        .and_then(|total| total.checked_add(staging_bytes))
+        .is_some_and(|total| total <= limit)
+}
+
+/// A translated stream has committed HTTP 200. Keep only the bounded logical
+/// error path; later provider chunks are dropped by `transform_stream_response`.
+fn record_converter_budget_failure(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
+    *body = None;
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+        state.retained_chat_converter_bytes = 0;
+        state.deferred_stream_done = false;
+    }
+    #[cfg(feature = "store")]
+    super::store::discard_retained_request_payload(ctx);
+    super::fs_end_stream_with_error_ctx(ctx, "server_error", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
 }
 
 #[expect(

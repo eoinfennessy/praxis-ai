@@ -39,10 +39,13 @@ use self::{
     events::StreamEvent,
     framing::{Framing, FramingError},
 };
-use crate::openai::translation::chat_completions::{
-    ResponseContext, chat_response_to_response_resource, context_has_web_search, function_call_output_item_from_parts,
-    in_progress_response_resource, message_output_item, output_text_item, refusal_item,
-    web_search_call_output_item_from_parts,
+use crate::openai::{
+    responses::state::{ResponsesState, retained_json_bytes, retained_json_values_bytes},
+    translation::chat_completions::{
+        ResponseContext, chat_response_to_response_resource, context_has_web_search,
+        function_call_output_item_from_parts, in_progress_response_resource, message_output_item, output_text_item,
+        refusal_item, web_search_call_output_item_from_parts,
+    },
 };
 
 /// Resource limits governing one streaming translation.
@@ -221,14 +224,20 @@ struct MessageState {
     text_content_index: Option<usize>,
     /// Accumulated assistant text.
     text: String,
+    /// JSON-escaped content bytes, maintained per fragment for closeout admission.
+    text_escaped_bytes: Option<usize>,
     /// Accumulated text token logprobs.
     logprobs: Vec<Value>,
+    /// Compact JSON bytes retained by `logprobs`, maintained per delta.
+    logprobs_bytes: Option<usize>,
     /// Whether the refusal content part was opened.
     refusal_part_open: bool,
     /// Content index assigned to the refusal part.
     refusal_content_index: Option<usize>,
     /// Accumulated refusal text.
     refusal: String,
+    /// JSON-escaped content bytes, maintained per fragment for closeout admission.
+    refusal_escaped_bytes: Option<usize>,
 }
 
 impl MessageState {
@@ -243,10 +252,13 @@ impl MessageState {
             text_part_open: false,
             text_content_index: None,
             text: String::new(),
+            text_escaped_bytes: Some(0),
             logprobs: Vec::new(),
+            logprobs_bytes: Some(2),
             refusal_part_open: false,
             refusal_content_index: None,
             refusal: String::new(),
+            refusal_escaped_bytes: Some(0),
         }
     }
 
@@ -281,6 +293,8 @@ struct ToolCallState {
     name: String,
     /// Accumulated function arguments.
     arguments: String,
+    /// JSON-escaped content bytes, maintained per fragment for closeout admission.
+    arguments_escaped_bytes: Option<usize>,
     /// Whether argument fragments have begun.
     args_started: bool,
     /// Whether this is the private compatibility function for a hosted
@@ -303,6 +317,7 @@ impl ToolCallState {
             call_id: String::new(),
             name: String::new(),
             arguments: String::new(),
+            arguments_escaped_bytes: Some(0),
             args_started: false,
             is_web_search: false,
             item_added: false,
@@ -356,9 +371,109 @@ pub(super) struct StreamConverter {
     accumulated_bytes: usize,
     /// Count of decoded SSE frames processed.
     frames_processed: usize,
+    /// Request/tool echo sizes are stable for this translated upstream round.
+    echo_projection: Option<(usize, usize, usize)>,
+    /// Request, history, and prior-round output are immutable until the
+    /// translated upstream round has completed.
+    shared_stable_bytes: Option<usize>,
 }
 
 impl StreamConverter {
+    /// Payload still owned after a callback. The caller publishes this in the
+    /// request-shared aggregate meter because other filters cannot access this
+    /// filter's local state through their own filter IDs.
+    pub(super) fn retained_payload_bytes(&self) -> Option<usize> {
+        let mut bytes = self.framing.retained_bytes().checked_add(self.response_id.len())?;
+        for value in [
+            self.chat_id.as_deref(),
+            self.model.as_deref(),
+            self.finish_reason.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.checked_add(value.len())?;
+        }
+        for value in [self.service_tier.as_ref(), self.usage.as_ref()].into_iter().flatten() {
+            bytes = bytes.checked_add(retained_json_bytes(value)?)?;
+        }
+        if let Some(message) = &self.message {
+            bytes = bytes
+                .checked_add(message.item_id.len())?
+                .checked_add(message.text.len())?
+                .checked_add(message.refusal.len())?
+                .checked_add(message.logprobs_bytes?)?;
+        }
+        for call in &self.tool_calls {
+            bytes = bytes
+                .checked_add(call.item_id.as_ref().map_or(0, String::len))?
+                .checked_add(call.call_id.len())?
+                .checked_add(call.name.len())?
+                .checked_add(call.arguments.len())?;
+        }
+        Some(bytes)
+    }
+
+    /// Bound the escaped strings repeated in closeout frames and the terminal
+    /// resource. The next callback can itself contain a finish marker, so its
+    /// bytes are already JSON-encoded, so their entire source length bounds
+    /// the encoded form of all strings decoded from that callback.
+    /// Existing large text and arguments use incremental escaped counts instead
+    /// of being serialized again for every small provider fragment.
+    pub(super) fn terminal_wire_bytes(&self, incoming_bytes: usize, retained_bytes: usize) -> Option<usize> {
+        let mut semantic_raw = 0_usize;
+        let mut semantic_escaped = 0_usize;
+        if let Some(message) = &self.message {
+            semantic_raw = message.text.len().checked_add(message.refusal.len())?;
+            semantic_escaped = message
+                .text_escaped_bytes?
+                .checked_add(message.refusal_escaped_bytes?)?;
+        }
+        for call in &self.tool_calls {
+            semantic_raw = semantic_raw.checked_add(call.arguments.len())?;
+            semantic_escaped = semantic_escaped.checked_add(call.arguments_escaped_bytes?)?;
+        }
+        // IDs, names, metadata, logprobs, and an incomplete frame are also
+        // provider-controlled. Six encoded bytes per raw byte covers JSON's
+        // longest single-byte escape (\\u00XX).
+        retained_bytes
+            .checked_sub(semantic_raw)?
+            .checked_mul(6)?
+            .checked_add(semantic_escaped)?
+            .checked_add(incoming_bytes)
+    }
+
+    /// Cache stable echo sizes once, avoiding a full request serialization on
+    /// every provider SSE chunk.
+    pub(super) fn set_echo_projection(
+        &mut self,
+        request_body: &Value,
+        tools: &[Value],
+        original_tool_choice: Option<&Value>,
+    ) {
+        let choice = original_tool_choice.map_or(Some(0), retained_json_bytes);
+        self.echo_projection = retained_json_bytes(request_body)
+            .zip(retained_json_bytes(tools))
+            .zip(choice)
+            .map(|((request, tools), choice)| (request, tools, choice));
+    }
+
+    /// Stable request/tool echo sizes for terminal construction preflight.
+    pub(super) const fn echo_projection(&self) -> Option<(usize, usize, usize)> {
+        self.echo_projection
+    }
+
+    /// Cache the stable shared-state charge once per provider stream.
+    pub(super) fn shared_stable_bytes(&mut self, state: &ResponsesState, limit: usize) -> Option<usize> {
+        if self.shared_stable_bytes.is_none() {
+            self.shared_stable_bytes = state
+                .stream_stable_payload_bytes_bounded(limit)
+                .and_then(|bytes| bytes.checked_add(retained_json_values_bytes(&state.accumulated_output)?))
+                .filter(|bytes| *bytes <= limit);
+        }
+        self.shared_stable_bytes
+    }
+
     /// Create a converter for a streaming response.
     pub(super) fn new(response_id: String, created_at: u64, limits: StreamLimits) -> Self {
         Self {
@@ -384,6 +499,8 @@ impl StreamConverter {
             tool_calls: Vec::new(),
             accumulated_bytes: 0,
             frames_processed: 0,
+            echo_projection: None,
+            shared_stable_bytes: None,
         }
     }
 
@@ -744,6 +861,7 @@ impl StreamConverter {
         clippy::expect_used,
         reason = "message item and text content part were just ensured above; their absence is an unreachable state-machine invariant"
     )]
+    #[expect(clippy::too_many_lines, reason = "one bounded text/logprob delta transition")]
     fn process_text_delta(
         &mut self,
         delta: &str,
@@ -765,6 +883,18 @@ impl StreamConverter {
         }
         if let (Some(message), Value::Array(items)) = (self.message.as_mut(), &delta_logprobs) {
             message.text.push_str(delta);
+            message.text_escaped_bytes = message
+                .text_escaped_bytes
+                .and_then(|bytes| bytes.checked_add(json_escaped_fragment_bytes(delta)?));
+            if !items.is_empty() {
+                let separator = usize::from(!message.logprobs.is_empty());
+                message.logprobs_bytes = message.logprobs_bytes.and_then(|used| {
+                    retained_json_bytes(&delta_logprobs)?
+                        .checked_sub(2)?
+                        .checked_add(separator)?
+                        .checked_add(used)
+                });
+            }
             message.logprobs.extend(items.iter().cloned());
         }
         let message = self.message.as_ref().expect("message ensured");
@@ -799,6 +929,9 @@ impl StreamConverter {
         self.ensure_refusal_part(out)?;
         if let Some(message) = self.message.as_mut() {
             message.refusal.push_str(delta);
+            message.refusal_escaped_bytes = message
+                .refusal_escaped_bytes
+                .and_then(|bytes| bytes.checked_add(json_escaped_fragment_bytes(delta)?));
         }
         let message = self.message.as_ref().expect("message ensured");
         emit_event(
@@ -963,6 +1096,10 @@ impl StreamConverter {
             }
             self.charge_tool_arguments(position, arguments.len())?;
             self.tool_calls[position].arguments.push_str(arguments);
+            let call = &mut self.tool_calls[position];
+            call.arguments_escaped_bytes = call
+                .arguments_escaped_bytes
+                .and_then(|bytes| bytes.checked_add(json_escaped_fragment_bytes(arguments)?));
             if is_web_search {
                 return Ok(());
             }
@@ -1760,6 +1897,11 @@ fn logprobs_byte_cost(logprobs: &Value) -> usize {
         Value::Array(items) if !items.is_empty() => serde_json::to_vec(logprobs).map_or(0, |bytes| bytes.len()),
         _ => 0,
     }
+}
+
+/// JSON string content size without the two surrounding quotes.
+fn json_escaped_fragment_bytes(fragment: &str) -> Option<usize> {
+    retained_json_bytes(fragment)?.checked_sub(2)
 }
 
 /// Build a filter error for an internal serialization failure.
