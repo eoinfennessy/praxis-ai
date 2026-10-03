@@ -344,6 +344,8 @@ pub(crate) struct ResponsesState {
     pub(crate) retained_external_payload_bytes: usize,
     /// Parser payload published by `openai_stream_events` for other filters.
     pub(crate) retained_stream_parser_bytes: usize,
+    /// Incomplete SSE frame held by the outer rehydration response rewrite.
+    pub(crate) retained_rehydrate_stream_bytes: usize,
     /// Semantic and framing payload published by the Chat stream translator.
     pub(crate) retained_chat_converter_bytes: usize,
 
@@ -906,6 +908,7 @@ impl Default for ResponsesState {
             retained_payload_limit: None,
             retained_external_payload_bytes: 0,
             retained_stream_parser_bytes: 0,
+            retained_rehydrate_stream_bytes: 0,
             retained_chat_converter_bytes: 0,
             retained_payload_failed: false,
             citation_files: HashMap::new(),
@@ -1067,6 +1070,13 @@ impl ResponsesState {
         self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, false, true)
     }
 
+    /// Rehydration runs after the stream parser and can see new canonical output
+    /// between chunks; count both while reusing only stable request/history bytes.
+    #[cfg(feature = "store")]
+    pub(crate) fn rehydrate_stream_changing_payload_bytes_bounded(&self, max_bytes: usize) -> Option<usize> {
+        self.retained_payload_bytes_bounded_inner(max_bytes, true, true, false, true, true)
+    }
+
     /// The response store caches request/history and prior output while
     /// capturing replay chunks, but must still count all changing owners,
     /// including the parser charge published by `openai_stream_events`.
@@ -1113,6 +1123,7 @@ impl ResponsesState {
         let mut meter = PayloadMeter::new(max_bytes);
         if include_external {
             meter.raw(self.retained_external_payload_bytes)?;
+            meter.raw(self.retained_rehydrate_stream_bytes)?;
         }
         if include_stream_parser {
             meter.raw(self.retained_stream_parser_bytes)?;
@@ -1338,6 +1349,7 @@ impl ResponsesState {
         self.locally_executed_output_items.clear();
         self.provider_streamed_terminal_ids.clear();
         self.provider_compaction_ids.clear();
+        self.retained_rehydrate_stream_bytes = 0;
         self.dispatch_failure = None;
     }
 
