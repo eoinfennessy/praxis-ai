@@ -198,6 +198,7 @@ use super::{
         ensure_public_output_item_ids_in_response, has_file_search_tool, is_file_search_function_call,
         is_pending_file_search_call, translate_function_calls_to_file_search,
     },
+    is_responses_create,
     state::{
         DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
         current_round_file_search_admissions, tool_search_discovery_is_within_budget,
@@ -358,7 +359,8 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        if is_responses_create(&ctx.request.method, ctx.request.uri.path())
+            && ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
             && ctx
                 .extensions
                 .get::<ResponsesState>()

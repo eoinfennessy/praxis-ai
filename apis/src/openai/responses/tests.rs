@@ -8,6 +8,7 @@ use bytes::Bytes;
 use super::*;
 
 #[test]
+#[cfg(feature = "openai-responses")]
 fn budgeted_plain_request_rejects_nested_optional_values() {
     let mut request = serde_json::json!({
         "model": "test",

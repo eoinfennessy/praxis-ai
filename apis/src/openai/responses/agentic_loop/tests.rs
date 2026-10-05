@@ -66,6 +66,17 @@ async fn budgeted_loop_rejects_missing_initializer_before_dispatch() {
     assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
 }
 
+#[tokio::test]
+async fn budgeted_loop_leaves_non_create_requests_alone() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions
+        .insert(super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
 #[test]
 fn budgeted_buffered_output_rejects_before_json_parse() {
     let filter = make_filter();
