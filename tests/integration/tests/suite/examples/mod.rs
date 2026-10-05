@@ -85,6 +85,8 @@ mod openai_responses_proxy;
 mod openai_responses_validate;
 #[cfg(all(feature = "store-sqlite", feature = "openai-file-resolve-filter"))]
 mod openai_retained_file_resolve;
+#[cfg(feature = "store-sqlite")]
+mod openai_retained_stream;
 // The state-ownership example selects the SQLite store backend.
 #[cfg(feature = "store-sqlite")]
 mod openai_state_ownership;
