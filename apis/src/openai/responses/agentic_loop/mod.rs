@@ -207,12 +207,12 @@ use super::{
     arm_agentic_stream_guard, enforce_agentic_stream_guard,
     error::responses_error_rejection,
     file_search_callout::{
-        ensure_public_output_item_ids_in_response, has_file_search_tool, is_file_search_function_call,
-        is_pending_file_search_call, translate_function_calls_to_file_search,
+        ensure_public_output_item_ids_in_response, has_file_search_tool, is_pending_file_search_call,
+        translate_function_calls_to_file_search,
     },
     is_responses_create,
     state::{
-        DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
+        DispatchFailure, FileSearchAssignment, McpApprovalState, OutputAssignment, ResponsesState, SynthesisKind,
         current_round_file_search_admissions, tool_search_discovery_is_within_budget,
     },
     stream_events::{encode_local_completion, encode_local_error},
@@ -534,7 +534,7 @@ impl HttpFilter for AgenticLoopFilter {
 )]
 fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     if let Some(max_calls) = configured_web_max_calls(ctx)
-        && state.web_search_calls.len() > max_calls
+        && state.selected_web_search_calls().len() > max_calls
     {
         return Err(DispatchFailure {
             status: 502,
@@ -699,6 +699,8 @@ fn prepare_streamed_round(ctx: &mut HttpFilterContext<'_>, state: &mut Responses
     if !super::streamed_round_is_dispatchable(ctx, state) {
         collect_streaming_output_items(state);
         state.tool_calls.clear();
+        #[cfg(feature = "openai-mcp-tools")]
+        state.approved_tool_calls.clear();
         state.tool_search_calls.clear();
         state.web_search_calls.clear();
         // No dispatcher runs on a non-dispatchable (terminal) round, so drop the
@@ -721,6 +723,8 @@ fn end_stream_with_error(
     message: &str,
 ) -> Result<(), FilterError> {
     state.tool_calls.clear();
+    #[cfg(feature = "openai-mcp-tools")]
+    state.approved_tool_calls.clear();
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
     state.file_search_assignments.clear();
@@ -853,7 +857,9 @@ fn request_is_streaming(state: &ResponsesState) -> bool {
 /// resolves to no dispatcher, so a round carrying only client calls must
 /// terminate as `done` rather than loop uselessly to the `max_infer_iters` cap.
 fn has_dispatchable_calls(state: &ResponsesState) -> bool {
-    !state.web_search_calls.is_empty() || !state.file_search_assignments.is_empty() || has_dispatchable_mcp_work(state)
+    !state.selected_web_search_calls().is_empty()
+        || !state.file_search_assignments.is_empty()
+        || has_dispatchable_mcp_work(state)
 }
 
 /// Whether deferred MCP discovery is pending or a recorded call resolves to a
@@ -863,12 +869,12 @@ fn has_dispatchable_mcp_work(state: &ResponsesState) -> bool {
     if has_pending_deferred_discovery(state) {
         return true;
     }
-    if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
+    if state.selected_tool_calls().is_empty() || state.mcp_tool_map.is_empty() {
         return false;
     }
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     state
-        .tool_calls
+        .selected_tool_calls()
         .iter()
         .any(|call| classify_mcp(call, &tool_index) != McpDisposition::NotMcp)
 }
@@ -934,31 +940,45 @@ fn mark_over_budget_tool_searches_incomplete(state: &mut ResponsesState) {
     if state.tool_search_calls.is_empty() || tool_search_discovery_is_within_budget(state) {
         return;
     }
-    let queued_ids: Vec<String> = state
-        .tool_search_calls
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
-        .collect();
-    let mark_unidentified = queued_ids.is_empty();
-    let mark = |item: &mut Value| {
-        if item.get("type").and_then(Value::as_str) != Some("tool_search_call") {
-            return;
+    let round_start = state.current_round_output_start.unwrap_or(0);
+    let mut pending = std::collections::HashMap::<String, usize>::new();
+    for assignment in &state.tool_search_calls {
+        if assignment
+            .resolve(&state.accumulated_output, round_start, "tool_search_call")
+            .is_none()
+        {
+            continue;
         }
-        let matches = match item.get("id").and_then(Value::as_str) {
-            Some(id) => queued_ids.iter().any(|queued| queued == id),
-            None => mark_unidentified,
-        };
-        if matches && let Some(obj) = item.as_object_mut() {
+        if let Some(item) = state.accumulated_output.get_mut(assignment.output_index)
+            && let Some(obj) = item.as_object_mut()
+        {
             obj.insert("status".to_owned(), json!("incomplete"));
+            *pending.entry(assignment.item_id.clone()).or_default() += 1;
         }
-    };
-    for item in &mut state.accumulated_output {
-        mark(item);
     }
-    for item in &mut state.persisted_messages {
-        mark(item);
-    }
+    mark_persisted_tool_searches_incomplete(&mut state.persisted_messages, &mut pending);
     state.tool_search_calls.clear();
+}
+
+/// Match the most recent persisted occurrence of each current-round search ID.
+fn mark_persisted_tool_searches_incomplete(
+    messages: &mut [Value],
+    pending: &mut std::collections::HashMap<String, usize>,
+) {
+    for item in messages.iter_mut().rev() {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(count) = pending.get_mut(id) else {
+            continue;
+        };
+        if *count > 0 && item.get("type").and_then(Value::as_str) == Some("tool_search_call") {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert("status".to_owned(), json!("incomplete"));
+            }
+            *count -= 1;
+        }
+    }
 }
 
 /// Remove representation metadata after replacing a buffered response body.
@@ -1065,7 +1085,7 @@ pub(crate) fn plain_text_output_item(item: &Value) -> bool {
 /// without sending the latter back to inference as an unresolved call, so fail
 /// before any external side effect.
 fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
-    let has_server = !state.web_search_calls.is_empty()
+    let has_server = !state.selected_web_search_calls().is_empty()
         || !state.file_search_assignments.is_empty()
         || has_hosted_queued_tool_search(state);
     // Scan this round's items in `accumulated_output` rather than
@@ -1082,7 +1102,7 @@ fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
         .unwrap_or_default()
         .iter()
         .any(super::state::is_client_executed_tool_call);
-    if state.tool_calls.is_empty() {
+    if state.selected_tool_calls().is_empty() {
         return has_server && has_client;
     }
     if state.mcp_tool_map.is_empty() {
@@ -1100,7 +1120,7 @@ fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
     let mut has_server = false;
     let mut has_client = false;
-    for call in &state.tool_calls {
+    for call in state.selected_tool_calls() {
         let is_mcp = call
             .get("name")
             .and_then(Value::as_str)
@@ -1114,7 +1134,7 @@ fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
 /// Without MCP tool support every function call is client-owned.
 #[cfg(not(feature = "openai-mcp-tools"))]
 fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
-    (false, !state.tool_calls.is_empty())
+    (false, !state.selected_tool_calls().is_empty())
 }
 
 /// Distribute output items from a parsed response into the accumulator and state vectors.
@@ -1138,7 +1158,9 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") if is_dispatchable_function_call(&item) => {
-                state.tool_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.tool_calls.push(assignment);
+                }
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
@@ -1165,14 +1187,18 @@ fn collect_output_items(response: &mut Value, state: &mut ResponsesState, privat
                 // openai_web_search dispatch consumes `web_search_calls` and
                 // appends a backend-valid function_call/function_call_output
                 // bridge for the next inference step.
-                state.web_search_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.web_search_calls.push(assignment);
+                }
                 state.persisted_messages.push(item.clone());
             },
             Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
                 // Only a completed hosted search may trigger deferred
                 // `tools/list`. Client-executed searches return to the caller
                 // without listing or another inference round.
-                state.tool_search_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.tool_search_calls.push(assignment);
+                }
                 state.persisted_messages.push(item.clone());
             },
             Some("tool_search_call") if is_completed_output_item(&item) => {
@@ -1232,6 +1258,13 @@ fn record_file_search_assignments(state: &mut ResponsesState, pending: Vec<(usiz
         .into_iter()
         .map(|(output_index, synthesis)| FileSearchAssignment {
             output_index,
+            item_id: state
+                .accumulated_output
+                .get(output_index)
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             synthesis,
         })
         .collect::<Vec<_>>();
@@ -1280,17 +1313,9 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
     } else {
         Vec::new()
     };
-    // `openai_stream_events` built `tool_calls` from the raw streamed round
-    // before normalization, so any private `function_call(name=file_search)` is
-    // still present there as a client-looking call. It is now a
-    // `file_search_call` in `response_object`/`accumulated_output`, so drop it
-    // from `tool_calls` to mirror the buffered path, where `collect_output_items`
-    // builds `tool_calls` from the already-normalized response. Otherwise
-    // `has_mixed_function_call_ownership` misreads a pure file-search round (no
-    // MCP tool map, a recorded assignment) as mixed client/server ownership.
-    if !private_indices.is_empty() {
-        state.tool_calls.retain(|call| !is_file_search_function_call(call));
-    }
+    // The stream accumulator owns the response tree until this round is
+    // complete. Build dispatch selections only after normalization and move.
+    state.tool_calls.clear();
     // Stamp stable synthetic IDs on any id-less streamed items before draining the
     // round into the accumulator (issue #955), mirroring the buffered path.
     ensure_public_output_item_ids_in_response(&mut state.response_object);
@@ -1303,7 +1328,17 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
     for (round_index, item) in round.into_iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call" | "reasoning") => {
+            Some("function_call") => {
+                if is_dispatchable_function_call(&item)
+                    && let Some(assignment) = OutputAssignment::new(absolute_index, &item)
+                {
+                    state.tool_calls.push(assignment);
+                }
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item.clone());
+                state.accumulated_output.push(item);
+            },
+            Some("reasoning") => {
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
                 state.accumulated_output.push(item);
@@ -1327,7 +1362,9 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // enter `messages`. The openai_web_search dispatch consumes
                 // `web_search_calls` and appends a backend-valid
                 // function_call/function_call_output bridge for the next round.
-                state.web_search_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.web_search_calls.push(assignment);
+                }
                 state.persisted_messages.push(item.clone());
                 state.accumulated_output.push(item);
             },
@@ -1360,7 +1397,9 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
                 // `tool_search_call` is not a valid OpenResponses input item, so
                 // it must not enter `messages`. `openai_mcp_dispatch` consumes
                 // `tool_search_calls` to list deferred connectors.
-                state.tool_search_calls.push(item.clone());
+                if let Some(assignment) = OutputAssignment::new(absolute_index, &item) {
+                    state.tool_search_calls.push(assignment);
+                }
                 state.accumulated_output.push(item.clone());
                 state.persisted_messages.push(item);
             },
@@ -1413,6 +1452,8 @@ fn is_responses_api_output(response: &Value) -> bool {
 /// Drop this round's dispatcher queues so a terminal outcome cannot re-dispatch.
 fn clear_round_dispatch_state(state: &mut ResponsesState) {
     state.tool_calls.clear();
+    #[cfg(feature = "openai-mcp-tools")]
+    state.approved_tool_calls.clear();
     state.web_search_calls.clear();
     state.tool_search_calls.clear();
     state.file_search_assignments.clear();
@@ -1420,10 +1461,7 @@ fn clear_round_dispatch_state(state: &mut ResponsesState) {
 
 /// Whether a hosted `tool_search_call` is queued for deferred connector listing.
 fn has_hosted_queued_tool_search(state: &ResponsesState) -> bool {
-    state
-        .tool_search_calls
-        .iter()
-        .any(|item| !super::state::is_client_executed_tool_call(item))
+    !state.selected_tool_search_calls().is_empty()
 }
 
 // -----------------------------------------------------------------------------

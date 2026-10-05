@@ -49,7 +49,7 @@ use crate::{
             agentic_loop::plain_text_output_item,
             error::{responses_error_rejection, responses_error_sse_payload},
             openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
-            state::{EmittedItem, ResponsesState},
+            state::{ClientToolRestore, EmittedItem, ResponsesState},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
     },
@@ -820,14 +820,6 @@ fn budgeted_stream_event_supported(event: &ResponsesEvent) -> bool {
 /// contributes to shared state, and the budget bounds total accumulated memory even
 /// when every individual event stays within `max_buffer_bytes`.
 ///
-/// The one accumulator whose growth is *not* bounded by the driving frame is the
-/// `tool_calls` list: a `function_call_arguments.done` clones the whole retained
-/// output item (whose payload arrived in an earlier frame) rather than the small
-/// `done` frame. That clone is charged in phase 2 ([`commit_chunk_events`]), where
-/// it is actually performed and its size is known exactly, instead of being
-/// predicted here — so the byte budget cannot diverge from the item the commit
-/// retains, and no per-event history rescan is needed.
-///
 /// The running total lives in [`ResponsesState::stream_accumulated_bytes`], so it
 /// is charged once per request and survives the per-round re-arm: a multi-round
 /// stream cannot reset the counter between IRR rounds and accumulate unbounded
@@ -944,12 +936,8 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 /// Split into two passes so both retained-state budgets are validated before any
 /// delivery milestone is recorded:
 ///
-/// - Phase 2a accumulates every event into the retained output (`output_items`, `tool_calls`, `response_object`) — the
-///   only state the count derives from, and state no delivery milestone depends on. As it accumulates it charges the
-///   one byte-bearing growth the phase-1 frame charge cannot bound: the `tool_calls` clone a
-///   `function_call_arguments.done` makes of a whole retained output item (see [`charge_accumulation_budget`]). That
-///   clone is measured, not predicted, so the charge equals the item the commit actually retained and a `done` that
-///   re-clones a large item fails the chunk closed the instant the request-wide byte total exceeds the cap.
+/// - Phase 2a accumulates every event into the retained output (`output_items`, `response_object`) — the only state the
+///   count derives from, and state no delivery milestone depends on.
 /// - The count guard then runs against the grown output, *before* any delivery milestone is recorded. A chunk that
 ///   overflows the item cap therefore fails closed without leaving a committed local-tool milestone that EOS recovery
 ///   would trust for bytes the client never received (review finding: the former post-commit count check let an
@@ -958,8 +946,7 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 ///
 /// On a rejected chunk phase 2a has already grown the retained output past a cap, so
 /// the request-wide guards in [`accumulation_budget_exceeded`] stay sticky for every
-/// later chunk and round. The byte guard fails closed per event, so transient
-/// overshoot is bounded to the single clone that trips the cap. Phase 2b's only
+/// later chunk and round. Phase 2b's only
 /// fallible step, the client-tool restoration plan pass (see
 /// [`restore_and_append_chunk`]), runs before any byte is appended or milestone is
 /// recorded, so a malformed lowered lifecycle fails the chunk closed with nothing
@@ -970,9 +957,9 @@ fn commit_chunk_events(
     ctx: &mut HttpFilterContext<'_>,
     events: Vec<ResponsesEvent>,
 ) -> Result<Vec<u8>, SseParseError> {
-    // Phase 2a: accumulate every event and charge the retained-clone byte budget,
-    // capturing lowered client-tool completion artifacts for the restore plan.
-    let completions = accumulate_chunk(state, ctx, &events)?;
+    // Phase 2a: accumulate every event and capture lowered client-tool
+    // completion artifacts for the restore plan.
+    let completions = accumulate_chunk(state, ctx, &events);
 
     // The retained item count only exists after phase 2a grows it. Enforce it here,
     // before phase 2b records any delivery milestone, so a rejected chunk leaves no
@@ -999,46 +986,27 @@ fn commit_chunk_events(
 }
 
 /// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`,
-/// charge the retained-clone byte budget, and capture lowered client-tool
-/// completion artifacts for the phase-2b restore plan (#1159).
+/// and capture lowered client-tool completion artifacts for the phase-2b
+/// restore plan (#1159).
 ///
 /// Split out of [`commit_chunk_events`] so the per-event byte charge and the
-/// artifact capture stay under one owner. Fails closed the instant the request-wide
-/// accumulation byte total exceeds the cap (#556); the returned completions are the
-/// authoritative source the plan pass reads when synthesizing the `custom_tool_call`
-/// lifecycle.
+/// artifact capture stay under one owner. The returned completions are the
+/// authoritative source the plan pass reads when synthesizing the
+/// `custom_tool_call` lifecycle.
 fn accumulate_chunk(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     events: &[ResponsesEvent],
-) -> Result<Vec<client_tools::ClientToolCompletion>, SseParseError> {
+) -> Vec<client_tools::ClientToolCompletion> {
     let mut completions: Vec<client_tools::ClientToolCompletion> = Vec::new();
     for event in events {
-        let retained_clone_bytes = accumulate_event(ctx, state, event);
-        // A `function_call_arguments.done` clones a whole retained output item into
-        // `tool_calls` — the one accumulator whose growth the driving `done` frame
-        // does not bound. Charge that measured clone here, where it happens, and fail
-        // the chunk closed the instant the request-wide byte total exceeds the cap.
-        // Charging the actual clone (not a phase-1 prediction) is exact and
-        // O(clone size): it cannot diverge from the item the commit retained, and the
-        // per-event check bounds transient overshoot to a single clone.
-        if retained_clone_bytes > 0 {
-            let accumulated_bytes = {
-                let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
-                responses.stream_accumulated_bytes =
-                    responses.stream_accumulated_bytes.saturating_add(retained_clone_bytes);
-                responses.stream_accumulated_bytes
-            };
-            if let Some(error) = accumulation_bytes_exceeded(state, accumulated_bytes) {
-                return Err(error);
-            }
-        }
+        accumulate_event(ctx, state, event);
         // Capture the just-completed lowered `function_call` item (now carrying its
         // final arguments in `ResponsesState`) so the plan pass can restore the
         // canonical `custom_tool_call` lifecycle without re-borrowing mutable state.
         capture_client_tool_completion(ctx, &mut completions, event);
     }
-    Ok(completions)
+    completions
 }
 
 /// Capture the completed lowered `function_call` item at
@@ -1047,8 +1015,8 @@ fn accumulate_chunk(
 /// Only fires when client-tool lowering is armed and the just-accumulated item's
 /// name is a lowering-map key, so native (non-lowered) traffic pays nothing. The
 /// completed item lives in [`ResponsesState::output_items`] after [`accumulate_event`]
-/// merged its arguments; the accumulator's own copy is moved into `tool_calls`, so
-/// the plan pass needs this owned snapshot to synthesize the restored lifecycle.
+/// merged its arguments; the plan pass needs this owned snapshot to synthesize
+/// the restored lifecycle.
 fn capture_client_tool_completion(
     ctx: &HttpFilterContext<'_>,
     completions: &mut Vec<client_tools::ClientToolCompletion>,
@@ -1066,20 +1034,26 @@ fn capture_client_tool_completion(
     let Some(item) = find_output_item(responses.output_items(), payload) else {
         return;
     };
-    let is_lowered = item
+    let restore = item
         .get("name")
         .and_then(Value::as_str)
-        .is_some_and(|name| responses.client_tool_lowering.contains_key(name));
-    if !is_lowered {
+        .and_then(|name| responses.client_tool_lowering.get(name))
+        .map(|lowered| lowered.restore);
+    // Namespace function calls only rename the arguments event; their restore
+    // plan never reads a completed-item snapshot.
+    if restore.is_none_or(|restore| restore == ClientToolRestore::Namespace) {
         return;
     }
     let Some(key) = tool_call_key(payload) else {
         return;
     };
-    // Necessary clone (AGENTS.md boundary): the accumulator moved its only owned copy
-    // of the completed item into `tool_calls`, so the plan pass needs an owned
-    // snapshot to restore the `custom_tool_call` lifecycle without re-borrowing the
-    // mutable `ResponsesState` (#1159).
+    // The restore planner uses the first artifact for a key. Repeated done
+    // events in one chunk must not retain another full payload per frame.
+    if completions.iter().any(|completion| completion.key == key) {
+        return;
+    }
+    // Necessary clone (AGENTS.md boundary): the restore plan needs an owned
+    // snapshot of this lowered call after releasing the shared state borrow.
     completions.push(client_tools::ClientToolCompletion {
         key,
         item: item.clone(),
@@ -2449,15 +2423,9 @@ fn canonicalize_logical_response(
     // stream — it stays empty, so fall back to the terminal event's own output
     // rather than clobber it with nothing. Mirrors `finalize_response_body`.
     let mut output = if state.accumulated_output.is_empty() {
-        if state.simple_budget.is_some() {
-            std::mem::take(state.output_items_mut())
-        } else {
-            state.output_items().to_vec()
-        }
-    } else if state.simple_budget.is_some() {
-        std::mem::take(&mut state.accumulated_output)
+        std::mem::take(state.output_items_mut())
     } else {
-        state.accumulated_output.clone()
+        std::mem::take(&mut state.accumulated_output)
     };
     // Rewrite file_search citation markers into typed annotations on the final
     // assistant message, mirroring the buffered `annotate_response` finalize

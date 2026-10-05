@@ -7896,11 +7896,12 @@ def _drain_response_stream(stream):
     """Consume a Responses SSE stream.
 
     Returns the ordered event types, every output item announced via
-    output_item.added/.done, and the terminal response status.
+    output_item.added/.done, and the terminal response status and output.
     """
     event_types = []
     output_items = []
     terminal_status = None
+    terminal_output = []
     for event in stream:
         event_types.append(event.type)
         if event.type in (
@@ -7910,7 +7911,8 @@ def _drain_response_stream(stream):
             output_items.append(event.item)
         if event.type in ("response.completed", "response.incomplete"):
             terminal_status = event.response.status
-    return event_types, output_items, terminal_status
+            terminal_output = event.response.output
+    return event_types, output_items, terminal_status, terminal_output
 
 
 class TestFileSearchStreamingVLLM:
@@ -7953,7 +7955,7 @@ class TestFileSearchStreamingVLLM:
             max_output_tokens=2048,
         )
 
-        event_types, output_items, terminal_status = _drain_response_stream(
+        event_types, output_items, terminal_status, terminal_output = _drain_response_stream(
             stream
         )
 
@@ -7977,6 +7979,14 @@ class TestFileSearchStreamingVLLM:
             "a hosted file_search_call item must be announced on the stream; "
             f"got event types: {event_types}"
         )
+        announced_ids = {item.id for item in file_search_items}
+        terminal_ids = {
+            item.id for item in terminal_output if item.type == "file_search_call"
+        }
+        assert terminal_ids == announced_ids, (
+            "the terminal output must retain each announced file-search ID; "
+            f"announced={announced_ids}, terminal={terminal_ids}"
+        )
         for item in file_search_items:
             assert item.status in ("searching", "completed", "incomplete"), (
                 "file_search_call status should be a known lifecycle state; "
@@ -7998,7 +8008,7 @@ class TestFileSearchStreamingVLLM:
             max_output_tokens=512,
         )
 
-        event_types, output_items, _status = _drain_response_stream(stream)
+        event_types, output_items, _status, _terminal_output = _drain_response_stream(stream)
 
         # The #756/#313 logical stream unifies the search round and the
         # terminal re-inference round into ONE client-visible envelope.

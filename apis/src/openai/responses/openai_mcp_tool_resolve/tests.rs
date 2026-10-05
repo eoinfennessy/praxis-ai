@@ -3873,6 +3873,15 @@ fn deferred_connector(
     }
 }
 
+fn select_deferred_discovery_search(state: &mut ResponsesState) {
+    // Production discovery only follows a selected search in the current
+    // canonical output. Keep direct resolver tests behind that same gate.
+    state.select_test_output(
+        "tool_search_call",
+        vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_discovery", "status": "completed"})],
+    );
+}
+
 #[tokio::test]
 async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpoint() {
     let (server_url, ct) = start_single_tool_mcp_server().await;
@@ -3883,22 +3892,28 @@ async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpo
         "allowed_tools": ["get_weather"],
         "require_approval": "never"
     });
-    let mut state = ResponsesState {
-        tools: vec![serde_json::json!({"type": "tool_search"}), deferred_tool.clone()],
-        request_body: serde_json::json!({
-            "model": "gpt-4o",
-            "tools": [
-                {"type": "tool_search"},
-                deferred_tool
-            ]
-        }),
-        deferred_mcp: vec![deferred_connector(
-            &server_url,
-            Some(serde_json::json!(["get_weather"])),
-            Some("Bearer secret".to_owned()),
-        )],
-        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            tools: vec![serde_json::json!({"type": "tool_search"}), deferred_tool.clone()],
+            request_body: serde_json::json!({
+                "model": "gpt-4o",
+                "tools": [
+                    {"type": "tool_search"},
+                    deferred_tool
+                ]
+            }),
+            deferred_mcp: vec![deferred_connector(
+                &server_url,
+                Some(serde_json::json!(["get_weather"])),
+                Some("Bearer secret".to_owned()),
+            )],
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "tool_search_call",
+            vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        );
+        state
     };
 
     discover_deferred_connectors(&mut state).await.unwrap();
@@ -3982,6 +3997,7 @@ async fn discover_deferred_connectors_applies_allowed_tools() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     discover_deferred_connectors(&mut state).await.unwrap();
     ct.cancel();
 
@@ -4005,6 +4021,7 @@ async fn discover_deferred_connectors_redacts_endpoint_on_error() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     let err = discover_deferred_connectors(&mut state)
         .await
         .expect_err("unreachable MCP endpoint should fail");
@@ -4037,6 +4054,7 @@ async fn discover_deferred_connectors_is_transactional_across_connectors() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     let err = discover_deferred_connectors(&mut state)
         .await
         .expect_err("second connector should fail closed");
@@ -4075,6 +4093,7 @@ async fn discover_deferred_connectors_rejects_name_collision() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     let err = discover_deferred_connectors(&mut state)
         .await
         .expect_err("colliding generated name should be rejected");
@@ -4110,6 +4129,7 @@ async fn discover_deferred_connectors_enforces_rewritten_body_cap() {
         ..ResponsesState::default()
     };
 
+    select_deferred_discovery_search(&mut state);
     let err = discover_deferred_connectors(&mut state)
         .await
         .expect_err("oversized expansion should be rejected");
@@ -4156,18 +4176,24 @@ fn has_pending_deferred_discovery_requires_tool_search_and_connectors() {
     assert!(!has_pending_deferred_discovery(&state));
     state.deferred_mcp = vec![deferred_connector("https://a.example.com/mcp", None, None)];
     assert!(!has_pending_deferred_discovery(&state));
-    state.tool_search_calls = vec![serde_json::json!({"type": "tool_search_call"})];
+    state.select_test_output(
+        "tool_search_call",
+        vec![serde_json::json!({"type": "tool_search_call"})],
+    );
     assert!(has_pending_deferred_discovery(&state));
 }
 
 #[test]
 fn has_pending_deferred_discovery_respects_exhausted_max_tool_calls() {
     let search = serde_json::json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
-    let mut state = ResponsesState {
-        deferred_mcp: vec![deferred_connector("https://a.example.com/mcp", None, None)],
-        tool_search_calls: vec![search.clone()],
-        max_tool_calls: Some(0),
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            deferred_mcp: vec![deferred_connector("https://a.example.com/mcp", None, None)],
+            max_tool_calls: Some(0),
+            ..ResponsesState::default()
+        };
+        state.select_test_output("tool_search_call", vec![search.clone()]);
+        state
     };
     assert!(
         !has_pending_deferred_discovery(&state),
@@ -4183,9 +4209,19 @@ fn has_pending_deferred_discovery_respects_exhausted_max_tool_calls() {
     let web = serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});
     state.accumulated_output = vec![web.clone(), search.clone()];
     state.response_object = serde_json::json!({"output": [web, search]});
+    state.tool_search_calls.clear();
+    state.select_test_output("tool_search_call", vec![state.accumulated_output[1].clone()]);
+    state.current_round_output_start = Some(0);
     assert!(
         !has_pending_deferred_discovery(&state),
         "an earlier current-round built-in call consumes the shared cap first"
+    );
+
+    state.max_tool_calls = None;
+    state.accumulated_output[1] = serde_json::json!({"type": "function_call", "id": "tsc_1"});
+    assert!(
+        !has_pending_deferred_discovery(&state),
+        "a stale tool-search index cannot authorize tools/list even without a call limit"
     );
 }
 
@@ -4195,11 +4231,17 @@ async fn discover_deferred_connectors_skips_tools_list_when_budget_exhausted() {
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
     drop(listener);
 
-    let mut state = ResponsesState {
-        deferred_mcp: vec![deferred_connector(&server_url, None, None)],
-        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
-        max_tool_calls: Some(0),
-        ..ResponsesState::default()
+    let mut state = {
+        let mut state = ResponsesState {
+            deferred_mcp: vec![deferred_connector(&server_url, None, None)],
+            max_tool_calls: Some(0),
+            ..ResponsesState::default()
+        };
+        state.select_test_output(
+            "tool_search_call",
+            vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        );
+        state
     };
 
     discover_deferred_connectors(&mut state).await.unwrap();

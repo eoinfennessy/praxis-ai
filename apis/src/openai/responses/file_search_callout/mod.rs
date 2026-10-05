@@ -369,6 +369,16 @@ impl FileSearchCalloutFilter {
         if assignments.is_empty() {
             return Ok(FilterAction::Continue);
         }
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+            && assignments.iter().any(|assignment| assignment.resolve(state).is_none())
+        {
+            state.dispatch_failure = Some(DispatchFailure {
+                status: 502,
+                code: "server_error",
+                message: "openai_file_search_callout: stale file-search assignment".to_owned(),
+            });
+            return Ok(FilterAction::Continue);
+        }
         let identity = match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
             Ok(identity) => identity,
             Err(CalloutContextMissing::Credential { slot }) => {
@@ -695,15 +705,33 @@ fn continuation_state_fits(
         &state.messages,
         &state.persisted_messages,
         &state.previous_tools,
-        &state.tool_calls,
         &state.tools,
-        &state.web_search_calls,
     ] {
         let Some(size) = bounded_json_size(values, max_bytes.saturating_sub(used)).ok().flatten() else {
             return false;
         };
         used = used.saturating_add(size);
     }
+    #[cfg(feature = "openai-mcp-tools")]
+    {
+        let Some(size) = bounded_json_size(&state.approved_tool_calls, max_bytes.saturating_sub(used))
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        used = used.saturating_add(size);
+    }
+    used = used.saturating_add(
+        state
+            .tool_calls
+            .iter()
+            .chain(&state.web_search_calls)
+            .chain(&state.tool_search_calls)
+            .fold(0_usize, |bytes, assignment| {
+                bytes.saturating_add(assignment.item_id.len())
+            }),
+    );
     for value in [
         state.context_management.as_ref(),
         state.conversation.as_ref(),
@@ -1003,7 +1031,7 @@ fn pending_calls_from_assignments(
     let mut calls = Vec::new();
     for assignment in assignments.iter().take(MAX_PENDING_CALLS) {
         let output_index = assignment.output_index;
-        let Some(item) = state.accumulated_output.get(output_index) else {
+        let Some(item) = assignment.resolve(state) else {
             continue;
         };
         let Some(query_values) = item.get("queries").and_then(Value::as_array) else {
@@ -1307,6 +1335,9 @@ fn terminalize_unplanned_pending_calls(
     for assignment in assignments {
         let output_index = assignment.output_index;
         if plan.calls.iter().any(|call| call.output_index == output_index) {
+            continue;
+        }
+        if assignment.resolve(state).is_none() {
             continue;
         }
         if let Some(object) = state
