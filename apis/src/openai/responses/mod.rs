@@ -77,12 +77,15 @@ pub(crate) mod usage;
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::{AgenticBudgetPolicy, AgenticLoopFilter};
 
-/// Preflight an agentic create body before the first JSON parser allocates.
+/// Preflight a budgeted Responses body before the first JSON parser allocates.
 /// The same listener policy applies to every reachable loop instance.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
     let policy = ctx.extensions.get::<AgenticBudgetPolicy>()?;
-    if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+    if !(is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        || (ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"))
+    {
         return None;
     }
     let admitted =
@@ -94,21 +97,6 @@ pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, byte
             "request body exceeds openai_agentic_loop.max_retained_bytes",
         ))
     })
-}
-
-/// Deny explicit compaction before a body hook can summarize or persist it.
-#[cfg(feature = "openai-responses")]
-pub(crate) fn budgeted_compaction_rejection(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
-    (ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
-        && ctx.request.method == http::Method::POST
-        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact")
-        .then(|| {
-            FilterAction::Reject(error::responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "compaction is not yet supported with openai_agentic_loop.max_retained_bytes",
-            ))
-        })
 }
 
 /// Admit buffered input whose independently owned copies and expansions have
@@ -502,10 +490,6 @@ impl HttpFilter for ResponsesFormatFilter {
         Ok(FilterAction::Continue)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "classifies one buffered request after the budget and compaction preflight"
-    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -522,9 +506,7 @@ impl HttpFilter for ResponsesFormatFilter {
         };
 
         #[cfg(feature = "openai-responses")]
-        if let Some(action) =
-            budgeted_compaction_rejection(ctx).or_else(|| initial_agentic_budget_rejection(ctx, bytes))
-        {
+        if let Some(action) = initial_agentic_budget_rejection(ctx, bytes) {
             return Ok(action);
         }
 

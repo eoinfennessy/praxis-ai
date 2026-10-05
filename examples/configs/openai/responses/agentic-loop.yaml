@@ -16,9 +16,10 @@
 # The retained-payload guardrail accepts buffered text, file, and image inputs
 # with or without Store persistence, finite Responses-to-Chat translation,
 # bounded previous_response_id or conversation restore, and conversation
-# append-back. File resolution and document extraction reserve their expanded
-# content when those filters are configured in the request path.
-# Tools, streaming, and compaction fail closed until their accounting lands
+# append-back, and explicit POST /v1/responses/compact with bounded Store and
+# summarization callouts. File resolution and document extraction reserve their
+# expanded content when those filters are configured in the request path.
+# Tools and streaming fail closed until their accounting lands
 # in this draft PR. The tool examples below document the intended pipeline but
 # currently return a Responses-formatted 400 before inference or dispatch.
 #
@@ -202,6 +203,12 @@ filter_chains:
         conversations_table: openai_conversations
 
       - filter: openai_responses_rehydrate
+
+      - filter: openai_responses_compact
+        allow_pre_security_callout: true
+        inference_url: "http://127.0.0.1:3001/v1/chat/completions"
+        allow_private_inference_url: true
+        default_model: gpt-4.1
 
       - filter: openai_mcp_tool_resolve
         connectors:
