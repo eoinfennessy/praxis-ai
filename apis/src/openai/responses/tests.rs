@@ -43,6 +43,8 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     assert!(!plain_agentic_request_supported(request.as_object().unwrap()));
     request["stream"] = serde_json::Value::Bool(false);
     assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+    request.as_object_mut().unwrap().remove("store");
+    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
 }
 
 #[tokio::test]

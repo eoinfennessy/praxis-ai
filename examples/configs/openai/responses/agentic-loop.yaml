@@ -13,10 +13,10 @@
 # Client-side function calls resolve to no dispatcher and are returned to the
 # client without looping.
 #
-# The first retained-payload guardrail accepts only buffered text creates with
-# explicit `store: false` and no tools or history. Streaming, persistence,
+# The retained-payload guardrail accepts buffered text creates with or without
+# Store persistence, but no tools or history. Streaming, restore,
 # compaction, and hosted/client tools fail closed until their accounting lands
-# in follow-up PRs. The tool examples below document the intended pipeline but
+# in this draft PR. The tool examples below document the intended pipeline but
 # currently return a Responses-formatted 400 before inference or dispatch.
 #
 # Configured `connector_id` values can be combined with `defer_loading: true`

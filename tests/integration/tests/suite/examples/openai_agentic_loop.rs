@@ -21,7 +21,7 @@ use std::{
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path,
-    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
+    free_port, http_get, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
     start_proxy,
 };
 
@@ -65,6 +65,72 @@ fn single_pass_completes_through_irr() {
         model_body.get("parallel_tool_calls").is_none(),
         "an omitted parallel_tool_calls field must remain omitted"
     );
+}
+
+#[test]
+fn retained_budget_persists_default_store_plain_response() {
+    let response = r#"{"id":"resp_stored_plain","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_stored_plain","content":[{"type":"output_text","text":"Hello"}]}]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_plain_store");
+    let config = load_approval_config(free_port(), model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi"}"#),
+    );
+    assert_eq!(
+        parse_status(&created),
+        200,
+        "default Store create must succeed: {created}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let id = body["id"].as_str().expect("created response id");
+
+    let (status, retrieved) = http_get(proxy.addr(), &format!("/v1/responses/{id}"), None);
+    assert_eq!(status, 200, "budgeted response must be stored: {retrieved}");
+    assert_eq!(model.requests().len(), 1, "retrieve must not run inference");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_budget_store_overflow_skips_persistence() {
+    let response = serde_json::json!({
+        "id": "resp_store_overflow",
+        "object": "response",
+        "created_at": 1_760_000_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type":"message","content":[{"type":"output_text","text":"x".repeat(200)}]}]
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_store_overflow");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_192, db.url());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi"}"#),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        502,
+        "over-budget Store output must fail before persistence: {raw}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "overflow must stop after the first inference"
+    );
+
+    let pool = sqlx::SqlitePool::connect(db.url())
+        .await
+        .expect("Store database should open");
+    let persisted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM openai_responses")
+        .fetch_one(&pool)
+        .await
+        .expect("Store table should be queryable");
+    assert_eq!(persisted, 0, "an over-budget response must not be stored");
+    pool.close().await;
 }
 
 #[test]
@@ -126,7 +192,6 @@ fn retained_budget_rejects_tools_and_streaming_before_inference() {
     for request_body in [
         r#"{"model":"gpt-4.1","input":"Hi","store":false,"stream":true}"#,
         r#"{"model":"gpt-4.1","input":"Hi","store":false,"tools":[{"type":"web_search_preview"}]}"#,
-        r#"{"model":"gpt-4.1","input":"Hi"}"#,
     ] {
         let raw = http_send(proxy.addr(), &json_post("/v1/responses", request_body));
         assert_eq!(parse_status(&raw), 400, "request: {request_body}");
@@ -7508,6 +7573,30 @@ fn load_agentic_config_with_budget(
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config")
+}
+
+fn load_agentic_config_with_budget_and_store(
+    proxy_port: u16,
+    model_port: u16,
+    max_retained_bytes: usize,
+    db_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let with_budget = original.replacen(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+        1,
+    );
+    assert_ne!(with_budget, original, "expected the example's retained-payload limit");
+    let with_store = with_budget.replace("sqlite://responses.db?mode=rwc", db_url);
+    let yaml = patch_yaml(
+        &with_store,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model_port)]),
+    );
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config with Store")
 }
 
 fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {

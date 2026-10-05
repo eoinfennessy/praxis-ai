@@ -100,14 +100,16 @@ pub(super) struct AgenticLoopConfig {
     /// Conservative request-wide retained-payload ceiling. Valid from 4 `KiB`
     /// through 256 `MiB`, defaults to a non-disableable 64 `MiB`, and uses the
     /// smallest limit when several loop instances are reachable. The first
-    /// guardrail slice admits buffered text Responses creates with explicit
-    /// `store: false` and no tools or history. Streaming, persistence, restore,
+    /// guardrail slice admits buffered text Responses creates with or without
+    /// Store persistence, but no tools or history. Streaming, restore,
     /// compaction, hosted tools, Chat translation, and request-expanding filters
-    /// reject before inference until their owners have precise accounting.
+    /// reject before inference until their owners have accounting.
     /// Initial payloads are conservatively charged at 32 times raw bytes plus
     /// a per-node reserve; cumulative buffered provider output is charged at
-    /// 64 times its wire bytes plus a larger per-node reserve. A loop-bearing
-    /// listener also clamps its raw request body limit to at most one
+    /// 64 times its wire bytes plus a larger per-node reserve. Store
+    /// persistence doubles those conservative charges for its independent
+    /// request input snapshot and response persistence projection. The listener
+    /// also clamps its raw request body limit to at most one
     /// thirty-second of this ceiling and its buffered IRR response limit to
     /// at most one eighth. These reserves can
     /// reject a request well below the configured ceiling. Initial budget

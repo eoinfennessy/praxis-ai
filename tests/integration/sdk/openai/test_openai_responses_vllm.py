@@ -5331,9 +5331,8 @@ class TestAgenticLoopVLLM:
         [
             {"stream": True, "store": False},
             {"store": False, "tools": [{"type": "web_search_preview"}]},
-            {},  # Omitted store defaults to persistence on the Responses API.
         ],
-        ids=["streaming", "hosted-tool", "default-store"],
+        ids=["streaming", "hosted-tool"],
     )
     def test_retained_budget_rejects_unsupported_sdk_requests(self, agentic_client, options):
         """The first budget slice rejects unmetered paths before inference."""
@@ -5346,6 +5345,12 @@ class TestAgenticLoopVLLM:
         assert "openai_agentic_loop.max_retained_bytes" in str(exc_info.value), (
             f"{options} must reject before inference until its payload owners are metered"
         )
+
+    def test_retained_budget_allows_default_store_for_plain_text(self, agentic_client):
+        """The default Store path persists a bounded plain text response."""
+        response = agentic_client.responses.create(model=VLLM_MODEL, input="Hello")
+        stored = agentic_client.responses.retrieve(response.id)
+        assert stored.id == response.id, "the bounded response must be retrievable"
 
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,

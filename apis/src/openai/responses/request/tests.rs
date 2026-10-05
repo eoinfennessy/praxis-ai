@@ -52,6 +52,25 @@ async fn budgeted_plain_create_initializes_shared_charge() {
 }
 
 #[tokio::test]
+async fn budgeted_create_accepts_default_store_with_shared_charge() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "default Store must remain available for plain creates"
+    );
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().simple_budget.is_some());
+}
+
+#[tokio::test]
 async fn budgeted_create_preserves_provider_owned_parameters() {
     let request = create_request();
     let mut ctx = make_filter_context(&request);
@@ -67,8 +86,14 @@ async fn budgeted_create_preserves_provider_owned_parameters() {
     });
     let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
 
-    let action = default_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Release), "provider parameters must reach the backend");
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "provider parameters must reach the backend"
+    );
     assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().request_body, original);
 }
 
@@ -108,7 +133,6 @@ async fn budgeted_create_rejects_unaccounted_owners() {
     let request = create_request();
     let filter = default_filter();
     for body in [
-        json!({"input":"hello"}),
         json!({"input":"hello","store":false,"stream":true}),
         json!({"input":"hello","store":false,"tools":[{"type":"web_search_preview"}]}),
         json!({"input":"hello","store":false,"previous_response_id":"resp_old"}),

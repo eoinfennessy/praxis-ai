@@ -133,26 +133,25 @@ pub(crate) fn plain_agentic_budget(
         return Err(FilterAction::Reject(error::responses_error_rejection(
             400,
             "invalid_request_error",
-            "openai_agentic_loop.max_retained_bytes currently supports only buffered text requests with store:false and no tools or history",
+            "openai_agentic_loop.max_retained_bytes currently supports only buffered text requests without tools or history",
         )));
     }
     let charge = agentic_loop::budget::input_charge(bytes).unwrap_or(usize::MAX);
-    agentic_loop::budget::SimpleBudget::new(policy.max_retained_bytes(), charge)
-        .map(Some)
-        .ok_or_else(|| {
-            FilterAction::Reject(error::responses_error_rejection(
-                413,
-                "invalid_request_error",
-                "request body exceeds openai_agentic_loop.max_retained_bytes",
-            ))
-        })
+    let will_store = object.get("store") != Some(&serde_json::Value::Bool(false));
+    let budget = agentic_loop::budget::SimpleBudget::new_with_store(policy.max_retained_bytes(), charge, will_store);
+    budget.map(Some).ok_or_else(|| {
+        FilterAction::Reject(error::responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request body exceeds openai_agentic_loop.max_retained_bytes",
+        ))
+    })
 }
 
 /// Keep owners with unbounded expansions out of the first budget slice.
 #[cfg(feature = "openai-responses")]
 fn plain_agentic_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     object.get("input").is_some_and(serde_json::Value::is_string)
-        && object.get("store") == Some(&serde_json::Value::Bool(false))
         && object.get("stream") != Some(&serde_json::Value::Bool(true))
         && !object.keys().any(|key| {
             matches!(

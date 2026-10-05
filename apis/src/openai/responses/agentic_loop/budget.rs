@@ -5,8 +5,9 @@
 //!
 //! All paths that retain payload outside this small set of owners are rejected
 //! before dispatch. These factors include the raw body, parsed JSON trees,
-//! canonical input copies, response normalization, and SSE framing. Follow-up
-//! owner patches can replace these coarse reserves with exact charges.
+//! canonical input copies, response normalization, Store persistence, and SSE
+//! framing. Follow-up owner patches can replace these coarse reserves with
+//! exact charges.
 
 /// Copies and parsing capacity held while classifying and validating input.
 pub(super) const INPUT_WIRE_MULTIPLIER: usize = 32;
@@ -27,22 +28,42 @@ pub(crate) struct SimpleBudget {
     limit: usize,
     /// Input charge retained throughout execution.
     input_charge: usize,
+    /// Additional allowance for the response Store's request input snapshot.
+    store_input_charge: usize,
     /// Conservative sum of provider payload charges from all rounds.
     output_charge: usize,
+    /// Separate allowance for Store's persisted response and history copies.
+    store_output_charge: usize,
+    /// Whether Store persists this create response and owns another output projection.
+    store_response: bool,
 }
 
 impl SimpleBudget {
     /// Admit a request after the allocation-free ingress scan.
+    #[cfg(test)]
     pub(crate) fn new(limit: usize, input_charge: usize) -> Option<Self> {
+        Self::new_with_store(limit, input_charge, false)
+    }
+
+    /// Admit a create that will retain Store input and response projections.
+    pub(crate) fn new_with_store(limit: usize, input_charge: usize, store_response: bool) -> Option<Self> {
+        let store_input_charge = if store_response { input_charge } else { 0 };
         // Core's response Vec may keep spare capacity alongside the live raw
         // body. Reserve three times its validated `limit / 8` transport cap.
-        if input_charge.checked_add(response_reserve(limit)?)? > limit {
+        if input_charge
+            .checked_add(store_input_charge)?
+            .checked_add(response_reserve(limit)?)?
+            > limit
+        {
             return None;
         }
         Some(Self {
             limit,
             input_charge,
+            store_input_charge,
             output_charge: 0,
+            store_output_charge: 0,
+            store_response,
         })
     }
 
@@ -54,11 +75,22 @@ impl SimpleBudget {
 
     /// Preflight one more provider chunk before any response parser sees it.
     pub(crate) fn admit_output(&mut self, bytes: &[u8]) -> bool {
-        let Some(next) = output_charge(bytes).and_then(|charge| self.output_charge.checked_add(charge)) else {
+        let Some(additional) = output_charge(bytes) else {
             return false;
         };
-        let Some(total) = next
-            .checked_add(self.input_charge)
+        let Some(next_output) = self.output_charge.checked_add(additional) else {
+            return false;
+        };
+        let Some(next_store) = self
+            .store_output_charge
+            .checked_add(if self.store_response { additional } else { 0 })
+        else {
+            return false;
+        };
+        let Some(total) = next_output
+            .checked_add(next_store)
+            .and_then(|charge| charge.checked_add(self.input_charge))
+            .and_then(|charge| charge.checked_add(self.store_input_charge))
             .and_then(|charge| charge.checked_add(response_reserve(self.limit)?))
         else {
             return false;
@@ -66,14 +98,17 @@ impl SimpleBudget {
         if total > self.limit {
             return false;
         }
-        self.output_charge = next;
+        self.output_charge = next_output;
+        self.store_output_charge = next_store;
         true
     }
 
     /// Return the current charge including the IRR transport reserve.
     fn charge(self) -> Option<usize> {
         self.output_charge
+            .checked_add(self.store_output_charge)?
             .checked_add(self.input_charge)?
+            .checked_add(self.store_input_charge)?
             .checked_add(response_reserve(self.limit)?)
     }
 }
@@ -155,6 +190,17 @@ mod tests {
         assert!(!budget.admit_output(&[b' '; 1]));
         assert!(budget.lower_limit(4_096));
         assert!(!budget.lower_limit(4_092));
+    }
+
+    #[test]
+    fn store_reserves_independent_input_and_output_projections() {
+        assert!(SimpleBudget::new(4_096, 1_500).is_some());
+        assert!(SimpleBudget::new_with_store(4_096, 1_500, true).is_none());
+
+        let mut plain = SimpleBudget::new(4_096, 100).unwrap();
+        let mut stored = SimpleBudget::new_with_store(4_096, 100, true).unwrap();
+        assert!(plain.admit_output(&[b' '; 37]));
+        assert!(!stored.admit_output(&[b' '; 37]));
     }
 
     #[test]
