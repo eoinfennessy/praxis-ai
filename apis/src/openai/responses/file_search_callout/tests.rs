@@ -1487,7 +1487,11 @@ async fn exhausted_file_response_allowance_stops_before_paid_fanout() {
 async fn request_budget_body_overflow_is_terminal_even_with_fail_open() {
     let server = MockServer::json(200, &json!({"data": [], "padding": "x".repeat(500_000)}));
     let filter = make_filter(server.port, "on_failure: open\n");
-    let mut state = one_pending_state(&["vs-a"]);
+    let store_ids: Vec<String> = (0..=MAX_CONCURRENT_SEARCHES)
+        .map(|index| format!("vs-{index}"))
+        .collect();
+    let store_refs: Vec<&str> = store_ids.iter().map(String::as_str).collect();
+    let mut state = one_pending_state(&store_refs);
     state.simple_budget = Some(SimpleBudget::new(8_388_608, 0).unwrap());
     let pending = state.accumulated_output[0].clone();
     let mut ctx = make_context(Some(state));
@@ -1497,6 +1501,19 @@ async fn request_budget_body_overflow_is_terminal_even_with_fail_open() {
     assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
     assert_eq!(state.accumulated_output[0], pending);
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    let requests = server.requests();
+    assert!(
+        !requests.is_empty(),
+        "the first bounded batch should reach the provider"
+    );
+    assert!(
+        requests.len() <= MAX_CONCURRENT_SEARCHES,
+        "retained-budget exhaustion must stop scheduling later batches"
+    );
+    assert!(
+        requests.iter().all(|request| !request.contains("/vs-8/search")),
+        "the next vector store must not run after budget exhaustion"
+    );
 }
 
 #[tokio::test]

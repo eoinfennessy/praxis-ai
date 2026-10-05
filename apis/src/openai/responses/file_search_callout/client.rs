@@ -661,6 +661,11 @@ impl FileSearchClient {
             }
 
             next_spec = next_spec.saturating_add(chunk_len);
+            // A request-wide retained limit is terminal regardless of the
+            // provider's fail-open policy. Do not start another paid batch.
+            if batch.retained_limit_exceeded {
+                break;
+            }
             if execution_started.elapsed() >= execution_timeout {
                 append_unprocessed_deadline_failures(&mut batch.failures, specs, next_spec);
                 deadline_recorded = true;
