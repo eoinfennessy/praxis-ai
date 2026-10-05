@@ -3,7 +3,7 @@
 
 //! Functional tests for the Responses-to-Chat Completions example config.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use praxis_test_utils::{
     Backend, StatefulCapturingBackend, TempSqlite, example_config_path, free_port, http_get, http_send, json_post,
@@ -370,6 +370,47 @@ fn responses_to_chat_completions_translates_streaming_sse() {
     let parsed: serde_json::Value = serde_json::from_str(data).expect("terminal event data should be JSON");
     assert_eq!(parsed["response"]["status"], "completed");
     assert_eq!(parsed["response"]["output"][0]["content"][0]["text"], "Hi");
+}
+
+#[test]
+fn retained_budget_ends_chat_stream_once_after_partial_frame_overflow() {
+    let chunks = vec![
+        "data: {\"id\":\"chatcmpl_budget\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n".to_owned(),
+        format!("data: {}", "x".repeat(256 * 1024)),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let backend = Backend::chunked(chunks)
+        .header("content-type", "text/event-stream")
+        .stall_after_first_chunk(Duration::from_millis(50))
+        .start_with_shutdown();
+    let (config, _db) =
+        load_budgeted_chat_config("budgeted_chat_stream_overflow", free_port(), backend.port(), 8_388_608);
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1-mini","input":"Hello","stream":true,"store":true}"#,
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "the first event commits SSE headers: {raw}");
+    let body = parse_body(&raw);
+    assert!(body.contains("event: response.created\n"), "{body}");
+    assert_eq!(body.matches("event: error\n").count(), 1, "{body}");
+    assert!(!body.contains("event: response.completed\n"), "{body}");
+    assert!(!body.contains("data: [DONE]"), "{body}");
+    assert!(!body.contains("chat.completion.chunk"), "{body}");
+    let created = body
+        .split("\n\n")
+        .find(|frame| frame.starts_with("event: response.created\n"))
+        .unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(created.lines().nth(1).unwrap().strip_prefix("data: ").unwrap()).unwrap();
+    let response_id = payload["response"]["id"].as_str().unwrap();
+    let (status, _) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    assert_eq!(status, 404, "failed stream must not be stored as success");
 }
 
 #[test]
