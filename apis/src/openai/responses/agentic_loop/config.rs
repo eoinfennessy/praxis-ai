@@ -101,14 +101,16 @@ pub(super) struct AgenticLoopConfig {
     /// through 256 `MiB`, defaults to a non-disableable 64 `MiB`, and uses the
     /// smallest limit when several loop instances are reachable. The first
     /// guardrail slice admits buffered text Responses creates with or without
-    /// Store persistence, but no tools or history. Streaming, restore,
-    /// compaction, hosted tools, Chat translation, and request-expanding filters
-    /// reject before inference until their owners have accounting.
+    /// Store persistence, including finite Responses-to-Chat translation, but
+    /// no tools or history. Streaming, restore, compaction, hosted tools, and
+    /// request-expanding filters reject until their owners have accounting.
     /// Initial payloads are conservatively charged at 32 times raw bytes plus
     /// a per-node reserve; cumulative buffered provider output is charged at
     /// 64 times its wire bytes plus a larger per-node reserve. Store
     /// persistence doubles those conservative charges for its independent
-    /// request input snapshot and response persistence projection. The listener
+    /// request input snapshot and response persistence projection. Finite Chat
+    /// translation reserves its additional request and response JSON owners
+    /// before allocating them. The listener
     /// also clamps its raw request body limit to at most one
     /// thirty-second of this ceiling and its buffered IRR response limit to
     /// at most one eighth. These reserves can

@@ -14,7 +14,8 @@
 # client without looping.
 #
 # The retained-payload guardrail accepts buffered text creates with or without
-# Store persistence, but no tools or history. Streaming, restore,
+# Store persistence, including finite Responses-to-Chat translation, but no
+# tools or history. Streaming, restore,
 # compaction, and hosted/client tools fail closed until their accounting lands
 # in this draft PR. The tool examples below document the intended pipeline but
 # currently return a Responses-formatted 400 before inference or dispatch.

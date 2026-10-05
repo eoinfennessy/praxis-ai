@@ -38,8 +38,9 @@ use self::{
     stream::{SnapshotInputs, StreamConverter},
 };
 use super::{
+    agentic_loop::{AgenticBudgetPolicy, budget::input_charge},
     body_limits::rewritten_body_too_large_rejection,
-    enforce_agentic_stream_guard,
+    bounded_json_size, enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
 };
@@ -71,6 +72,14 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 
 /// Marker for a streaming Chat Completions SSE response.
 const RESPONSE_TRANSFORM_STREAM: &str = "stream";
+
+/// Conservative allowance for the owned Chat request tree and its serialized body.
+const CHAT_REQUEST_SOURCE_MULTIPLIER: usize = 8;
+const CHAT_REQUEST_FIXED_RESERVE: usize = 4_096;
+const CHAT_REQUEST_OVERFLOW: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat request translation";
+const CHAT_RESPONSE_OVERFLOW: &str =
+    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat response translation";
 
 /// Translates canonical Responses create requests for a Chat Completions backend.
 ///
@@ -186,12 +195,18 @@ impl ResponsesToChatCompletionsFilter {
     /// Build and size-check the owned Chat Completions request body.
     fn translated_request_bytes(
         &self,
-        ctx: &HttpFilterContext<'_>,
+        ctx: &mut HttpFilterContext<'_>,
     ) -> Result<Result<Vec<u8>, SelectedUpstreamBodyOutcome>, FilterError> {
+        if !reserve_chat_request_source(ctx) {
+            return Ok(Err(chat_request_budget_rejection()));
+        }
         let translated = match translate_canonical_state(ctx, &self.config.reasoning) {
             Ok(value) => value,
             Err(outcome) => return Ok(Err(outcome)),
         };
+        if !reserve_chat_request_wire(ctx, &translated) {
+            return Ok(Err(chat_request_budget_rejection()));
+        }
         let serialized = serde_json::to_vec(&translated)
             .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
@@ -352,6 +367,87 @@ impl ResponsesToChatCompletionsFilter {
     }
 }
 
+/// Reserve the independently owned Chat tree before request translation builds it.
+/// The source consists of the canonical request plus enriched conversation turns;
+/// the fixed allowance covers the new map and message wrappers for a short input.
+fn reserve_chat_request_source(ctx: &mut HttpFilterContext<'_>) -> bool {
+    let charge = {
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return true;
+        };
+        if state.simple_budget.is_none() {
+            return true;
+        }
+        (|| {
+            bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
+                .ok()
+                .flatten()?
+                .checked_add(bounded_json_size(&state.messages, MAX_JSON_BODY_BYTES).ok().flatten()?)?
+                .checked_mul(CHAT_REQUEST_SOURCE_MULTIPLIER)?
+                .checked_add(CHAT_REQUEST_FIXED_RESERVE)
+        })()
+    };
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
+/// The translated tree is still live when its outbound wire Vec is allocated.
+fn reserve_chat_request_wire(ctx: &mut HttpFilterContext<'_>, translated: &serde_json::Value) -> bool {
+    if !ctx
+        .extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.simple_budget.is_some())
+    {
+        return true;
+    }
+    let charge = bounded_json_size(translated, MAX_JSON_BODY_BYTES)
+        .ok()
+        .flatten()
+        .and_then(|bytes| bytes.checked_mul(2));
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
+fn chat_request_budget_rejection() -> SelectedUpstreamBodyOutcome {
+    SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        CHAT_REQUEST_OVERFLOW,
+    ))
+}
+
+/// Reserve a parsed Chat tree and the derived Responses tree before JSON parse.
+/// The loop subsequently charges the translated Responses wire independently.
+fn reserve_finite_chat_response(ctx: &mut HttpFilterContext<'_>, body: &[u8]) -> bool {
+    let echo_charge = {
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return true;
+        };
+        if state.simple_budget.is_none() {
+            return true;
+        }
+        bounded_json_size(&state.request_body, MAX_JSON_BODY_BYTES)
+            .ok()
+            .flatten()
+            .and_then(|bytes| bytes.checked_mul(4))
+    };
+    let charge = echo_charge.and_then(|echo| input_charge(body)?.checked_add(echo));
+    charge.is_some_and(|charge| {
+        ctx.extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|state| state.simple_budget.as_mut())
+            .is_some_and(|budget| budget.reserve_additional_input(charge))
+    })
+}
+
 #[async_trait]
 impl HttpFilter for ResponsesToChatCompletionsFilter {
     fn name(&self) -> &'static str {
@@ -422,11 +518,17 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
 
         ctx.set_metadata(RESPONSE_TRANSFORM_KEY, transform);
         ctx.set_metadata(RESPONSE_STATUS_KEY, status.as_u16().to_string());
-        // Buffer the finite response up to the absolute ceiling; the
-        // pipeline's body_limits decides the real raw cap.
-        ctx.set_response_body_mode(BodyMode::StreamBuffer {
-            max_bytes: Some(MAX_JSON_BODY_BYTES),
-        });
+        // Cap core's raw response buffer before the body callback can preflight
+        // the Chat parse tree and translated Responses resource.
+        if let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() {
+            ctx.response_body_mode = BodyMode::StreamBuffer {
+                max_bytes: Some(policy.max_irr_response_bytes().min(MAX_JSON_BODY_BYTES)),
+            };
+        } else {
+            ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_JSON_BODY_BYTES),
+            });
+        }
         prepare_transformed_response_headers(ctx);
 
         Ok(FilterAction::Continue)
@@ -446,6 +548,17 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
             Some(_) => {
                 if end_of_stream {
+                    if ctx.get_metadata(RESPONSE_TRANSFORM_KEY) == Some(RESPONSE_TRANSFORM_SUCCESS)
+                        && !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default())
+                    {
+                        *body = None;
+                        ctx.set_metadata("responses.skip_persist", "true");
+                        return Ok(FilterAction::Reject(responses_error_rejection(
+                            502,
+                            "server_error",
+                            CHAT_RESPONSE_OVERFLOW,
+                        )));
+                    }
                     self.transform_finite_response(ctx, body)?;
                 }
                 Ok(FilterAction::Continue)
@@ -466,18 +579,6 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         if let Some(outcome) = request_disposition(ctx) {
             return Ok(outcome);
         }
-        if ctx
-            .extensions
-            .get::<ResponsesState>()
-            .is_some_and(|state| state.simple_budget.is_some())
-        {
-            return Ok(SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "Chat translation is not yet supported with openai_agentic_loop.max_retained_bytes",
-            )));
-        }
-
         let serialized = match self.translated_request_bytes(ctx)? {
             Ok(bytes) => bytes,
             Err(outcome) => return Ok(outcome),

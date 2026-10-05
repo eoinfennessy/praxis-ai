@@ -28,6 +28,77 @@ fn load_test_config(
     (config, db)
 }
 
+fn load_budgeted_chat_config(
+    test_name: &str,
+    listener_port: u16,
+    backend_port: u16,
+    max_retained_bytes: usize,
+) -> (praxis_core::config::Config, TempSqlite) {
+    let db = TempSqlite::new(test_name);
+    let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url()).replace(
+        "              - filter: responses_to_chat_completions",
+        &format!(
+            "              - filter: openai_agentic_loop\n                max_retained_bytes: {max_retained_bytes}\n              - filter: responses_to_chat_completions"
+        ),
+    );
+    let patched = patch_yaml(&yaml, listener_port, &HashMap::from([("127.0.0.1:3001", backend_port)]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("budgeted Chat config should parse");
+    (config, db)
+}
+
+#[test]
+fn retained_budget_preserves_buffered_chat_translation() {
+    let chat_response = serde_json::json!({
+        "id": "chatcmpl_budgeted",
+        "object": "chat.completion",
+        "model": "gpt-4.1-mini",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello from Chat."}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let (config, _db) = load_budgeted_chat_config("budgeted_chat_success", free_port(), backend.port(), 1_048_576);
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1-mini","input":"Hello","store":false}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "in-budget Chat translation must succeed: {raw}"
+    );
+    let translated: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(translated["output"][0]["content"][0]["text"], "Hello from Chat.");
+    assert_eq!(backend.requests().len(), 1);
+}
+
+#[test]
+fn retained_budget_rejects_chat_request_before_dispatch() {
+    let backend = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let (config, _db) = load_budgeted_chat_config("budgeted_chat_reject", free_port(), backend.port(), 8_192);
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1-mini","input":"Hello","store":false}"#,
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 413, "Chat translation budget must reject: {raw}");
+    assert!(
+        backend.requests().is_empty(),
+        "over-budget Chat request must not dispatch"
+    );
+}
+
 #[test]
 fn responses_to_chat_completions_translates_request_and_response() {
     let chat_response = serde_json::json!({

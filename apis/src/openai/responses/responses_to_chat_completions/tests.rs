@@ -14,9 +14,105 @@ use super::{
     ResponsesToChatCompletionsFilter, error::normalize_provider_error, reject_incompatible_reasoning,
 };
 use crate::openai::{
-    responses::state::ResponsesState,
+    responses::{
+        agentic_loop::{AgenticBudgetPolicy, budget::SimpleBudget},
+        state::ResponsesState,
+    },
     translation::reasoning::{ReasoningDialect, ReasoningOptions},
 };
+
+#[tokio::test]
+async fn budgeted_buffered_text_translates_with_shared_request_reservation() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
+    state.messages = vec![json!({"role":"user","content":"hello"})];
+    state.simple_budget = SimpleBudget::new_with_store(1_048_576, 2_000, false);
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello","store":false}"#));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(outbound["messages"][0]["content"], "hello");
+    assert_eq!(outbound["model"], "m");
+}
+
+#[tokio::test]
+async fn budgeted_chat_request_overflow_rejects_before_dispatch() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
+    state.messages = vec![json!({"role":"user","content":"hello"})];
+    state.simple_budget = SimpleBudget::new_with_store(4_096, 100, false);
+    context.extensions.insert(state);
+    let original = Bytes::from_static(br#"{"model":"m","input":"hello","store":false}"#);
+    let mut body = Some(original.clone());
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
+        panic!("translation must reject when its own request tree cannot be reserved");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_eq!(body.as_deref(), Some(original.as_ref()));
+    assert!(context.get_metadata(ARMED_KEY).is_none());
+}
+
+#[test]
+fn budgeted_chat_response_overflow_rejects_before_json_parse() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.set_metadata(RESPONSE_TRANSFORM_KEY, "success");
+    let mut state = ResponsesState::from_request_body(json!({"model":"m","input":"hello","store":false}));
+    state.simple_budget = SimpleBudget::new_with_store(65_536, 2_000, false);
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from(vec![b'x'; 5_000]));
+
+    let action = filter.on_response_body(&mut context, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("response must reject before parsing a body that exceeds its budget");
+    };
+    assert_eq!(rejection.status, 502);
+    assert!(body.is_none());
+    assert_eq!(context.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
+async fn budgeted_finite_chat_buffer_uses_listener_cap() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata(ARMED_KEY, "true");
+    context.extensions.insert(
+        AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 1048576").unwrap()).unwrap(),
+    );
+    context.response_header = Some(Box::leak(Box::new(crate::test_utils::make_response())));
+
+    let action = filter.on_response(&mut context).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(
+        context.response_body_mode,
+        BodyMode::StreamBuffer {
+            max_bytes: Some(131_072)
+        }
+    ));
+}
 
 #[test]
 fn default_config_parses() {
