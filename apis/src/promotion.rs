@@ -39,19 +39,6 @@ pub fn is_promotable_value(val: &str) -> bool {
     val.len() <= MAX_PROMOTED_VALUE_LEN && is_safe_promoted_value(val)
 }
 
-/// Return whether a value contains a byte disallowed in an HTTP header.
-/// A2A and MCP promotion use the same predicate as AI classification.
-#[must_use]
-pub fn contains_control_chars(val: &str) -> bool {
-    !is_safe_promoted_value(val)
-}
-
-/// Match HTTP header-value validation without allocating a `HeaderValue`.
-/// Praxis core keeps its equivalent predicate private as of 0.7.3.
-fn is_safe_promoted_value(val: &str) -> bool {
-    val.bytes().all(|byte| byte == b'\t' || (byte >= 0x20 && byte != 0x7F))
-}
-
 /// Namespaces that classification filters may overwrite when the call
 /// site does not pin a single dedicated header.
 const AI_FACT_PREFIXES: &[&str] = &["x-praxis-ai-", "x-praxis-responses-"];
@@ -331,26 +318,6 @@ mod tests {
     #[test]
     fn accepts_empty_string() {
         assert!(is_promotable_value(""), "empty string should be accepted");
-    }
-
-    #[test]
-    fn value_safety_matches_http_header_parsing() {
-        for byte in 0_u8..=127 {
-            let value = char::from(byte).to_string();
-            assert_eq!(
-                is_safe_promoted_value(&value),
-                http::HeaderValue::from_str(&value).is_ok(),
-                "ASCII byte 0x{byte:02x} must match HTTP header validation"
-            );
-            assert_eq!(contains_control_chars(&value), !is_safe_promoted_value(&value));
-        }
-        for value in ["caf\u{e9}", "\u{1f600}", "bad\rvalue", "bad\tvalue"] {
-            assert_eq!(
-                is_safe_promoted_value(value),
-                http::HeaderValue::from_str(value).is_ok(),
-                "{value:?} must match HTTP header validation"
-            );
-        }
     }
 
     #[test]

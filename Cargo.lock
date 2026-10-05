@@ -3858,9 +3858,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06f015b2b83fd515f687bb1fc6ba98e896064aac1faece462f69d646359bb486"
+checksum = "b6f402714db9ad19f8d7ab47b1dec83533412d0f3fd1b214a6d55606a66a8bfc"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -4141,7 +4141,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -4162,7 +4162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
