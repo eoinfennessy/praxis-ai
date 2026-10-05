@@ -752,6 +752,11 @@ pub(crate) struct ResponsesState {
     /// same id, or gaining `action.sources` after local execution).
     pub emitted_output_items: HashMap<String, EmittedItem>,
 
+    /// Last local SSE synthesis snapshot admitted for each absolute output index.
+    /// Rechecking the same pending item at chunk and round finalization must not
+    /// charge it twice; a changed item gets a fresh reservation before re-emission.
+    pub stream_synthesis_reserved: HashMap<usize, u64>,
+
     /// Item ids of local tool calls a dispatch filter actually executed this
     /// request (execution provenance), keyed by the output item's `id`.
     ///
@@ -1009,6 +1014,7 @@ impl Default for ResponsesState {
             accumulated_output: Vec::new(),
             stream_accumulated_bytes: 0,
             emitted_output_items: HashMap::new(),
+            stream_synthesis_reserved: HashMap::new(),
             locally_executed_output_items: HashSet::new(),
             pending_local_tool_synthesis: Vec::new(),
             provider_streamed_terminal_ids: BTreeSet::new(),

@@ -19,7 +19,7 @@
 # append-back, and explicit POST /v1/responses/compact with bounded Store and
 # summarization callouts. File resolution and document extraction reserve their
 # expanded content when those filters are configured in the request path.
-# Tools and streaming fail closed until their accounting lands
+# Tool requests remain gated until their dispatch accounting lands.
 # in this draft PR. The tool examples below document the intended pipeline but
 # currently return a Responses-formatted 400 before inference or dispatch.
 #
@@ -76,8 +76,7 @@
 #                    the allowed MCP-backed inference continuations).
 #
 # Streaming:
-#   Streamed requests currently fail closed. After the stream owner follow-up,
-#   each inference round will be streamed through the same
+#   Each streaming inference round is composed through the same
 #   downstream Responses SSE lifecycle. Intermediate response lifecycle
 #   events are normalized by openai_stream_events while MCP and web-search
 #   transitions resume inference after each upstream stream completes.

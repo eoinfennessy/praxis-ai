@@ -140,6 +140,21 @@ impl SimpleBudget {
         };
         self.additional_input_charge = next;
         true
+
+    /// Reserve the live item clones, event envelopes, and encoded SSE bytes
+    /// before a local tool lifecycle is synthesized. One item can appear in
+    /// opening, progress, done, and Store event-log owners at the same time.
+    pub(crate) fn admit_stream_synthesis(&mut self, item_bytes: usize, event_count: usize) -> bool {
+        let Some(factor) = 16_usize.checked_add(if self.store_response { 8 } else { 0 }) else {
+            return false;
+        };
+        let Some(charge) = item_bytes
+            .checked_mul(factor)
+            .and_then(|bytes| event_count.checked_mul(1_024)?.checked_add(bytes))
+        else {
+            return false;
+        };
+        self.reserve_additional_input(charge)
     }
 
     /// Preflight one more provider chunk before any response parser sees it.
@@ -256,8 +271,8 @@ impl SimpleBudget {
         true
     }
 
-    /// Reserve terminal output and Store copy capacity before cloning the
-    /// canonical output into `response_object` and the client-visible frame.
+    /// Reserve terminal wire encoding and Store copy capacity before the
+    /// accumulated output moves into the canonical response object.
     pub(crate) fn admit_stream_terminal(&mut self, serialized_output_bytes: usize) -> bool {
         let Some(output_delta) = serialized_output_bytes.checked_mul(4) else {
             return false;
@@ -452,6 +467,16 @@ mod tests {
         assert!(!budget.admit_stream_chunk(&[b'x'; 1_000]));
         assert_eq!(budget.charge(), accepted);
         assert!(budget.admit_stream_chunk(b"x"));
+    }
+
+    #[test]
+    fn local_sse_synthesis_admits_at_ceiling_and_fails_atomically_above_it() {
+        let mut budget = SimpleBudget::new(65_536, 0).unwrap();
+        assert_eq!(budget.remaining_bytes(), Some(40_960));
+        assert!(budget.admit_stream_synthesis(0, 40));
+        assert_eq!(budget.remaining_bytes(), Some(0));
+        assert!(!budget.admit_stream_synthesis(1, 0));
+        assert_eq!(budget.remaining_bytes(), Some(0));
     }
 
     #[test]

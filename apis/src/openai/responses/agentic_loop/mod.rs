@@ -131,9 +131,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState, PipelineExtension,
-    Rejection, RequestExtensions, SubRequestResponseMode, TrustedHeaderMutation, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, ClientResponseHeadersCommitted, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    IterationState, PipelineExtension, Rejection, RequestExtensions, SubRequestResponseMode, TrustedHeaderMutation,
+    body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
@@ -441,17 +441,16 @@ impl HttpFilter for AgenticLoopFilter {
             && !budget.lower_limit(self.config.max_retained_bytes.get())
         {
             let status = if state.iteration == 0 { 413 } else { 502 };
-            ctx.set_metadata("responses.skip_persist", "true");
-            set_action(ctx, ACTION_DONE)?;
-            return Ok(FilterAction::Reject(responses_error_rejection(
+            let failure = DispatchFailure {
                 status,
-                if status == 413 {
+                code: if status == 413 {
                     "invalid_request_error"
                 } else {
                     "server_error"
                 },
-                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
-            )));
+                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
+            };
+            return convert_dispatch_failure(ctx, state, &failure);
         }
 
         // A locally-detected security-context failure (missing/invalid per-user callout
@@ -659,17 +658,13 @@ fn convert_dispatch_failure(
 ) -> Result<FilterAction, FilterError> {
     // The loop terminates here; drop this round's dispatch bookkeeping.
     clear_round_dispatch_state(&mut state);
-    let streaming = request_is_streaming(&state);
-    if streaming {
-        // No `deferred_stream_done` here: a terminal SSE `error` frame is the stream
-        // terminator and is never followed by a `[DONE]` sentinel (see
-        // `encode_local_error`). Only skip persistence of the failed round.
-        ctx.set_metadata("responses.skip_persist", "true");
-    }
+    let streaming = request_is_streaming(&state) && ctx.extensions.get::<ClientResponseHeadersCommitted>().is_some();
+    ctx.set_metadata("responses.skip_persist", "true");
     ctx.extensions.insert(state);
     set_action(ctx, ACTION_DONE)?;
 
     if streaming {
+        // An error frame terminates the committed stream without [DONE].
         let body = encode_local_error(ctx, failure.code, &failure.message);
         let mut response = Rejection::status(200)
             .with_header("content-type", "text/event-stream")

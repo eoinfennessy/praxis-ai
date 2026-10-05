@@ -42,7 +42,7 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     assert!(budgeted_request_supported(request.as_object().unwrap()));
 
     request["stream"] = serde_json::Value::Bool(true);
-    assert!(!budgeted_request_supported(request.as_object().unwrap()));
+    assert!(budgeted_request_supported(request.as_object().unwrap()));
     request["stream"] = serde_json::Value::Bool(false);
     assert!(budgeted_request_supported(request.as_object().unwrap()));
     request.as_object_mut().unwrap().remove("store");

@@ -99,7 +99,7 @@ pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, byte
     })
 }
 
-/// Admit buffered input whose independently owned copies and expansions have
+/// Admit input whose independently owned copies and expansions have
 /// request-wide accounting. Remaining features stay gated in this draft.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn plain_agentic_budget(
@@ -140,7 +140,6 @@ pub(crate) fn plain_agentic_budget(
 #[cfg(feature = "openai-responses")]
 fn budgeted_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     budgeted_input_supported(object.get("input"))
-        && object.get("stream") != Some(&serde_json::Value::Bool(true))
         && !object.keys().any(|key| matches!(key.as_str(), "tools" | "tool_choice"))
 }
 

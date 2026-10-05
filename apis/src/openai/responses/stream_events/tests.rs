@@ -34,6 +34,145 @@ use crate::{
 };
 
 #[test]
+fn terminal_event_moves_response_payload_without_a_full_tree_clone() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let filter = make_filter_from("");
+    let mut parser = filter.new_round_state(0, 0);
+    let mut event = crate::openai::sse::responses::ResponsesEvent::ResponseCompleted(json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp_1",
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "x".repeat(256 * 1024)}]}]
+        }
+    }));
+    let original_text = event.payload()["response"]["output"][0]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .as_ptr();
+    let allocations = allocation_counter::measure(|| {
+        super::accumulate_event(&mut ctx, &mut parser, &mut event);
+    });
+    let response = &ctx.extensions.get::<ResponsesState>().unwrap().response_object;
+    assert_eq!(
+        response["output"][0]["content"][0]["text"].as_str().unwrap().as_ptr(),
+        original_text
+    );
+    assert_eq!(event.payload()["response"], serde_json::Value::Null);
+    assert!(
+        allocations.bytes_max < 128 * 1024,
+        "terminal accumulation retained another full payload: {allocations:?}"
+    );
+}
+
+#[test]
+fn borrowed_terminal_wire_avoids_full_response_clone() {
+    let response = json!({
+        "id": "resp_1",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "x".repeat(256 * 1024)}]}]
+    });
+    let metadata = json!({"type": "response.completed", "response": null, "sequence_number": 7});
+    let capacity = serde_json::to_vec(&response).unwrap().len() + 128;
+    let mut borrowed_wire = Vec::with_capacity(capacity);
+    let mut cloned_wire = Vec::with_capacity(capacity);
+    let borrowed = allocation_counter::measure(|| {
+        serde_json::to_writer(
+            &mut borrowed_wire,
+            &super::BorrowedTerminalPayload {
+                metadata: &metadata,
+                response: &response,
+            },
+        )
+        .unwrap();
+    });
+    let cloned = allocation_counter::measure(|| {
+        let mut payload = metadata.clone();
+        payload["response"] = response.clone();
+        serde_json::to_writer(&mut cloned_wire, &payload).unwrap();
+    });
+    assert_eq!(borrowed_wire, cloned_wire);
+    assert!(
+        borrowed.count_total < cloned.count_total,
+        "borrowed={borrowed:?}, cloned={cloned:?}"
+    );
+    assert!(
+        borrowed.bytes_max < cloned.bytes_max,
+        "borrowed={borrowed:?}, cloned={cloned:?}"
+    );
+}
+
+#[test]
+fn budgeted_local_synthesis_reserves_file_mcp_and_web_events() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState {
+        simple_budget: Some(SimpleBudget::new(262_144, 0).unwrap()),
+        ..ResponsesState::default()
+    };
+    for kind in ["file_search_call", "mcp_call", "web_search_call"] {
+        let id = format!("tool_{kind}");
+        state.locally_executed_output_items.insert(id.clone());
+        state.accumulated_output.push(json!({
+            "type": kind, "id": id, "status": "completed", "results": "x".repeat(1_000)
+        }));
+    }
+    state.pending_local_tool_synthesis.push((0, SynthesisKind::Native));
+    let before = state.simple_budget.unwrap().remaining_bytes();
+    ctx.extensions.insert(state);
+    assert!(super::reserve_local_synthesis(&mut ctx));
+    let after = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .simple_budget
+        .unwrap()
+        .remaining_bytes();
+    assert!(after < before, "local lifecycle owners must consume the shared budget");
+    assert!(super::reserve_local_synthesis(&mut ctx));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .simple_budget
+            .unwrap()
+            .remaining_bytes(),
+        after,
+        "rechecking the same pending items must not charge them twice"
+    );
+
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.accumulated_output[0]["results"] = json!("y".repeat(1_000));
+    assert!(super::reserve_local_synthesis(&mut ctx));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .simple_budget
+            .unwrap()
+            .remaining_bytes()
+            < after,
+        "a changed local item needs a new wire and Store reservation"
+    );
+
+    let state = ctx.extensions.get_mut::<ResponsesState>().unwrap();
+    state.simple_budget = Some(SimpleBudget::new(65_536, 0).unwrap());
+    state.stream_synthesis_reserved.clear();
+    let before = state.simple_budget.unwrap().remaining_bytes();
+    assert!(!super::reserve_local_synthesis(&mut ctx));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .simple_budget
+            .unwrap()
+            .remaining_bytes(),
+        before,
+        "rejected local synthesis must leave the charge unchanged"
+    );
+}
+
+#[test]
 fn repeated_lowered_done_retains_one_completion_snapshot_per_item() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -99,39 +238,54 @@ fn repeated_lowered_done_retains_one_completion_snapshot_per_item() {
 #[test]
 fn budgeted_stream_accepts_text_reasoning_and_refusal_but_rejects_tools() {
     use crate::openai::sse::responses::ResponsesEvent;
-    assert!(budgeted_stream_event_supported(&ResponsesEvent::OutputItemDone(
-        json!({
+    assert!(budgeted_stream_event_supported(
+        &ResponsesEvent::OutputItemDone(json!({
             "item": {"type": "reasoning", "summary": []}
-        })
-    )));
-    assert!(budgeted_stream_event_supported(&ResponsesEvent::OutputItemDone(
-        json!({
+        })),
+        false
+    ));
+    assert!(budgeted_stream_event_supported(
+        &ResponsesEvent::OutputItemDone(json!({
             "item": {"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}
-        })
-    )));
-    assert!(!budgeted_stream_event_supported(&ResponsesEvent::OutputItemAdded(
-        json!({
+        })),
+        false
+    ));
+    assert!(!budgeted_stream_event_supported(
+        &ResponsesEvent::OutputItemAdded(json!({
             "item": {"type": "function_call", "name": "run"}
-        })
-    )));
-    assert!(!budgeted_stream_event_supported(&ResponsesEvent::ResponseCompleted(
-        json!({
+        })),
+        false
+    ));
+    assert!(!budgeted_stream_event_supported(
+        &ResponsesEvent::ResponseCompleted(json!({
             "response": {"output": [{"type": "web_search_call"}]}
-        })
-    )));
+        })),
+        false
+    ));
     assert!(!budgeted_stream_event_supported(
         &ResponsesEvent::FunctionCallArgumentsDelta(json!({
             "delta": "{}"
-        }))
+        })),
+        false
     ));
-    assert!(budgeted_stream_event_supported(&ResponsesEvent::Unknown {
-        event_type: "response.provider_metadata".to_owned(),
-        data: json!({"type": "response.provider_metadata", "value": 1}),
-    }));
-    assert!(!budgeted_stream_event_supported(&ResponsesEvent::Unknown {
-        event_type: "response.web_search_call.in_progress".to_owned(),
-        data: json!({"type": "response.web_search_call.in_progress"}),
-    }));
+    assert!(budgeted_stream_event_supported(
+        &ResponsesEvent::Unknown {
+            event_type: "response.provider_metadata".to_owned(),
+            data: json!({"type": "response.provider_metadata", "value": 1}),
+        },
+        false
+    ));
+    assert!(!budgeted_stream_event_supported(
+        &ResponsesEvent::Unknown {
+            event_type: "response.web_search_call.in_progress".to_owned(),
+            data: json!({"type": "response.web_search_call.in_progress"}),
+        },
+        false
+    ));
+    assert!(budgeted_stream_event_supported(
+        &ResponsesEvent::FunctionCallArgumentsDelta(json!({"delta":"{}"})),
+        true,
+    ));
 }
 
 #[test]
@@ -190,6 +344,38 @@ fn retained_budget_overflow_poisoned_stream_emits_one_error_without_success() {
     assert_eq!(wire.matches("event: error").count(), 1, "{wire}");
     assert!(!wire.contains("response.completed"), "{wire}");
     assert!(!wire.contains("[DONE]"), "{wire}");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budgeted_argument_deltas_stop_before_growing_the_argument_buffer() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut response = ctx.extensions.remove::<ResponsesState>().unwrap_or_default();
+    response.simple_budget = Some(SimpleBudget::new(65_536, 0).unwrap());
+    response.request_body = json!({"stream":true,"tools":[{"type":"function","name":"run"}]});
+    ctx.extensions.insert(response);
+
+    let mut first = Some(make_sse_chunk(
+        "response.function_call_arguments.delta",
+        &json!({"item_id":"fc_1","output_index":0,"delta":"x".repeat(500)}),
+    ));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(first.is_some());
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>().unwrap().tool_call_args["item:fc_1"].len(),
+        500
+    );
+
+    let mut overflow = Some(make_sse_chunk(
+        "response.function_call_arguments.delta",
+        &json!({"item_id":"fc_1","output_index":0,"delta":"x".repeat(4_096)}),
+    ));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(overflow.is_none());
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>().unwrap().tool_call_args["item:fc_1"].len(),
+        500
+    );
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
@@ -261,14 +447,15 @@ fn budgeted_terminal_moves_accumulated_output_before_store_copy() {
         ..ResponsesState::default()
     };
     let prior_allocation = state.accumulated_output.as_ptr();
-    let (output, _) = canonicalize_logical_response(&mut state, false).unwrap();
+    canonicalize_logical_response(&mut state, false).unwrap();
+    let output = state.response_object["output"].as_array().unwrap();
     assert_eq!(
         output.as_ptr(),
         prior_allocation,
-        "the logical output should move into the terminal"
+        "the logical output should move into the canonical response"
     );
     assert!(state.accumulated_output.is_empty());
-    assert_eq!(state.response_object["output"], serde_json::Value::Array(output));
+    assert_eq!(output.len(), 1);
 }
 
 #[test]
@@ -284,6 +471,38 @@ fn budgeted_terminal_rejects_copy_before_growing_response_object() {
     let failure = canonicalize_logical_response(&mut state, false).unwrap_err();
     assert!(matches!(failure, SseParseError::RetainedPayloadLimitExceeded));
     assert_eq!(state.response_object["output"], json!([]));
+}
+
+#[test]
+fn streamed_citation_staging_obeys_exact_retained_budget_boundary() {
+    let output = vec![json!({
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "source <|file-known|>"}]
+    })];
+    let files = std::collections::HashMap::from([("file-known".to_owned(), "known.txt".to_owned())]);
+    let staging =
+        crate::openai::responses::file_search_callout::citations::annotation_staging_bytes(&output, &files).unwrap();
+    let terminal = serde_json::to_vec(&output).unwrap().len() * 4;
+    assert!(staging > 0);
+    for (extra, succeeds) in [(0, true), (1, false)] {
+        let mut budget = SimpleBudget::new(1_048_576, 0).unwrap();
+        let remaining = budget.remaining_bytes().unwrap();
+        assert!(budget.reserve_additional_input(remaining - terminal - staging + extra));
+        let mut state = ResponsesState {
+            simple_budget: Some(budget),
+            accumulated_output: output.clone(),
+            response_object: json!({"id": "resp_1", "output": []}),
+            citation_files: files.clone(),
+            ..ResponsesState::default()
+        };
+        let result = canonicalize_logical_response(&mut state, false);
+        assert_eq!(result.is_ok(), succeeds);
+        if succeeds {
+            assert_eq!(state.response_object["output"][0]["content"][0]["text"], "source");
+        } else {
+            assert_eq!(state.response_object["output"], json!([]));
+        }
+    }
 }
 
 #[test]
@@ -765,7 +984,8 @@ fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
         ..ResponsesState::default()
     };
 
-    let (output, _usage) = canonicalize_logical_response(&mut state, false).expect("terminal restore");
+    canonicalize_logical_response(&mut state, false).expect("terminal restore");
+    let output = state.response_object["output"].as_array().unwrap();
 
     assert_eq!(output[0]["type"], "custom_tool_call", "lowered function_call retyped");
     assert_eq!(
@@ -4525,9 +4745,11 @@ fn parse_error_sets_metadata() {
         deferred_terminal: None,
         deferred_done: false,
         local_items_flushed: false,
+        local_synthesis_reserved: false,
         local_tool_items: std::collections::HashMap::new(),
         client_tool_items: Vec::new(),
         stream_failed: false,
+        retained_budget_failed: false,
     });
 
     let large_chunk =
@@ -4571,6 +4793,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
         deferred_terminal: None,
         deferred_done: false,
         local_items_flushed: false,
+        local_synthesis_reserved: false,
         local_tool_items: std::collections::HashMap::new(),
         client_tool_items: vec![ClientToolStreamItem {
             key: "item:call_1".to_owned(),
@@ -4581,6 +4804,7 @@ fn incomplete_client_tool_lifecycle_fails_closed() {
             item_id: Some("call_1".to_owned()),
         }],
         stream_failed: false,
+        retained_budget_failed: false,
     });
 
     validate_stream_end(&mut ctx);

@@ -37,8 +37,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    SelectedUpstreamBodyOutcome, SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SelectedUpstreamBodyOutcome,
+    SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde::{Deserialize, ser::SerializeMap as _};
 use tracing::{debug, trace};
@@ -623,9 +623,6 @@ impl HttpFilter for ResponsesProxyFilter {
         let preserve_native_compaction = selected_backend_uses_native_responses(ctx);
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
-            if let Some(rejection) = budgeted_stream_rejection(ctx) {
-                return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
-            }
             if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
                 return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
             }
@@ -635,9 +632,6 @@ impl HttpFilter for ResponsesProxyFilter {
 
         if !request_needs_rebuild(state) {
             select_terminal_response_mode(ctx, body);
-            if let Some(rejection) = budgeted_stream_rejection(ctx) {
-                return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
-            }
             if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
                 return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
             }
@@ -679,9 +673,6 @@ impl HttpFilter for ResponsesProxyFilter {
 
         SerializedJson::from_bytes(serialized).commit(body, self.name(), "body");
         select_terminal_response_mode(ctx, body);
-        if let Some(rejection) = budgeted_stream_rejection(ctx) {
-            return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
-        }
         if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
             return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
         }
@@ -744,22 +735,6 @@ fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, body: &Option<
         SubRequestResponseMode::Buffered
     };
     ctx.set_subrequest_response_mode(mode);
-}
-
-/// The first retained-payload slice has no committed-SSE owner accounting.
-fn budgeted_stream_rejection(ctx: &HttpFilterContext<'_>) -> Option<Rejection> {
-    (ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming
-        && ctx
-            .extensions
-            .get::<ResponsesState>()
-            .is_some_and(|state| state.simple_budget.is_some()))
-    .then(|| {
-        responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "streaming is not yet supported with openai_agentic_loop.max_retained_bytes",
-        )
-    })
 }
 
 /// Borrowed view of the outbound request body.

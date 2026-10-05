@@ -5,7 +5,9 @@
 
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode, TrustedHeaderMutation};
+use praxis_filter::{
+    ClientResponseHeadersCommitted, FilterAction, HttpFilter, SubRequestResponseMode, TrustedHeaderMutation,
+};
 use serde_json::{Value, json};
 
 use super::{super::state::ResponsesState, budget::SimpleBudget, collect_output_items};
@@ -3567,6 +3569,7 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ClientResponseHeadersCommitted);
 
     let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4o",
@@ -3604,6 +3607,31 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
         Some("true"),
         "the failed streamed round must not be persisted"
     );
+}
+
+#[tokio::test]
+async fn dispatch_failure_before_stream_commit_preserves_http_error_status() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o", "input": "test", "stream": true
+    }));
+    state.dispatch_failure = Some(DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "vector store search failed".to_owned(),
+    });
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    let FilterAction::Reject(response) = action else {
+        panic!("a pre-commit failure must reject the request");
+    };
+    assert_eq!(response.status, 502);
+    let body: Value = serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["message"], "vector store search failed");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 /// A locally-detected security-context failure preempts a generic dispatch failure:
