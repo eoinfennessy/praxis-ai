@@ -9,7 +9,9 @@
 //! owner patches can replace these coarse reserves with exact charges.
 
 /// Copies and parsing capacity held while classifying and validating input.
-const INPUT_WIRE_MULTIPLIER: usize = 32;
+pub(super) const INPUT_WIRE_MULTIPLIER: usize = 32;
+/// The router buffer is reserved at one eighth of the configured ceiling.
+pub(super) const IRR_RESPONSE_DIVISOR: usize = 8;
 /// Copies and serialization capacity held while processing model output.
 const OUTPUT_WIRE_MULTIPLIER: usize = 64;
 /// Reserve for each JSON value/key, including collection spare capacity.
@@ -78,7 +80,7 @@ impl SimpleBudget {
 
 /// Account for core's buffered response capacity before parsing or copying.
 fn response_reserve(limit: usize) -> Option<usize> {
-    (limit / 8).checked_mul(3)
+    (limit / IRR_RESPONSE_DIVISOR).checked_mul(3)
 }
 
 /// Bound the simultaneously live raw and parsed create-body projections.

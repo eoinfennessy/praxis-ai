@@ -791,9 +791,18 @@ async fn budgeted_compaction_filter_rejects_before_callout() {
     ctx.extensions
         .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
+    let original = body.clone();
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "budgeted compaction must reject before callout");
+            let text = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+            assert!(text.contains("max_retained_bytes"), "{text}");
+        },
+        _ => panic!("budgeted compaction must reject before callout"),
+    }
+    assert_eq!(body, original, "rejection must leave the request body unchanged");
 }
 
 #[test]

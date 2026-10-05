@@ -147,6 +147,10 @@ impl HttpFilter for PromptEnrichFilter {
 
     async fn on_request_body(
         &self,
+        #[cfg_attr(
+            not(feature = "openai-responses"),
+            expect(unused_variables, reason = "the budgeted create guard is feature-gated")
+        )]
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
@@ -159,9 +163,6 @@ impl HttpFilter for PromptEnrichFilter {
         if let Some(action) = budgeted_create_rejection(ctx) {
             return Ok(action);
         }
-        #[cfg(not(feature = "openai-responses"))]
-        let _ = ctx;
-
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
@@ -202,7 +203,7 @@ fn budgeted_create_rejection(ctx: &HttpFilterContext<'_>) -> Option<FilterAction
                 Rejection::status(400)
                     .with_header("content-type", "application/json")
                     .with_body(Bytes::from_static(
-                        br#"{"error":{"type":"invalid_request_error","message":"prompt enrichment is not yet supported with openai_agentic_loop.max_retained_bytes"}}"#,
+                        br#"{"error":{"type":"invalid_request_error","message":"prompt enrichment is not yet supported with openai_agentic_loop.max_retained_bytes","param":null,"code":"invalid_request_error"}}"#,
                     )),
             )
         })

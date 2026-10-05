@@ -52,6 +52,27 @@ async fn budgeted_plain_create_initializes_shared_charge() {
 }
 
 #[tokio::test]
+async fn budgeted_create_preserves_provider_owned_parameters() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let original = json!({
+        "model": "gpt-4.1",
+        "input": "hello",
+        "store": false,
+        "reasoning": {"effort": "medium"},
+        "metadata": {"caller": "test"},
+        "temperature": "backend validates this"
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&original).unwrap()));
+
+    let action = default_filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release), "provider parameters must reach the backend");
+    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().request_body, original);
+}
+
+#[tokio::test]
 async fn budgeted_fused_request_rejects_compaction_in_body_phase() {
     let filter = default_filter();
     let req = make_request(http::Method::POST, "/v1/responses/compact");

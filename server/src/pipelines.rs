@@ -266,7 +266,7 @@ pub fn prepare_agentic_budget_entries(
 #[must_use]
 pub fn agentic_request_body_cap(configured: Option<usize>, policy: Option<AgenticBudgetPolicy>) -> Option<usize> {
     policy.map_or(configured, |policy| {
-        let maximum = policy.max_retained_bytes() / 32;
+        let maximum = policy.max_request_body_bytes();
         Some(configured.map_or(maximum, |configured| configured.min(maximum)))
     })
 }
@@ -362,7 +362,7 @@ fn cap_agentic_irr_responses(
                 }
             }
             if agentic_budget_policy(&step_entries, chains)?.is_some() {
-                let maximum = policy.max_retained_bytes() / 8;
+                let maximum = policy.max_irr_response_bytes();
                 let configured = configured_irr_response_cap(&entry.config)?;
                 if let Some(mapping) = entry.config.as_mapping_mut() {
                     mapping.insert(
@@ -491,7 +491,7 @@ fn validate_agentic_irr_caps(
         entries,
         chains,
         &mut HashSet::new(),
-        policy.max_retained_bytes() / 8,
+        policy.max_irr_response_bytes(),
         false,
     )
 }

@@ -93,7 +93,7 @@ pub(super) struct AgenticLoopConfig {
     /// Maximum number of inference loop iterations (Praxis-only,
     /// not part of the OpenAI API spec). When the iteration counter
     /// reaches this limit, the loop returns a 508 Loop Detected error. Must be
-    /// between 1 and [`MAX_ITERATIONS_CEILING`] (currently 100); defaults to 10.
+    /// between 1 and 100 (the core IRR iteration ceiling); defaults to 10.
     #[serde(default = "default_max_infer_iters")]
     pub max_infer_iters: u32,
 

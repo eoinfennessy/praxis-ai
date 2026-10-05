@@ -173,6 +173,18 @@ impl AgenticBudgetPolicy {
         self.max_retained_bytes
     }
 
+    /// Largest raw create body admitted before the request JSON is parsed.
+    #[must_use]
+    pub const fn max_request_body_bytes(self) -> usize {
+        self.max_retained_bytes / budget::INPUT_WIRE_MULTIPLIER
+    }
+
+    /// Largest buffered inference response admitted by the core router.
+    #[must_use]
+    pub const fn max_irr_response_bytes(self) -> usize {
+        self.max_retained_bytes / budget::IRR_RESPONSE_DIVISOR
+    }
+
     /// Lower this policy to another reachable loop's configured limit.
     #[must_use]
     pub const fn min(self, other: Self) -> Self {
@@ -367,8 +379,8 @@ impl HttpFilter for AgenticLoopFilter {
                 .is_none_or(|state| state.simple_budget.is_none())
         {
             return Ok(FilterAction::Reject(responses_error_rejection(
-                413,
-                "invalid_request_error",
+                500,
+                "server_error",
                 "agentic retained-payload policy was not attached to this Responses create request",
             )));
         }
@@ -1008,17 +1020,21 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> boo
     false
 }
 
-/// The first budgeted slice accepts only text messages. Every tool-related
-/// output is rejected before its dispatcher sees an assignment.
+/// The first budgeted slice accepts plain messages and reasoning items. Every
+/// tool-related output is rejected before its dispatcher sees an assignment.
 fn plain_text_response(response: &Value) -> bool {
     response.get("output").and_then(Value::as_array).is_some_and(|items| {
-        items.iter().all(|item| {
-            item.get("type").and_then(Value::as_str) == Some("message")
-                && item.get("content").and_then(Value::as_array).is_some_and(|parts| {
-                    parts
-                        .iter()
-                        .all(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+        items.iter().all(|item| match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => true,
+            Some("message") => item.get("content").and_then(Value::as_array).is_some_and(|parts| {
+                parts.iter().all(|part| {
+                    matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("output_text" | "refusal")
+                    )
                 })
+            }),
+            _ => false,
         })
     })
 }

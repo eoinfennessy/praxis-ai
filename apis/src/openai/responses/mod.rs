@@ -153,14 +153,19 @@ pub(crate) fn plain_agentic_budget(
 fn plain_agentic_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     object.get("input").is_some_and(serde_json::Value::is_string)
         && object.get("store") == Some(&serde_json::Value::Bool(false))
-        && object.get("stream").is_none_or(|value| value.as_bool() == Some(false))
-        && object.iter().all(|(key, value)| match key.as_str() {
-            "model" | "input" | "instructions" | "user" => value.is_string(),
-            "store" => value == false,
-            "stream" | "parallel_tool_calls" => value.is_boolean(),
-            "max_output_tokens" | "seed" => value.is_i64() || value.is_u64(),
-            "temperature" | "top_p" => value.is_number(),
-            _ => false,
+        && object.get("stream") != Some(&serde_json::Value::Bool(true))
+        && !object.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "tools"
+                    | "tool_choice"
+                    | "previous_response_id"
+                    | "conversation"
+                    | "prompt"
+                    | "include"
+                    | "background"
+                    | "context_management"
+            )
         })
 }
 #[cfg(feature = "openai-responses")]

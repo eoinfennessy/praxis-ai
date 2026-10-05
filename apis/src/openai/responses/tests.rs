@@ -9,16 +9,39 @@ use super::*;
 
 #[test]
 #[cfg(feature = "openai-responses")]
-fn budgeted_plain_request_rejects_nested_optional_values() {
+fn budgeted_plain_request_accepts_provider_owned_fields() {
     let mut request = serde_json::json!({
         "model": "test",
         "input": "hello",
         "store": false,
-        "instructions": [[[["nested"]]]]
+        "reasoning": {"effort": "medium"},
+        "text": {"format": {"type": "json_object"}},
+        "metadata": {"caller": "test"},
+        "temperature": "provider validates this"
     });
-    assert!(!plain_agentic_request_supported(request.as_object().unwrap()));
+    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
 
-    request["instructions"] = serde_json::Value::String("plain".to_owned());
+    for key in [
+        "tools",
+        "tool_choice",
+        "previous_response_id",
+        "conversation",
+        "prompt",
+        "include",
+        "background",
+        "context_management",
+    ] {
+        request[key] = serde_json::Value::Null;
+        assert!(
+            !plain_agentic_request_supported(request.as_object().unwrap()),
+            "{key} still has an unmetered owner"
+        );
+        request.as_object_mut().unwrap().remove(key);
+    }
+
+    request["stream"] = serde_json::Value::Bool(true);
+    assert!(!plain_agentic_request_supported(request.as_object().unwrap()));
+    request["stream"] = serde_json::Value::Bool(false);
     assert!(plain_agentic_request_supported(request.as_object().unwrap()));
 }
 

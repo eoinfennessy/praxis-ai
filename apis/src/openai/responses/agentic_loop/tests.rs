@@ -63,7 +63,7 @@ async fn budgeted_loop_rejects_missing_initializer_before_dispatch() {
     ctx.extensions
         .insert(super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 500));
 }
 
 #[tokio::test]
@@ -132,6 +132,34 @@ fn budgeted_plain_buffered_response_succeeds() {
     assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
     let response: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
     assert_eq!(response["output"][0]["content"][0]["text"], "hello");
+}
+
+#[test]
+fn budgeted_reasoning_and_refusal_response_succeeds() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "object":"response", "status":"completed", "output":[
+                {"type":"reasoning","id":"rs_1","summary":[]},
+                {"type":"message","id":"msg_1","content":[{"type":"refusal","refusal":"I cannot help with that"}]}
+            ]
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "reasoning and refusal are valid plain output"
+    );
+    let response: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(response["output"][0]["type"], "reasoning");
+    assert_eq!(response["output"][1]["content"][0]["type"], "refusal");
 }
 
 #[test]

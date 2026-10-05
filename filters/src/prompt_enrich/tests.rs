@@ -335,7 +335,16 @@ async fn budgeted_responses_create_rejects_before_prompt_expansion() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400, "prompt expansion must reject before copying");
+            let error: serde_json::Value =
+                serde_json::from_slice(rejection.body.as_deref().unwrap_or_default()).unwrap();
+            assert_eq!(error["error"]["code"], "invalid_request_error");
+            assert!(error["error"]["param"].is_null());
+        },
+        _ => panic!("prompt expansion must reject before copying"),
+    }
     assert_eq!(body.as_deref(), Some(raw.as_slice()));
 }
 
