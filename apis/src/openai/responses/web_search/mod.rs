@@ -942,15 +942,7 @@ fn append_search_turn(
 /// next inference iteration and persisted replay from treating a missing query
 /// as a successful search with zero results.
 fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
-    let Some(id_charge) = ids.public.len().checked_add(ids.bridge.len()) else {
-        record_web_search_budget_failure(ctx);
-        return;
-    };
-    let Some(peak_charge) = id_charge.checked_mul(8).and_then(|bytes| bytes.checked_add(8_192)) else {
-        record_web_search_budget_failure(ctx);
-        return;
-    };
-    let Some(retained_charge) = id_charge.checked_mul(4).and_then(|bytes| bytes.checked_add(4_096)) else {
+    let Some((peak_charge, retained_charge)) = web_search_incomplete_charges(ids) else {
         record_web_search_budget_failure(ctx);
         return;
     };
@@ -979,6 +971,19 @@ fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
     }
 }
 
+/// Public and bridge IDs have separate canonical, provenance, model, and
+/// persisted owners even when the provider returned no result rows.
+fn web_search_id_charges(ids: &SearchCallIds<'_>) -> Option<(usize, usize)> {
+    let bytes = ids.public.len().checked_add(ids.bridge.len())?;
+    Some((bytes.checked_mul(8)?, bytes.checked_mul(4)?))
+}
+
+/// Small failure bridge and public placeholder, including independently owned IDs.
+fn web_search_incomplete_charges(ids: &SearchCallIds<'_>) -> Option<(usize, usize)> {
+    let (peak, retained) = web_search_id_charges(ids)?;
+    Some((peak.checked_add(8_192)?, retained.checked_add(4_096)?))
+}
+
 /// Reserve independent decoded, formatted, public, and twice-retained bridge
 /// owners before constructing them. The smaller charge survives after the
 /// decoded rows and formatter scratch have dropped.
@@ -990,7 +995,7 @@ fn web_search_turn_charges(
 ) -> Option<(usize, usize)> {
     let rows = web_search_results_bytes(results)?;
     let action = bounded_json_size(action, usize::MAX).ok().flatten()?;
-    let ids = ids.public.len().checked_add(ids.bridge.len())?;
+    let (id_peak, id_retained) = web_search_id_charges(ids)?;
     let structural = results
         .len()
         .checked_mul(if include_sources { 1_024 } else { 512 })?
@@ -998,12 +1003,12 @@ fn web_search_turn_charges(
     let retained = rows
         .checked_mul(if include_sources { 8 } else { 6 })?
         .checked_add(action.checked_mul(4)?)?
-        .checked_add(ids.checked_mul(4)?)?
+        .checked_add(id_retained)?
         .checked_add(structural)?;
     let peak = rows
         .checked_mul(if include_sources { 16 } else { 12 })?
         .checked_add(action.checked_mul(8)?)?
-        .checked_add(ids.checked_mul(8)?)?
+        .checked_add(id_peak)?
         .checked_add(structural.checked_mul(2)?)?;
     Some((peak, retained))
 }
