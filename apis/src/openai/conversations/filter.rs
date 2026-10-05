@@ -592,7 +592,7 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
-        if !budgeted_response_is_completed(ctx, body) {
+        if !budgeted_response_is_completed(ctx, body, streaming) {
             return Ok(FilterAction::Continue);
         }
 
@@ -664,15 +664,22 @@ fn contains_completed_terminal(body: &Option<Bytes>) -> bool {
         .is_some_and(|chunk| chunk.windows(EVENT_HEADER.len()).any(|window| window == EVENT_HEADER))
 }
 
-/// Inspect only the response status before charging append-only owners. Serde
-/// skips other fields without materializing the provider's output tree.
-fn budgeted_response_is_completed(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> bool {
+/// Inspect only the response status before charging append-only owners. The
+/// stream composer already owns a canonical response; buffered JSON is read
+/// with Serde without materializing the provider's output tree.
+fn budgeted_response_is_completed(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>, streaming: bool) -> bool {
     #[derive(Deserialize)]
     struct Status {
         status: Option<String>,
     }
     if ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
         return true;
+    }
+    if streaming {
+        return ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.response_object.get("status").and_then(Value::as_str) == Some("completed"));
     }
     body.as_deref()
         .and_then(|bytes| serde_json::from_slice::<Status>(bytes).ok())
