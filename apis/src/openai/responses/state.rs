@@ -1033,7 +1033,10 @@ impl ResponsesState {
 
     /// Borrow function calls selected for dispatch, including resumed approvals.
     pub(crate) fn selected_tool_calls(&self) -> Vec<&serde_json::Value> {
+        #[cfg(feature = "openai-mcp-tools")]
         let mut selected: Vec<_> = self.selected_output(&self.tool_calls, "function_call").collect();
+        #[cfg(not(feature = "openai-mcp-tools"))]
+        let selected: Vec<_> = self.selected_output(&self.tool_calls, "function_call").collect();
         #[cfg(feature = "openai-mcp-tools")]
         selected.extend(self.approved_tool_calls.iter());
         selected
