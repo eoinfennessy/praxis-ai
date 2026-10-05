@@ -243,6 +243,30 @@ async fn budgeted_file_resolve_rejects_before_file_callout() {
 }
 
 #[tokio::test]
+async fn budgeted_plain_text_skips_file_resolution_without_changing_body() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request = json!({"model":"test","input":"hello"});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.simple_budget =
+        Some(super::super::agentic_loop::budget::SimpleBudget::new_with_store(67_108_864, 128, true).unwrap());
+    ctx.extensions.insert(state);
+    let raw = Bytes::from(serde_json::to_vec(&request).unwrap());
+    let mut body = Some(raw.clone());
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "plain text needs no file resolution"
+    );
+    assert_eq!(body, Some(raw), "file resolver must leave the admitted body untouched");
+}
+
+#[tokio::test]
 async fn skips_non_responses_request() {
     let filter = make_filter();
     let req = Box::leak(Box::new(crate::test_utils::make_request(

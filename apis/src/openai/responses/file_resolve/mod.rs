@@ -376,14 +376,6 @@ impl HttpFilter for FileResolveFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some() {
-            return Ok(FilterAction::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "file resolution is not yet supported with openai_agentic_loop.max_retained_bytes",
-            )));
-        }
-
         let Some(raw) = body.as_ref() else {
             trace!("no body, releasing");
             return Ok(FilterAction::Release);
@@ -396,6 +388,25 @@ impl HttpFilter for FileResolveFilter {
                 return Ok(FilterAction::Release);
             },
         };
+
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some() {
+            // A string input has no content parts for this filter to resolve.
+            // The request validator has already charged this parsed body, and
+            // rehydrated history is still guarded until its copies are metered.
+            let no_resolution = parsed.get("input").is_some_and(serde_json::Value::is_string)
+                && ctx
+                    .extensions
+                    .get::<ResponsesState>()
+                    .is_some_and(|state| state.simple_budget.is_some() && !state.history_rehydrated);
+            if no_resolution {
+                return Ok(FilterAction::Continue);
+            }
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "file resolution is not yet supported with openai_agentic_loop.max_retained_bytes",
+            )));
+        }
 
         resolve_and_rewrite(self, ctx, body, parsed).await
     }
