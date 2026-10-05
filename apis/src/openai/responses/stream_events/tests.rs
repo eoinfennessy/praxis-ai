@@ -67,6 +67,7 @@ fn terminal_event_moves_response_payload_without_a_full_tree_clone() {
 }
 
 #[test]
+#[expect(clippy::print_stderr, reason = "record count and peak evidence against the cloned baseline")]
 fn borrowed_terminal_wire_avoids_full_response_clone() {
     let response = json!({
         "id": "resp_1",
