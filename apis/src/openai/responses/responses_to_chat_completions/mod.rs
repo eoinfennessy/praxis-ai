@@ -38,7 +38,7 @@ use self::{
     stream::{SnapshotInputs, StreamConverter},
 };
 use super::{
-    agentic_loop::{AgenticBudgetPolicy, budget::input_charge},
+    agentic_loop::{AgenticBudgetPolicy, budget::output_charge},
     body_limits::rewritten_body_too_large_rejection,
     bounded_json_size, enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
@@ -75,9 +75,12 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 
 /// Conservative allowance for the owned Chat request tree and its serialized body.
 const CHAT_REQUEST_SOURCE_MULTIPLIER: usize = 8;
+/// Map, message, and serializer capacity needed even for a short text input.
 const CHAT_REQUEST_FIXED_RESERVE: usize = 4_096;
+/// Request-phase admission error before any translated body is built.
 const CHAT_REQUEST_OVERFLOW: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat request translation";
+/// Response-phase admission error before a buffered Chat body is parsed.
 const CHAT_RESPONSE_OVERFLOW: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes during Chat response translation";
 
@@ -397,10 +400,10 @@ fn reserve_chat_request_source(ctx: &mut HttpFilterContext<'_>) -> bool {
 
 /// The translated tree is still live when its outbound wire Vec is allocated.
 fn reserve_chat_request_wire(ctx: &mut HttpFilterContext<'_>, translated: &serde_json::Value) -> bool {
-    if !ctx
+    if ctx
         .extensions
         .get::<ResponsesState>()
-        .is_some_and(|state| state.simple_budget.is_some())
+        .is_none_or(|state| state.simple_budget.is_none())
     {
         return true;
     }
@@ -416,6 +419,7 @@ fn reserve_chat_request_wire(ctx: &mut HttpFilterContext<'_>, translated: &serde
     })
 }
 
+/// Reject a Chat request whose additional translation owners cannot be reserved.
 fn chat_request_budget_rejection() -> SelectedUpstreamBodyOutcome {
     SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
         413,
@@ -439,7 +443,7 @@ fn reserve_finite_chat_response(ctx: &mut HttpFilterContext<'_>, body: &[u8]) ->
             .flatten()
             .and_then(|bytes| bytes.checked_mul(4))
     };
-    let charge = echo_charge.and_then(|echo| input_charge(body)?.checked_add(echo));
+    let charge = echo_charge.and_then(|echo| output_charge(body)?.checked_add(echo));
     charge.is_some_and(|charge| {
         ctx.extensions
             .get_mut::<ResponsesState>()
@@ -449,6 +453,10 @@ fn reserve_finite_chat_response(ctx: &mut HttpFilterContext<'_>, body: &[u8]) ->
 }
 
 #[async_trait]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the adapter owns request transport selection and finite and streaming response translation"
+)]
 impl HttpFilter for ResponsesToChatCompletionsFilter {
     fn name(&self) -> &'static str {
         "responses_to_chat_completions"
@@ -565,10 +573,6 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the selected-upstream hook aligns translated bytes and response mode"
-    )]
     async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,

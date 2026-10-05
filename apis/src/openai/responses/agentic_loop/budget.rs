@@ -149,7 +149,7 @@ pub(crate) fn input_charge(bytes: &[u8]) -> Option<usize> {
 }
 
 /// Charge provider structure before its first JSON parser allocates.
-fn output_charge(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn output_charge(bytes: &[u8]) -> Option<usize> {
     bytes
         .len()
         .checked_mul(OUTPUT_WIRE_MULTIPLIER)?
