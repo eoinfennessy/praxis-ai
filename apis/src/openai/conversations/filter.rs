@@ -781,11 +781,14 @@ fn reject_missing_append_budget() -> FilterAction {
 
 /// Why append admission failed before any conversation items were copied.
 enum AppendBudgetError {
+    /// The request-wide ledger cannot admit the append payload.
     Exceeded,
+    /// A budgeted exchange did not carry its shared ledger into this filter.
     Missing,
 }
 
 impl AppendBudgetError {
+    /// Return the Responses error code for this failure.
     fn code(&self) -> &'static str {
         match self {
             Self::Exceeded => "invalid_request_error",
@@ -793,6 +796,7 @@ impl AppendBudgetError {
         }
     }
 
+    /// Return the stable client-facing explanation.
     fn message(&self) -> &'static str {
         match self {
             Self::Exceeded => "conversation append exceeds openai_agentic_loop.max_retained_bytes",
@@ -800,6 +804,7 @@ impl AppendBudgetError {
         }
     }
 
+    /// Build the HTTP rejection used before response headers commit.
     fn rejection(&self) -> FilterAction {
         match self {
             Self::Exceeded => reject_append_budget(),
