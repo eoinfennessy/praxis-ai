@@ -55,8 +55,13 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
 #[test]
 #[cfg(feature = "openai-responses")]
 fn budgeted_message_arrays_admit_text_and_file_parts() {
+    assert!(budgeted_request_supported(
+        serde_json::json!({"store":false}).as_object().unwrap()
+    ));
     for input in [
+        serde_json::Value::Null,
         serde_json::json!([]),
+        serde_json::json!({"type":"message","role":"user","content":"Hello"}),
         serde_json::json!([{"role":"user","content":"Hello"}]),
         serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]),
         serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_file","file_data":"YQ=="}]}]),

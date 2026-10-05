@@ -148,32 +148,33 @@ fn budgeted_request_supported(object: &serde_json::Map<String, serde_json::Value
 /// document extraction reserve their additional owners before expansion.
 #[cfg(feature = "openai-responses")]
 fn budgeted_input_supported(input: Option<&serde_json::Value>) -> bool {
-    let Some(input) = input else {
-        return false;
-    };
     match input {
-        serde_json::Value::String(_) => true,
-        serde_json::Value::Array(items) => items.iter().all(|item| {
-            let Some(message) = item.as_object() else {
-                return false;
-            };
-            if message.get("type").is_some_and(|kind| kind != "message") {
-                return false;
-            }
-            match message.get("content") {
-                Some(serde_json::Value::String(_)) => true,
-                Some(serde_json::Value::Array(parts)) => {
-                    parts
-                        .iter()
-                        .all(|part| match part.get("type").and_then(serde_json::Value::as_str) {
-                            Some("input_text") => part.get("text").is_some_and(serde_json::Value::is_string),
-                            Some("input_file" | "input_image") => true,
-                            _ => false,
-                        })
-                },
-                _ => false,
-            }
-        }),
+        None | Some(serde_json::Value::Null | serde_json::Value::String(_)) => true,
+        Some(serde_json::Value::Object(message)) => budgeted_message_supported(message),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .all(|item| item.as_object().is_some_and(budgeted_message_supported)),
+        _ => false,
+    }
+}
+
+/// An object input has the same owners whether sent alone or in an array.
+#[cfg(feature = "openai-responses")]
+fn budgeted_message_supported(message: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if message.get("type").is_some_and(|kind| kind != "message") {
+        return false;
+    }
+    match message.get("content") {
+        Some(serde_json::Value::String(_)) => true,
+        Some(serde_json::Value::Array(parts)) => {
+            parts
+                .iter()
+                .all(|part| match part.get("type").and_then(serde_json::Value::as_str) {
+                    Some("input_text") => part.get("text").is_some_and(serde_json::Value::is_string),
+                    Some("input_file" | "input_image") => true,
+                    _ => false,
+                })
+        },
         _ => false,
     }
 }

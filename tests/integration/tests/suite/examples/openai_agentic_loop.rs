@@ -169,6 +169,32 @@ fn retained_budget_preserves_text_message_array() {
 }
 
 #[test]
+fn retained_budget_preserves_single_message_object_and_empty_input() {
+    let response = r#"{"id":"resp_input_shape","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned()), (200, response.to_owned())])
+        .start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let message = serde_json::json!({"type":"message","role":"user","content":"Hello"});
+    let requests = [
+        serde_json::json!({"model":"gpt-4.1","input":message,"store":false}),
+        serde_json::json!({"model":"gpt-4.1","store":false}),
+    ];
+
+    for request in &requests {
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+        assert_eq!(parse_status(&raw), 200, "in-budget request shape failed: {raw}");
+    }
+
+    let sent = model.requests();
+    assert_eq!(sent.len(), 2);
+    let first: serde_json::Value = serde_json::from_str(&sent[0].body).expect("first provider request JSON");
+    let second: serde_json::Value = serde_json::from_str(&sent[1].body).expect("second provider request JSON");
+    assert_eq!(first["input"], requests[0]["input"]);
+    assert!(second.get("input").is_none(), "omitted input must remain omitted");
+}
+
+#[test]
 fn retained_budget_persists_default_store_plain_response() {
     let response = r#"{"id":"resp_stored_plain","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_stored_plain","content":[{"type":"output_text","text":"Hello"}]}]}"#;
     let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
