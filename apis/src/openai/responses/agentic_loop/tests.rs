@@ -134,6 +134,19 @@ fn budgeted_plain_buffered_response_succeeds() {
     assert_eq!(response["output"][0]["content"][0]["text"], "hello");
 }
 
+#[test]
+fn from_config_matches_router_iteration_ceiling() {
+    let ceiling = praxis_core::config::MAX_ITERATIONS_CEILING;
+    for (value, accepted) in [(1, true), (ceiling, true), (ceiling.saturating_add(1), false)] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_infer_iters: {value}")).unwrap();
+        assert_eq!(
+            super::AgenticLoopFilter::from_config(&yaml).is_ok(),
+            accepted,
+            "max_infer_iters={value}"
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Passthrough Without State
 // -----------------------------------------------------------------------------
