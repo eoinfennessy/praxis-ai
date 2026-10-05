@@ -122,6 +122,10 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         BodyMode::Stream
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validates and initializes one Responses create body"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,

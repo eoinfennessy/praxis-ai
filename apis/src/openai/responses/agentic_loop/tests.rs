@@ -92,7 +92,7 @@ fn budgeted_model_tool_output_rejects_before_dispatch_assignment() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
-    state.simple_budget = Some(SimpleBudget::new(65_536, 0).unwrap());
+    state.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({
@@ -111,7 +111,7 @@ fn budgeted_plain_buffered_response_succeeds() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
-    state.simple_budget = Some(SimpleBudget::new(65_536, 0).unwrap());
+    state.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from(serde_json::to_vec(&json!({
         "object":"response", "status":"completed", "output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]

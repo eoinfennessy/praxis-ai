@@ -323,6 +323,23 @@ async fn invalid_json_continue_leaves_body_unchanged() {
 }
 
 #[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn budgeted_responses_create_rejects_before_prompt_expansion() {
+    let filter = make_filter_with_on_invalid(Some(&[("system", "configured instruction")]), None, "reject");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(praxis_ai_apis::openai::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let raw = br#"{"model":"gpt-4.1","input":"Hello","store":false}"#;
+    let mut body = Some(Bytes::from_static(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+    assert_eq!(body.as_deref(), Some(raw.as_slice()));
+}
+
+#[tokio::test]
 async fn invalid_json_rejects() {
     let filter = make_filter_with_on_invalid(Some(&[("system", "Hello.")]), None, "reject");
 

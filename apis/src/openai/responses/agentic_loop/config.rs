@@ -106,9 +106,10 @@ pub(super) struct AgenticLoopConfig {
     /// reject before inference until their owners have precise accounting.
     /// Initial payloads are conservatively charged at 32 times raw bytes plus
     /// a per-node reserve; cumulative buffered provider output is charged at
-    /// 64 times its wire bytes. A loop-bearing listener also clamps its raw
-    /// request body limit to at most one thirty-second of this ceiling and its
-    /// buffered IRR response limit to at most one eighth. These reserves can
+    /// 64 times its wire bytes plus a larger per-node reserve. A loop-bearing
+    /// listener also clamps its raw request body limit to at most one
+    /// thirty-second of this ceiling and its buffered IRR response limit to
+    /// at most one eighth. These reserves can
     /// reject a request well below the configured ceiling. Initial budget
     /// overflow returns HTTP 413; buffered provider overflow returns HTTP 502.
     #[serde(default = "default_max_retained_bytes")]

@@ -114,31 +114,11 @@ pub(crate) fn plain_agentic_budget(
             "a budgeted Responses request must be a JSON object",
         )));
     };
-    // A restricted create schema keeps store, restore, compaction, hosted tools,
-    // client tool lowering, and document extraction out of the first slice.
-    let supported = object.get("input").is_some_and(serde_json::Value::is_string)
-        && object.get("store") == Some(&serde_json::Value::Bool(false))
-        && object.get("stream").is_none_or(|value| value.as_bool() == Some(false))
-        && object.keys().all(|key| {
-            matches!(
-                key.as_str(),
-                "model"
-                    | "input"
-                    | "instructions"
-                    | "store"
-                    | "stream"
-                    | "max_output_tokens"
-                    | "temperature"
-                    | "top_p"
-                    | "seed"
-                    | "user"
-            )
-        });
-    if !supported {
+    if !plain_agentic_request_supported(object) {
         return Err(FilterAction::Reject(error::responses_error_rejection(
             400,
             "invalid_request_error",
-            "the agentic retained-payload budget currently supports only buffered text requests with store:false and no tools or history",
+            "openai_agentic_loop.max_retained_bytes currently supports only buffered text requests with store:false and no tools or history",
         )));
     }
     let charge = agentic_loop::budget::input_charge(bytes).unwrap_or(usize::MAX);
@@ -150,6 +130,22 @@ pub(crate) fn plain_agentic_budget(
                 "invalid_request_error",
                 "request body exceeds openai_agentic_loop.max_retained_bytes",
             ))
+        })
+}
+
+/// Keep owners with unbounded expansions out of the first budget slice.
+#[cfg(feature = "openai-responses")]
+fn plain_agentic_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object.get("input").is_some_and(serde_json::Value::is_string)
+        && object.get("store") == Some(&serde_json::Value::Bool(false))
+        && object.get("stream").is_none_or(|value| value.as_bool() == Some(false))
+        && object.iter().all(|(key, value)| match key.as_str() {
+            "model" | "input" | "instructions" | "user" => value.is_string(),
+            "store" => value == false,
+            "stream" | "parallel_tool_calls" => value.is_boolean(),
+            "max_output_tokens" | "seed" => value.is_i64() || value.is_u64(),
+            "temperature" | "top_p" => value.is_number(),
+            _ => false,
         })
 }
 #[cfg(feature = "openai-responses")]

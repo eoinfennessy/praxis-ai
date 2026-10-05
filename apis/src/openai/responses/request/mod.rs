@@ -131,6 +131,10 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "classification and budget admission share one body pass"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -222,6 +226,10 @@ fn reject_unsupported_managed_fields(
 /// # Errors
 ///
 /// Returns [`FilterError`] when a filter result cannot be published.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "publishes one classified create and its budget at one ownership boundary"
+)]
 fn publish_request_facts(
     ctx: &mut HttpFilterContext<'_>,
     classified: &ClassifiedRequest,

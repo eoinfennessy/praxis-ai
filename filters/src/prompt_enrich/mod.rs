@@ -156,20 +156,8 @@ impl HttpFilter for PromptEnrichFilter {
         }
 
         #[cfg(feature = "openai-responses")]
-        if ctx
-            .extensions
-            .get::<praxis_ai_apis::openai::AgenticBudgetPolicy>()
-            .is_some()
-            && ctx.request.method == http::Method::POST
-            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses"
-        {
-            return Ok(FilterAction::Reject(
-                Rejection::status(400)
-                    .with_header("content-type", "application/json")
-                    .with_body(Bytes::from_static(
-                        br#"{"error":{"type":"invalid_request_error","message":"prompt enrichment is not yet supported with openai_agentic_loop.max_retained_bytes"}}"#,
-                    )),
-            ));
+        if let Some(action) = budgeted_create_rejection(ctx) {
+            return Ok(action);
         }
         #[cfg(not(feature = "openai-responses"))]
         let _ = ctx;
@@ -198,6 +186,26 @@ impl HttpFilter for PromptEnrichFilter {
 
         Ok(FilterAction::Continue)
     }
+}
+
+/// Reject configured prompt expansion before it copies a budgeted create body.
+#[cfg(feature = "openai-responses")]
+fn budgeted_create_rejection(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
+    (ctx
+        .extensions
+        .get::<praxis_ai_apis::openai::AgenticBudgetPolicy>()
+        .is_some()
+        && ctx.request.method == http::Method::POST
+        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses")
+        .then(|| {
+            FilterAction::Reject(
+                Rejection::status(400)
+                    .with_header("content-type", "application/json")
+                    .with_body(Bytes::from_static(
+                        br#"{"error":{"type":"invalid_request_error","message":"prompt enrichment is not yet supported with openai_agentic_loop.max_retained_bytes"}}"#,
+                    )),
+            )
+        })
 }
 
 // -----------------------------------------------------------------------------

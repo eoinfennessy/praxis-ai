@@ -454,6 +454,10 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the selected-upstream hook aligns translated bytes and response mode"
+    )]
     async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,

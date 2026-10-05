@@ -7,6 +7,20 @@ use bytes::Bytes;
 
 use super::*;
 
+#[test]
+fn budgeted_plain_request_rejects_nested_optional_values() {
+    let mut request = serde_json::json!({
+        "model": "test",
+        "input": "hello",
+        "store": false,
+        "instructions": [[[["nested"]]]]
+    });
+    assert!(!plain_agentic_request_supported(request.as_object().unwrap()));
+
+    request["instructions"] = serde_json::Value::String("plain".to_owned());
+    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------

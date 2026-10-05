@@ -344,6 +344,10 @@ impl HttpFilter for AgenticLoopFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the loop orders request admission and terminal dispatch outcomes"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -355,10 +359,10 @@ impl HttpFilter for AgenticLoopFilter {
         }
 
         if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
-            && !ctx
+            && ctx
                 .extensions
                 .get::<ResponsesState>()
-                .is_some_and(|state| state.simple_budget.is_some())
+                .is_none_or(|state| state.simple_budget.is_none())
         {
             return Ok(FilterAction::Reject(responses_error_rejection(
                 413,
@@ -414,6 +418,10 @@ impl HttpFilter for AgenticLoopFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the loop admits output before its sole parse and transition decision"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -444,7 +452,7 @@ impl HttpFilter for AgenticLoopFilter {
         };
 
         if let Some(budget) = state.simple_budget.as_mut()
-            && !body.as_ref().is_some_and(|bytes| budget.admit_output(bytes.len()))
+            && !body.as_ref().is_some_and(|bytes| budget.admit_output(bytes))
         {
             ctx.set_metadata("responses.skip_persist", "true");
             set_action(ctx, ACTION_DONE)?;

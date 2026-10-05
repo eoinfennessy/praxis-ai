@@ -149,7 +149,7 @@ fn build_listener_pipelines(
     attach: impl Fn(&Listener, &mut FilterPipeline),
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
     praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
-    let chains: HashMap<&str, &[_]> = config
+    let configured_chains: HashMap<&str, &[_]> = config
         .filter_chains
         .iter()
         .map(|c| (c.name.as_str(), c.filters.as_slice()))
@@ -160,7 +160,7 @@ fn build_listener_pipelines(
     for listener in &config.listeners {
         let mut entries = Vec::new();
         for chain_name in &listener.filter_chains {
-            let chain_filters = chains.get(chain_name.as_str()).ok_or_else(|| {
+            let chain_filters = configured_chains.get(chain_name.as_str()).ok_or_else(|| {
                 let lname = &listener.name;
                 format!("unknown chain '{chain_name}' for listener '{lname}'")
             })?;
@@ -183,7 +183,20 @@ fn build_listener_pipelines(
         let _ = &gate_store_traffic;
 
         #[cfg(feature = "openai-responses")]
-        let budget_policy = prepare_agentic_budget_entries(&mut entries, &chains)?;
+        let mut owned_chains: HashMap<String, Vec<FilterEntry>> = config
+            .filter_chains
+            .iter()
+            .map(|chain| (chain.name.clone(), chain.filters.clone()))
+            .collect();
+        #[cfg(feature = "openai-responses")]
+        let budget_policy = prepare_agentic_budget_entries(&mut entries, &mut owned_chains)?;
+        #[cfg(feature = "openai-responses")]
+        let chains: HashMap<&str, &[_]> = owned_chains
+            .iter()
+            .map(|(name, filters)| (name.as_str(), filters.as_slice()))
+            .collect();
+        #[cfg(not(feature = "openai-responses"))]
+        let chains = configured_chains.clone();
         #[cfg(feature = "openai-responses")]
         let request_body_limit = agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
         #[cfg(not(feature = "openai-responses"))]
@@ -222,12 +235,26 @@ fn build_listener_pipelines(
 #[cfg(feature = "openai-responses")]
 pub fn prepare_agentic_budget_entries(
     entries: &mut [FilterEntry],
-    chains: &HashMap<&str, &[FilterEntry]>,
+    chains: &mut HashMap<String, Vec<FilterEntry>>,
 ) -> Result<Option<AgenticBudgetPolicy>, Box<dyn std::error::Error + Send + Sync>> {
-    let policy = agentic_budget_policy(entries, chains)?;
+    // Scan against a stable snapshot while rewriting both the listener entries
+    // and its named branch chains. The response cap is local to this listener.
+    let original = chains.clone();
+    let original_refs: HashMap<&str, &[_]> = original
+        .iter()
+        .map(|(name, filters)| (name.as_str(), filters.as_slice()))
+        .collect();
+    let policy = agentic_budget_policy(entries, &original_refs)?;
     if let Some(policy) = policy {
-        cap_agentic_irr_responses(entries, chains, policy)?;
-        validate_agentic_irr_caps(entries, chains, policy)?;
+        cap_agentic_irr_responses(entries, &original_refs, policy)?;
+        for filters in chains.values_mut() {
+            cap_agentic_irr_responses(filters, &original_refs, policy)?;
+        }
+        let rewritten_refs: HashMap<&str, &[_]> = chains
+            .iter()
+            .map(|(name, filters)| (name.as_str(), filters.as_slice()))
+            .collect();
+        validate_agentic_irr_caps(entries, &rewritten_refs, policy)?;
     }
     Ok(policy)
 }
@@ -310,6 +337,10 @@ fn agentic_budget_policy(
 /// Lower loop-bearing IRR transport caps before core builds their subpipelines.
 /// Core buffers that response before any AI body hook can reject it.
 #[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "rewrites reachable inline and nested IRR configs before core builds them"
+)]
 fn cap_agentic_irr_responses(
     entries: &mut [FilterEntry],
     chains: &HashMap<&str, &[FilterEntry]>,
@@ -340,6 +371,23 @@ fn cap_agentic_irr_responses(
                     );
                 }
             }
+            // A step may itself contain an IRR. Rewrite that nested config
+            // before core builds the step's subpipeline.
+            if let Some(steps) = entry
+                .config
+                .get_mut("steps")
+                .and_then(serde_yaml::Value::as_sequence_mut)
+            {
+                for step in steps {
+                    if let Some(filters) = step.get_mut("filters").and_then(serde_yaml::Value::as_sequence_mut) {
+                        for filter in filters {
+                            let mut nested: FilterEntry = serde_yaml::from_value(filter.clone())?;
+                            cap_agentic_irr_responses(std::slice::from_mut(&mut nested), chains, policy)?;
+                            *filter = serde_yaml::to_value(nested)?;
+                        }
+                    }
+                }
+            }
         }
         if let Some(branches) = &mut entry.branch_chains {
             for chain in branches.iter_mut().flat_map(|branch| branch.chains.iter_mut()) {
@@ -352,6 +400,7 @@ fn cap_agentic_irr_responses(
     Ok(())
 }
 
+/// Read the effective core IRR response cap while preserving malformed values.
 #[cfg(feature = "openai-responses")]
 fn configured_irr_response_cap(config: &serde_yaml::Value) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     // This is the default in the pinned core IRR. A present invalid value must
@@ -372,11 +421,19 @@ fn configured_irr_response_cap(config: &serde_yaml::Value) -> Result<usize, Box<
 /// Require its existing transport cap to fit inside the budget's raw-response
 /// reserve, even when an unrelated IRR on this listener has a larger cap.
 #[cfg(feature = "openai-responses")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "validates the same nested IRR and branch graph as cap preparation"
+)]
 fn validate_agentic_irr_caps(
     entries: &[FilterEntry],
     chains: &HashMap<&str, &[FilterEntry]>,
     policy: AgenticBudgetPolicy,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "walks nested IRR steps and branch chains with cycle protection"
+    )]
     fn visit(
         entries: &[FilterEntry],
         chains: &HashMap<&str, &[FilterEntry]>,
@@ -456,6 +513,10 @@ fn store_readiness_gate_entry() -> FilterEntry {
 
 /// Apply body limits, health registry, KV stores, and insecure options to a
 /// pipeline. Store registries are attached by the caller's `attach` hook.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads distinct pipeline services and the effective transport cap"
+)]
 fn configure_pipeline(
     pipeline: &mut FilterPipeline,
     config: &Config,
@@ -723,6 +784,47 @@ mod tests {
         cap_agentic_irr_responses(&mut entries, &HashMap::new(), policy).unwrap();
         validate_agentic_irr_caps(&entries, &HashMap::new(), policy).unwrap();
         assert_eq!(entries[0].config["max_response_bytes"].as_u64(), Some(512));
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn named_branch_irr_receives_the_same_transport_cap() {
+        let mut chains = HashMap::from([(
+            "agentic".to_owned(),
+            serde_yaml::from_str(
+                "- filter: iterative_request_router\n  initial_step: inference\n  steps:\n    - name: inference\n      filters:\n        - filter: openai_agentic_loop\n",
+            )
+            .unwrap(),
+        )]);
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "- filter: request_id\n  branch_chains:\n    - name: go\n      rejoin: terminal\n      chains: [agentic]\n",
+        )
+        .unwrap();
+
+        let policy = prepare_agentic_budget_entries(&mut entries, &mut chains)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.max_retained_bytes(), 67_108_864);
+        assert_eq!(
+            chains["agentic"][0].config["max_response_bytes"].as_u64(),
+            Some(8_388_608)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "openai-responses")]
+    fn nested_irr_receives_the_same_transport_cap() {
+        let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
+            "- filter: iterative_request_router\n  initial_step: outer\n  steps:\n    - name: outer\n      filters:\n        - filter: iterative_request_router\n          initial_step: inference\n          steps:\n            - name: inference\n              filters:\n                - filter: openai_agentic_loop\n",
+        )
+        .unwrap();
+
+        prepare_agentic_budget_entries(&mut entries, &mut HashMap::new()).unwrap();
+        assert_eq!(entries[0].config["max_response_bytes"].as_u64(), Some(8_388_608));
+        assert_eq!(
+            entries[0].config["steps"][0]["filters"][0]["max_response_bytes"].as_u64(),
+            Some(8_388_608),
+        );
     }
 
     #[test]
