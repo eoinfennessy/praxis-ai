@@ -392,98 +392,17 @@ impl HttpFilter for AgenticLoopFilter {
         Ok(FilterAction::Continue)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the loop orders request admission and terminal dispatch outcomes"
-    )]
-    #[cfg_attr(
-        all(feature = "openai-mcp-tools", feature = "openai-conversations"),
-        expect(
-            clippy::large_stack_frames,
-            reason = "the request callback moves the request-owned ResponsesState through terminal branches"
-        )
-    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         _body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
+        if end_of_stream {
+            handle_agentic_request_body(ctx, &self.config)
+        } else {
+            Ok(FilterAction::Continue)
         }
-
-        // The compact filter returns locally before IRR. Reaching the loop on
-        // this path means no compact owner accounted for its Store/callout work.
-        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
-            && ctx.request.method == http::Method::POST
-            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
-        {
-            return Ok(FilterAction::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "compaction requires openai_responses_compact before openai_agentic_loop",
-            )));
-        }
-
-        if is_responses_create(&ctx.request.method, ctx.request.uri.path())
-            && ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
-            && ctx
-                .extensions
-                .get::<ResponsesState>()
-                .is_none_or(|state| state.simple_budget.is_none())
-        {
-            return Ok(FilterAction::Reject(responses_error_rejection(
-                500,
-                "server_error",
-                "agentic retained-payload policy was not attached to this Responses create request",
-            )));
-        }
-
-        let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
-            return Ok(FilterAction::Continue);
-        };
-
-        if let Some(budget) = state.simple_budget.as_mut()
-            && !budget.lower_limit(self.config.max_retained_bytes.get())
-        {
-            let status = if state.iteration == 0 { 413 } else { 502 };
-            let failure = DispatchFailure {
-                status,
-                code: if status == 413 {
-                    "invalid_request_error"
-                } else {
-                    "server_error"
-                },
-                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
-            };
-            return convert_dispatch_failure(ctx, state, &failure);
-        }
-
-        // A locally-detected security-context failure (missing/invalid per-user callout
-        // credential) is converted here FIRST, so a security terminal preempts a generic
-        // dispatch terminal for the same round.
-        if let Some(failure) = state.security_failure.take() {
-            return convert_dispatch_failure(ctx, state, &failure);
-        }
-
-        // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
-        // records a shared terminal outcome instead of committing a second terminal
-        // response. The sole loop owner converts it here — before preparing another
-        // inference request — into a buffered JSON rejection (pre-commitment) or a
-        // logical-stream SSE error (post-commitment). See issue #1046.
-        if let Some(failure) = state.dispatch_failure.take() {
-            return convert_dispatch_failure(ctx, state, &failure);
-        }
-
-        if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
-            return finish_deferred_local_response(ctx, state);
-        }
-
-        prepare_iteration(ctx, &mut state);
-        trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
-        ctx.extensions.insert(state);
-        Ok(FilterAction::Continue)
     }
 
     #[expect(
@@ -555,6 +474,92 @@ impl HttpFilter for AgenticLoopFilter {
         ctx.extensions.insert(state);
         Ok(result)
     }
+}
+
+/// Process the request-side loop transition outside the async hook's future.
+///
+/// # Errors
+///
+/// Returns a filter error if a terminal outcome cannot be converted.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the loop orders request admission and terminal dispatch outcomes"
+)]
+fn handle_agentic_request_body(
+    ctx: &mut HttpFilterContext<'_>,
+    config: &AgenticLoopConfig,
+) -> Result<FilterAction, FilterError> {
+    // The compact filter returns locally before IRR. Reaching the loop on
+    // this path means no compact owner accounted for its Store/callout work.
+    if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        && ctx.request.method == http::Method::POST
+        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+    {
+        return Ok(FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "compaction requires openai_responses_compact before openai_agentic_loop",
+        )));
+    }
+
+    if is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        && ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_none_or(|state| state.simple_budget.is_none())
+    {
+        return Ok(FilterAction::Reject(responses_error_rejection(
+            500,
+            "server_error",
+            "agentic retained-payload policy was not attached to this Responses create request",
+        )));
+    }
+
+    let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
+        return Ok(FilterAction::Continue);
+    };
+
+    if let Some(budget) = state.simple_budget.as_mut()
+        && !budget.lower_limit(config.max_retained_bytes.get())
+    {
+        let status = if state.iteration == 0 { 413 } else { 502 };
+        let failure = DispatchFailure {
+            status,
+            code: if status == 413 {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            },
+            message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
+        };
+        return convert_dispatch_failure(ctx, state, &failure);
+    }
+
+    // A locally-detected security-context failure (missing/invalid per-user callout
+    // credential) is converted here FIRST, so a security terminal preempts a generic
+    // dispatch terminal for the same round.
+    if let Some(failure) = state.security_failure.take() {
+        return convert_dispatch_failure(ctx, state, &failure);
+    }
+
+    // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
+    // records a shared terminal outcome instead of committing a second terminal
+    // response. The sole loop owner converts it here — before preparing another
+    // inference request — into a buffered JSON rejection (pre-commitment) or a
+    // logical-stream SSE error (post-commitment). See issue #1046.
+    if let Some(failure) = state.dispatch_failure.take() {
+        return convert_dispatch_failure(ctx, state, &failure);
+    }
+
+    if state.deferred_tool_limit_completion || state.mcp_approval_state != McpApprovalState::None {
+        return finish_deferred_local_response(ctx, state);
+    }
+
+    prepare_iteration(ctx, &mut state);
+    trace!(iteration = state.iteration, "openai_agentic_loop on_request_body");
+    ctx.extensions.insert(state);
+    Ok(FilterAction::Continue)
 }
 
 /// Apply dispatcher-specific response validation before the sole loop decision.
