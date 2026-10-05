@@ -381,7 +381,7 @@ mod tests {
         assert!(budget.reserve_additional_input(2_000));
         assert!(!budget.reserve_additional_input(1_000));
         assert!(budget.reserve_additional_input(400));
-        assert!(!budget.lower_limit(4_000));
+        assert!(!budget.lower_limit(3_996));
         assert!(!budget.reserve_additional_input(usize::MAX));
     }
 
@@ -434,6 +434,16 @@ mod tests {
         let mut stored = SimpleBudget::new_with_store(65_536, 100, true).unwrap();
         assert!(plain.admit_stream_chunk(&wire));
         assert!(!stored.admit_stream_chunk(&wire));
+    }
+
+    #[test]
+    fn additional_input_owner_reduces_available_stream_budget() {
+        let wire = vec![b'x'; 500];
+        let mut plain = SimpleBudget::new(65_536, 100).unwrap();
+        let mut translated = SimpleBudget::new(65_536, 100).unwrap();
+        assert!(plain.admit_stream_chunk(&wire));
+        assert!(translated.reserve_additional_input(30_000));
+        assert!(!translated.admit_stream_chunk(&wire));
     }
 
     #[test]
