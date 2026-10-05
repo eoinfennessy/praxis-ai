@@ -28,6 +28,8 @@ pub(crate) struct SimpleBudget {
     limit: usize,
     /// Input charge retained throughout execution.
     input_charge: usize,
+    /// Additional request-side owners admitted before their payload is copied.
+    additional_input_charge: usize,
     /// Additional allowance for the response Store's request input snapshot.
     store_input_charge: usize,
     /// Conservative sum of provider payload charges from all rounds.
@@ -60,6 +62,7 @@ impl SimpleBudget {
         Some(Self {
             limit,
             input_charge,
+            additional_input_charge: 0,
             store_input_charge,
             output_charge: 0,
             store_output_charge: 0,
@@ -71,6 +74,22 @@ impl SimpleBudget {
     pub(crate) fn lower_limit(&mut self, limit: usize) -> bool {
         self.limit = self.limit.min(limit);
         self.charge().is_some_and(|charge| charge <= self.limit)
+    }
+
+    /// Reserve an independently owned request-side payload before allocating it.
+    /// Failed reservations leave the previous charge intact.
+    pub(crate) fn reserve_additional_input(&mut self, charge: usize) -> bool {
+        let Some(next) = self.additional_input_charge.checked_add(charge) else {
+            return false;
+        };
+        let Some(total) = self.charge().and_then(|total| total.checked_add(charge)) else {
+            return false;
+        };
+        if total > self.limit {
+            return false;
+        }
+        self.additional_input_charge = next;
+        true
     }
 
     /// Preflight one more provider chunk before any response parser sees it.
@@ -90,6 +109,7 @@ impl SimpleBudget {
         let Some(total) = next_output
             .checked_add(next_store)
             .and_then(|charge| charge.checked_add(self.input_charge))
+            .and_then(|charge| charge.checked_add(self.additional_input_charge))
             .and_then(|charge| charge.checked_add(self.store_input_charge))
             .and_then(|charge| charge.checked_add(response_reserve(self.limit)?))
         else {
@@ -108,6 +128,7 @@ impl SimpleBudget {
         self.output_charge
             .checked_add(self.store_output_charge)?
             .checked_add(self.input_charge)?
+            .checked_add(self.additional_input_charge)?
             .checked_add(self.store_input_charge)?
             .checked_add(response_reserve(self.limit)?)
     }
@@ -201,6 +222,16 @@ mod tests {
         let mut stored = SimpleBudget::new_with_store(4_096, 100, true).unwrap();
         assert!(plain.admit_output(&[b' '; 37]));
         assert!(!stored.admit_output(&[b' '; 37]));
+    }
+
+    #[test]
+    fn additional_input_reservation_is_cumulative_and_atomic() {
+        let mut budget = SimpleBudget::new(4_096, 100).unwrap();
+        assert!(budget.reserve_additional_input(2_000));
+        assert!(!budget.reserve_additional_input(1_000));
+        assert!(budget.reserve_additional_input(400));
+        assert!(!budget.lower_limit(4_000));
+        assert!(!budget.reserve_additional_input(usize::MAX));
     }
 
     #[test]
