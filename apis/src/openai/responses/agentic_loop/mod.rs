@@ -396,6 +396,10 @@ impl HttpFilter for AgenticLoopFilter {
         clippy::too_many_lines,
         reason = "the loop orders request admission and terminal dispatch outcomes"
     )]
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "the request callback moves the request-owned ResponsesState through terminal branches"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,

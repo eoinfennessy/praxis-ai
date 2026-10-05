@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Conservative admission for the first, plain Responses agentic path.
+//! Conservative request-wide retained-payload accounting for Responses.
 //!
-//! All paths that retain payload outside this small set of owners are rejected
-//! before dispatch. These factors include the raw body, parsed JSON trees,
-//! canonical input copies, response normalization, Store persistence, and SSE
-//! framing. Follow-up owner patches can replace these coarse reserves with
-//! exact charges.
+//! The shared ledger covers input, output, streaming, Store, and owner-specific
+//! expansions across inference rounds. Owners reserve capacity before making
+//! independent payload copies and settle transient reservations after use.
 
 /// Copies and parsing capacity held while classifying and validating input.
 pub(super) const INPUT_WIRE_MULTIPLIER: usize = 32;

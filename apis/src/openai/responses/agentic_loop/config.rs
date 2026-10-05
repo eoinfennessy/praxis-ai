@@ -99,30 +99,29 @@ pub(super) struct AgenticLoopConfig {
 
     /// Conservative request-wide retained-payload ceiling. Valid from 4 `KiB`
     /// through 256 `MiB`, defaults to a non-disableable 64 `MiB`, and uses the
-    /// smallest limit when several loop instances are reachable. The first
-    /// guardrail admits Responses creates with text, file, or
-    /// image input, with or without Store persistence, finite Responses-to-Chat
-    /// translation, bounded `previous_response_id` and conversation restore,
-    /// and transactional conversation append-back. File resolution and
-    /// document extraction reserve their additional owners before expansion.
-    /// Streaming text responses use the same request-wide ceiling across raw
-    /// SSE chunks, parsed frames, deferred terminal data, and Store. Tool
-    /// requests remain gated until their dispatch owners add accounting.
+    /// smallest limit when several loop instances are reachable. It covers
+    /// typed input, history restore, compaction, file and document expansion,
+    /// Store persistence, buffered and streaming output, Responses-to-Chat
+    /// translation, MCP dispatch, and hosted tools across inference rounds.
     /// Initial payloads are conservatively charged at 32 times raw bytes plus
     /// a per-node reserve; cumulative buffered provider output is charged at
     /// 64 times its wire bytes plus a larger per-node reserve. Store
     /// persistence doubles those conservative charges for its independent
     /// request input snapshot and response persistence projection. Finite Chat
     /// translation reserves its additional request and response JSON owners
-    /// before allocating them. Store history reads are capped before decoding;
+    /// before allocating them. Streaming reserves raw chunks, parsed frames,
+    /// terminal output, and separately retained tool results. Store history
+    /// reads are capped before decoding;
     /// the decoded record, replay, and replacement state are charged at 512
     /// times the stored record's serialized bytes. Conversation append-back
     /// uses a transactional bounded cache rebuild. The listener also clamps
     /// its raw request body limit to at most one
     /// thirty-second of this ceiling and its buffered IRR response limit to
     /// at most one eighth. These reserves can
-    /// reject a request well below the configured ceiling. Initial budget
-    /// overflow returns HTTP 413; buffered provider overflow returns HTTP 502.
+    /// reject a request well below the configured ceiling. Budgeted MCP calls
+    /// use fresh sessions so each call applies its current transport limit.
+    /// Initial budget overflow returns HTTP 413; buffered provider overflow
+    /// returns HTTP 502; a committed stream emits one SSE error on overflow.
     #[serde(default = "default_max_retained_bytes")]
     pub max_retained_bytes: RetainedBytes,
 }

@@ -836,10 +836,6 @@ fn count_unreserved_synthesis(
 /// Returns the parsed non-`[DONE]` events, failing closed on the first malformed
 /// frame so the caller can discard the whole chunk without having recorded any
 /// local-tool milestone (#276 finding 3).
-#[expect(
-    clippy::too_many_lines,
-    reason = "frame admission, validation, and accumulation are one atomic pass"
-)]
 fn parse_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
