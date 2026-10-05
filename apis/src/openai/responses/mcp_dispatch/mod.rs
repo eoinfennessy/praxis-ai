@@ -533,6 +533,7 @@ impl McpDispatchFilter {
     fn budget_limit_action(ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.tool_calls.clear();
+            state.approved_tool_calls.clear();
             state.dispatch_failure = Some(DispatchFailure {
                 status: 502,
                 code: "server_error",
@@ -775,8 +776,9 @@ impl McpDispatchFilter {
             && state.simple_budget.is_some()
         {
             let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-            let current_count = count_mcp_tool_calls(&state.tool_calls, &tool_index);
-            let current_calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
+            let selected_calls = state.selected_tool_calls();
+            let current_count = count_mcp_tool_calls(&selected_calls, &tool_index);
+            let current_calls = extract_mcp_tool_calls(&selected_calls, &tool_index);
             let sibling_charge = mcp_argument_parse_charge(&current_calls).ok_or_else(mcp_budget_rejection)?;
             if !state
                 .simple_budget
@@ -1094,7 +1096,7 @@ impl HttpFilter for McpDispatchFilter {
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         if let Some(state) = ctx.extensions.get::<ResponsesState>()
             && state.simple_budget.is_some()
-            && state.tool_calls.is_empty()
+            && state.selected_tool_calls().is_empty()
             && state.deferred_mcp.is_empty()
             && (state.iteration != 0 || !state.messages.iter().any(is_approval_response))
         {
@@ -1248,7 +1250,8 @@ impl HttpFilter for McpDispatchFilter {
         let budgeted_count = ctx.extensions.get::<ResponsesState>().and_then(|state| {
             state.simple_budget.map(|_| {
                 let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-                count_mcp_tool_calls(&state.tool_calls, &tool_index)
+                let selected_calls = state.selected_tool_calls();
+                count_mcp_tool_calls(&selected_calls, &tool_index)
             })
         });
         let execution_budget = if let Some(count) = budgeted_count.filter(|count| *count != 0) {
@@ -1259,7 +1262,8 @@ impl HttpFilter for McpDispatchFilter {
                 (prepaid.call_count == count).then_some(prepaid)
             } else {
                 let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-                let calls = extract_mcp_tool_calls(&state.tool_calls, &tool_index);
+                let selected_calls = state.selected_tool_calls();
+                let calls = extract_mcp_tool_calls(&selected_calls, &tool_index);
                 let Some(argument_charge) = mcp_argument_parse_charge(&calls) else {
                     return Ok(Self::budget_limit_action(ctx));
                 };
@@ -1422,15 +1426,21 @@ pub(crate) fn prepare_response_round(
     // The provider payload is already admitted, but approval records, emitted
     // items, persisted rows, and executable call staging are new owners. Admit
     // their worst-case projection before `check_single_approval` copies fields.
-    if let Some(budget) = state.simple_budget.as_mut() {
-        let charge = mcp_calls.iter().try_fold(0_usize, |sum, call| {
+    let staging_charge = if state.simple_budget.is_some() {
+        mcp_calls.iter().try_fold(0_usize, |sum, call| {
             serialized_len(call)
                 .ok()?
                 .checked_mul(12)?
                 .checked_add(8_192)
                 .and_then(|item| sum.checked_add(item))
-        });
-        if !charge.is_some_and(|charge| budget.reserve_additional_input(charge)) {
+        })
+    } else {
+        Some(0)
+    };
+    drop(mcp_calls);
+    drop(selected_calls);
+    if let Some(budget) = state.simple_budget.as_mut() {
+        if !staging_charge.is_some_and(|charge| budget.reserve_additional_input(charge)) {
             return Err(DispatchFailure {
                 status: 502,
                 code: "server_error",
@@ -1438,6 +1448,9 @@ pub(crate) fn prepare_response_round(
             });
         }
     }
+
+    let selected_calls = state.selected_tool_calls();
+    let mcp_calls = extract_mcp_tool_calls(&selected_calls, &tool_index);
 
     let mut pending = Vec::new();
     let mut executable = Vec::new();

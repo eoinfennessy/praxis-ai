@@ -1731,9 +1731,12 @@ fn budgeted_ungated_mcp_round_does_not_reserve_approval_staging() {
     let mut state = ResponsesState {
         simple_budget: SimpleBudget::new(1_048_576, 0),
         mcp_tool_map: tool_map,
-        tool_calls: vec![json!({"name":"weather__get_weather","call_id":"c1","arguments":"{}"})],
         ..ResponsesState::default()
     };
+    state.select_test_output(
+        "function_call",
+        vec![json!({"name":"weather__get_weather","call_id":"c1","arguments":"{}"})],
+    );
     let before = state.simple_budget.unwrap().remaining_bytes();
     prepare_response_round(&mut state, 1).unwrap();
     assert_eq!(state.simple_budget.unwrap().remaining_bytes(), before);
@@ -1745,20 +1748,27 @@ fn budgeted_approval_staging_rejects_before_emitting_or_persisting() {
     let mut state = ResponsesState {
         simple_budget: SimpleBudget::new(4_096, 0),
         mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![json!({
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+    state.select_test_output(
+        "function_call",
+        vec![json!({
             "name": "weather__get_weather",
             "call_id": "c1",
             "arguments": "{\"city\":\"Paris\"}"
         })],
-        store_persist_armed: true,
-        ..ResponsesState::default()
-    };
+    );
 
     let failure = prepare_response_round(&mut state, 1).unwrap_err();
     assert_eq!(failure.status, 502);
     assert!(failure.message.contains("max_retained_bytes"));
     assert!(state.pending_approvals.is_empty());
-    assert!(state.accumulated_output.is_empty());
+    assert_eq!(
+        state.accumulated_output.len(),
+        1,
+        "only the canonical model call may remain"
+    );
 }
 
 #[test]
@@ -2214,12 +2224,15 @@ async fn budgeted_mcp_dispatch_settles_result_before_next_inference_round() {
     let filter = make_dispatch_filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
-    let state = ResponsesState {
+    let mut state = ResponsesState {
         simple_budget: SimpleBudget::new(8_388_608, 1_000),
         mcp_tool_map: sample_tool_map(),
-        tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "{}"})],
         ..ResponsesState::default()
     };
+    state.select_test_output(
+        "function_call",
+        vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "{}"})],
+    );
     let before = state.simple_budget.unwrap().remaining_bytes().unwrap();
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
@@ -2227,7 +2240,11 @@ async fn budgeted_mcp_dispatch_settles_result_before_next_inference_round() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(
+        state.accumulated_output.len(),
+        2,
+        "canonical model call and MCP result remain"
+    );
     assert!(state.dispatch_failure.is_none());
     assert!(state.mcp_execution_budget.is_none(), "peak reservation must be settled");
     let after = state.simple_budget.unwrap().remaining_bytes().unwrap();
