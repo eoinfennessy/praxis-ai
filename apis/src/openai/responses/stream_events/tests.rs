@@ -91,6 +91,7 @@ fn borrowed_terminal_wire_avoids_full_response_clone() {
         payload["response"] = response.clone();
         serde_json::to_writer(&mut cloned_wire, &payload).unwrap();
     });
+    eprintln!("terminal wire allocations: borrowed={borrowed:?}, cloned={cloned:?}");
     assert_eq!(borrowed_wire, cloned_wire);
     assert!(
         borrowed.count_total < cloned.count_total,

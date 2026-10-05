@@ -758,6 +758,10 @@ fn parse_and_accumulate(
 /// Preflight the local lifecycle envelopes while their canonical items are
 /// still borrowed. The later synthesis may clone an item into opening and done
 /// events and grow the encoded wire, so admission must precede that mutation.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one admission covers both local synthesis queues atomically"
+)]
 fn reserve_local_synthesis(ctx: &mut HttpFilterContext<'_>) -> bool {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return true;
@@ -839,6 +843,10 @@ fn count_unreserved_synthesis(
 /// Returns the parsed non-`[DONE]` events, failing closed on the first malformed
 /// frame so the caller can discard the whole chunk without having recorded any
 /// local-tool milestone (#276 finding 3).
+#[expect(
+    clippy::too_many_lines,
+    reason = "frame admission, validation, and accumulation are one atomic pass"
+)]
 fn parse_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
@@ -846,6 +854,15 @@ fn parse_chunk_events(
     now: Instant,
 ) -> Result<Vec<ResponsesEvent>, SseParseError> {
     let mut events = Vec::with_capacity(frames.len());
+    let budgeted_tools = ctx.extensions.get::<ResponsesState>().and_then(|responses| {
+        responses.simple_budget.map(|_| {
+            responses
+                .request_body
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty())
+        })
+    });
     for frame in frames {
         if frame.data == b"[DONE]" {
             state.deferred_done = true;
@@ -862,15 +879,6 @@ fn parse_chunk_events(
         }
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
-        let budgeted_tools = ctx.extensions.get::<ResponsesState>().and_then(|responses| {
-            responses.simple_budget.map(|_| {
-                responses
-                    .request_body
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .is_some_and(|tools| !tools.is_empty())
-            })
-        });
         if budgeted_tools.is_some_and(|tools| !budgeted_stream_event_supported(&event, tools)) {
             return Err(SseParseError::UnsupportedBudgetedOutput);
         }
@@ -2220,17 +2228,18 @@ fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u
 /// the response-body finalizer cannot emit the deferred terminal event. Build
 /// the same canonical terminal representation directly from shared response
 /// state for IRR to append after already-emitted logical stream chunks.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one terminal path handles local lifecycle and canonical response"
+)]
 pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option<Bytes> {
     let parser_deferred_done = ctx
         .get_filter_state::<StreamEventsState>()
         .is_some_and(|state| state.deferred_done);
-    let mut output = match prepare_local_terminal_events(ctx) {
-        Some(output) => output,
-        None => {
-            let mut output = Vec::new();
-            emit_retained_payload_error(ctx, 0, &mut output);
-            return Some(Bytes::from(output));
-        },
+    let Some(mut output) = prepare_local_terminal_events(ctx) else {
+        let mut output = Vec::new();
+        emit_retained_payload_error(ctx, 0, &mut output);
+        return Some(Bytes::from(output));
     };
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let deferred_done = state.deferred_stream_done || parser_deferred_done;
@@ -2316,13 +2325,10 @@ fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u
 /// error event is itself the stream terminator, matching the response-body
 /// finalizer's own error branch, which emits the error and stops.
 pub(crate) fn encode_local_error(ctx: &mut HttpFilterContext<'_>, code: &str, message: &str) -> Option<Bytes> {
-    let mut output = match prepare_local_terminal_events(ctx) {
-        Some(output) => output,
-        None => {
-            let mut output = Vec::new();
-            emit_retained_payload_error(ctx, 0, &mut output);
-            return Some(Bytes::from(output));
-        },
+    let Some(mut output) = prepare_local_terminal_events(ctx) else {
+        let mut output = Vec::new();
+        emit_retained_payload_error(ctx, 0, &mut output);
+        return Some(Bytes::from(output));
     };
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let sequence_number = state.logical_stream_sequence;
@@ -2429,10 +2435,10 @@ fn finalize_emit_terminal(
         // #276: surface any locally executed tool items that never reached the
         // client before the stream terminates with an error, so already-executed
         // tool activity is not silently dropped by a resumed-round parse failure.
-        if !parser_state.retained_budget_failed {
-            flush_local_output_items(ctx, output);
-        } else {
+        if parser_state.retained_budget_failed {
             output.clear();
+        } else {
+            flush_local_output_items(ctx, output);
         }
         normalize_logical_payload(ctx, &mut error, parser_state.output_index_offset);
         encode_sse_event("error", &error, output);
@@ -2460,9 +2466,11 @@ fn emit_retained_payload_error(ctx: &mut HttpFilterContext<'_>, output_index_off
     encode_sse_event("error", &error, output);
 }
 
+/// Client-safe terminal reason for a request-wide retained payload overflow.
 const RETAINED_PAYLOAD_OVERFLOW_MESSAGE: &str =
     "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes";
 
+/// Make an overflow sticky across the remaining logical-stream hooks.
 fn record_retained_payload_failure(ctx: &mut HttpFilterContext<'_>) {
     ctx.set_metadata("responses.stream_error_code", "server_error");
     ctx.set_metadata("responses.stream_error_message", RETAINED_PAYLOAD_OVERFLOW_MESSAGE);
@@ -2674,7 +2682,9 @@ fn restore_terminal_client_tools(state: &mut ResponsesState) -> Result<(), SsePa
 /// Keep only terminal metadata in the deferred event. The response is borrowed
 /// from shared state while the final SSE frame is serialized.
 struct BorrowedTerminalPayload<'a> {
+    /// Deferred event fields other than the canonical response object.
     metadata: &'a Value,
+    /// Shared canonical response serialized directly into the terminal frame.
     response: &'a Value,
 }
 
