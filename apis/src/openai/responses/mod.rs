@@ -96,6 +96,21 @@ pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, byte
     })
 }
 
+/// Deny explicit compaction before a body hook can summarize or persist it.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn budgeted_compaction_rejection(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
+    (ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        && ctx.request.method == http::Method::POST
+        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact")
+        .then(|| {
+            FilterAction::Reject(error::responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "compaction is not yet supported with openai_agentic_loop.max_retained_bytes",
+            ))
+        })
+}
+
 /// Admit only the buffered plain-text path whose retained owners this first
 /// guardrail covers. Other features acquire their own accounting in later PRs.
 #[cfg(feature = "openai-responses")]
@@ -422,22 +437,14 @@ impl HttpFilter for ResponsesFormatFilter {
         }
     }
 
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        #[cfg(feature = "openai-responses")]
-        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
-            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
-        {
-            return Ok(FilterAction::Reject(error::responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "compaction is not yet supported with openai_agentic_loop.max_retained_bytes",
-            )));
-        }
-        #[cfg(not(feature = "openai-responses"))]
-        let _ = ctx;
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "classifies one buffered request after the budget and compaction preflight"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -454,7 +461,9 @@ impl HttpFilter for ResponsesFormatFilter {
         };
 
         #[cfg(feature = "openai-responses")]
-        if let Some(action) = initial_agentic_budget_rejection(ctx, bytes) {
+        if let Some(action) =
+            budgeted_compaction_rejection(ctx).or_else(|| initial_agentic_budget_rejection(ctx, bytes))
+        {
             return Ok(action);
         }
 

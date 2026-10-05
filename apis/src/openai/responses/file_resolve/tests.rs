@@ -223,6 +223,26 @@ fn reject_rewritten_body_too_large_returns_413() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+async fn budgeted_file_resolve_rejects_before_file_callout() {
+    let config = serde_yaml::from_str(
+        "files_api_url: http://127.0.0.1:9\nallow_pre_security_callout: true\non_missing: continue\ntimeout_ms: 100",
+    )
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&config).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let raw = br#"{"model":"test","input":[{"type":"input_file","file_id":"file-1"}]}"#;
+    let mut body = Some(Bytes::from_static(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+    assert_eq!(body.as_deref(), Some(raw.as_slice()));
+}
+
+#[tokio::test]
 async fn skips_non_responses_request() {
     let filter = make_filter();
     let req = Box::leak(Box::new(crate::test_utils::make_request(

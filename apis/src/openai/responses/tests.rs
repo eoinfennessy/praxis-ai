@@ -22,6 +22,20 @@ fn budgeted_plain_request_rejects_nested_optional_values() {
     assert!(plain_agentic_request_supported(request.as_object().unwrap()));
 }
 
+#[tokio::test]
+#[cfg(feature = "openai-responses")]
+async fn budgeted_legacy_classifier_rejects_compaction_in_body_phase() {
+    let filter = ResponsesFormatFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+}
+
 // -----------------------------------------------------------------------------
 // Config Parsing
 // -----------------------------------------------------------------------------

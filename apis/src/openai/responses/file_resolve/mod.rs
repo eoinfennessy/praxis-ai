@@ -87,8 +87,8 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    AgenticBudgetPolicy, body_limits::reject_rewritten_body_too_large, bound_body_outcome,
+    error::responses_error_rejection, openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -376,6 +376,14 @@ impl HttpFilter for FileResolveFilter {
             return Ok(FilterAction::Release);
         }
 
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some() {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "file resolution is not yet supported with openai_agentic_loop.max_retained_bytes",
+            )));
+        }
+
         let Some(raw) = body.as_ref() else {
             trace!("no body, releasing");
             return Ok(FilterAction::Release);
@@ -525,11 +533,7 @@ fn build_outbound_execution(
 /// agentic and ordinary Responses pipelines without relying on a later loop owner.
 fn reject_missing_callout_context(slot: &str) -> FilterAction {
     let message = format!("file resolution requires the '{slot}' per-user credential, which was not provided");
-    FilterAction::Reject(super::error::responses_error_rejection(
-        401,
-        MISSING_CALLOUT_CONTEXT,
-        &message,
-    ))
+    FilterAction::Reject(responses_error_rejection(401, MISSING_CALLOUT_CONTEXT, &message))
 }
 
 /// Enforce the resolver's body limit against the exact request shape

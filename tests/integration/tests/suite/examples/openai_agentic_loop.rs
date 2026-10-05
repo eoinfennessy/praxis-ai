@@ -82,6 +82,12 @@ fn retained_budget_rejects_oversized_initial_input_before_inference() {
     assert!(!parse_body(&raw).is_empty(), "empty 413 response: {raw:?}");
     let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
     assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max_retained_bytes")),
+        "413 must identify the retained-payload budget: {body}"
+    );
     assert!(model.requests().is_empty(), "rejected input must not reach inference");
 }
 

@@ -118,16 +118,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         }
     }
 
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if ctx.extensions.get::<super::AgenticBudgetPolicy>().is_some()
-            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
-        {
-            return Ok(FilterAction::Reject(super::error::responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "compaction is not yet supported with openai_agentic_loop.max_retained_bytes",
-            )));
-        }
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
 
@@ -143,6 +134,10 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+
+        if let Some(action) = super::budgeted_compaction_rejection(ctx) {
+            return Ok(action);
         }
 
         let Some(matched) = matched_body_bearing_operation(ctx) else {

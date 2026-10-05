@@ -52,6 +52,19 @@ async fn budgeted_plain_create_initializes_shared_charge() {
 }
 
 #[tokio::test]
+async fn budgeted_fused_request_rejects_compaction_in_body_phase() {
+    let filter = default_filter();
+    let req = make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+}
+
+#[tokio::test]
 async fn budgeted_create_rejects_large_body_before_parse() {
     let request = create_request();
     let mut ctx = make_filter_context(&request);

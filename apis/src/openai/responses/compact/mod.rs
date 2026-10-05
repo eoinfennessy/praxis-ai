@@ -57,6 +57,7 @@ use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{
+    budgeted_compaction_rejection,
     error::responses_error_rejection,
     is_explicit_compact_request,
     state::{ResponsesState, mark_local_compaction_item},
@@ -385,6 +386,9 @@ impl HttpFilter for CompactFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+        if let Some(action) = budgeted_compaction_rejection(ctx) {
+            return Ok(action);
         }
         if is_explicit_compact_request(ctx) {
             return self.handle_explicit_compact(ctx, body).await;

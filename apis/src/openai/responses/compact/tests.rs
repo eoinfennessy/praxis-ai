@@ -783,6 +783,19 @@ fn make_filter(on_failure: &str) -> CompactFilter {
     }
 }
 
+#[tokio::test]
+async fn budgeted_compaction_filter_rejects_before_callout() {
+    let filter = make_filter("closed");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions
+        .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+}
+
 #[test]
 fn callout_error_open_mode_skips_compaction() {
     let filter = make_filter("open");
