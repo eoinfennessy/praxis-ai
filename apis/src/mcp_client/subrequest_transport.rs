@@ -710,10 +710,15 @@ impl McpSubrequestClient {
             ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::CallToolRequest(_)) => {
                 self.tool_result_bytes
             },
-            _ => self.budgeted_limits.map_or(MAX_CONTROL_RESPONSE_BYTES, |limits| {
-                MAX_CONTROL_RESPONSE_BYTES.min(limits.wire_limit)
-            }),
+            _ => self.control_response_limit(),
         }
+    }
+
+    /// Shared control-plane bound for POST replies and session DELETE cleanup.
+    fn control_response_limit(&self) -> usize {
+        self.budgeted_limits.map_or(MAX_CONTROL_RESPONSE_BYTES, |limits| {
+            MAX_CONTROL_RESPONSE_BYTES.min(limits.wire_limit)
+        })
     }
 
     /// Reject compact JSON trees before rmcp allocates parsed nodes.
@@ -1183,7 +1188,7 @@ impl StreamableHttpClient for McpSubrequestClient {
             &uri,
             Bytes::new(),
             headers,
-            MAX_CONTROL_RESPONSE_BYTES,
+            self.control_response_limit(),
             &signal,
         ))
         .await?;
@@ -2057,6 +2062,40 @@ mod tests {
             signal.get(),
             Some(TransportSignal::ResponseTooLarge { limit: 32_768 })
         ));
+    }
+
+    #[tokio::test]
+    async fn budgeted_delete_response_uses_reserved_control_wire_cap() {
+        let router = axum::Router::new().route("/mcp", axum::routing::delete(|| async { vec![b'x'; 2_048] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let uri: Arc<str> = format!("http://{}/mcp", listener.local_addr().expect("server address")).into();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve test server");
+        });
+        let limits = McpBudgetedCallLimits {
+            wire_limit: 512,
+            parse_charge_limit: 32_768,
+        };
+        let client = McpSubrequestClient::for_tool_with_budget(
+            McpCallout::fabricated(true).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2_048,
+            Some(limits),
+            None,
+        );
+        let outcome = client
+            .delete_session(uri, "session-1".into(), None, HashMap::new())
+            .await;
+        server.abort();
+        assert!(
+            matches!(
+                outcome,
+                Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+            ),
+            "DELETE must reject a response larger than the request's reserved wire cap: {outcome:?}"
+        );
     }
 
     #[test]

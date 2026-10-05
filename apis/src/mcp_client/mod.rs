@@ -797,14 +797,14 @@ async fn call_tool_with_limits(
                     let rejected = pool.checkin(key.clone(), session);
                     session_pool::close_sessions_in_background(rejected);
                 },
-                (None, Some(session)) => session.close_before(deadline).await,
+                (None, Some(session)) => close_fresh_session(session, deadline, budgeted_limits).await,
                 (_, None) => {},
             }
             Ok(result)
         },
         Ok(Err(err)) => {
             if let Some(session) = session.take() {
-                session.close_before(deadline).await;
+                close_fresh_session(session, deadline, budgeted_limits).await;
             }
             Err(err)
         },
@@ -813,7 +813,7 @@ async fn call_tool_with_limits(
             // oversized/SSRF exchange surfaced only when the deadline fired still
             // maps to its typed error.
             if let Some(session) = session.take() {
-                session.close_before(deadline).await;
+                close_fresh_session(session, deadline, budgeted_limits).await;
             }
             Err(call_signal.map_or_else(
                 || McpClientError::Timeout {
@@ -823,6 +823,21 @@ async fn call_tool_with_limits(
                 |signal| classify_deadline(&signal, &display_url, timeout),
             ))
         },
+    }
+}
+
+/// A budgeted result can release its callout reservation only after rmcp's
+/// worker has stopped retaining the transport and any DELETE response. Normal
+/// unbudgeted calls keep their existing bounded close behavior.
+async fn close_fresh_session(
+    session: PooledSession,
+    deadline: tokio::time::Instant,
+    budgeted_limits: Option<McpBudgetedCallLimits>,
+) {
+    if budgeted_limits.is_some() {
+        session.close_budgeted().await;
+    } else {
+        session.close_before(deadline).await;
     }
 }
 
