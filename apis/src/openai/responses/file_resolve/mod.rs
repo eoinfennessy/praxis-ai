@@ -356,6 +356,10 @@ impl HttpFilter for FileResolveFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the request hook checks the budgeted no-op path before any file callout"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
