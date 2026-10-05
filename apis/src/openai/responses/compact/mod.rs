@@ -43,7 +43,7 @@ pub(super) mod config;
 )]
 mod tests;
 
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, io, time::Duration};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -57,6 +57,10 @@ use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{
+    agentic_loop::{
+        AgenticBudgetPolicy,
+        budget::{SimpleBudget, input_charge},
+    },
     budgeted_compaction_rejection,
     error::responses_error_rejection,
     is_explicit_compact_request,
@@ -75,6 +79,15 @@ use crate::{
 
 /// Maximum response body size for summarization callouts (1 MiB).
 const MAX_SUMMARIZATION_RESPONSE_BYTES: usize = 1_048_576;
+
+/// Account for tokenization, rendered text, callout JSON, and the replacement
+/// history while the original decoded history remains live.
+const COMPACTION_SOURCE_MULTIPLIER: usize = 128;
+
+/// A buffered callout can contain one JSON node per byte. Reserve space for
+/// its transport, parsed tree, summary, base64 item, and history copies before
+/// allowing the subrequest to read that many bytes.
+const COMPACTION_RESPONSE_MULTIPLIER: usize = 320;
 
 /// Minimum allowed `compact_threshold` for compaction (1,000 tokens).
 const MIN_COMPACT_THRESHOLD: u64 = 1_000; // 1,000 tokens
@@ -205,9 +218,13 @@ impl CompactFilter {
     }
 
     /// Run the summarization callout and return the summary text.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one callout needs preflight, bounded read, and post-read charge"
+    )]
     async fn execute_compaction(
         &self,
-        state: &ResponsesState,
+        state: &mut ResponsesState,
         params: &CompactionParams,
         conversation_text: &str,
     ) -> Result<Option<String>, FilterAction> {
@@ -215,15 +232,34 @@ impl CompactFilter {
         let instructions = state.request_body.get("instructions").and_then(Value::as_str);
         let request = build_summarization_request(conversation_text, instructions, model);
         let timeout = Duration::from_millis(self.config.callout.timeout_ms);
+        let response_limit = compaction_response_limit(state.simple_budget)?;
         let result = subrequest::execute_url(
             &self.client,
             &self.config.inference_url,
             request,
-            MAX_SUMMARIZATION_RESPONSE_BYTES,
+            response_limit,
             timeout,
             self.config.address_policy,
         )
         .await;
+        if let Some(budget) = state.simple_budget.as_mut() {
+            match &result {
+                Ok(response) => {
+                    let charge = input_charge(&response.body)
+                        .and_then(|charge| response.body.len().checked_mul(16)?.checked_add(charge))
+                        .ok_or_else(reject_compaction_budget)?;
+                    if !budget.reserve_additional_input(charge) {
+                        return Err(reject_compaction_budget());
+                    }
+                },
+                Err(subrequest::SubRequestError::ResponseTooLarge { .. })
+                    if response_limit < MAX_SUMMARIZATION_RESPONSE_BYTES =>
+                {
+                    return Err(reject_compaction_budget());
+                },
+                _ => {},
+            }
+        }
         Ok(self.handle_subrequest_result(result)?.map(|s| s.content))
     }
 
@@ -299,7 +335,26 @@ impl CompactFilter {
     }
 
     /// Check the threshold and run summarization if it is exceeded.
-    async fn check_and_summarize(&self, state: &ResponsesState) -> Result<Option<String>, FilterAction> {
+    async fn check_and_summarize(&self, state: &mut ResponsesState) -> Result<Option<String>, FilterAction> {
+        let config = extract_compaction_config(&state.context_management)
+            .map_err(|message| reject_compact(400, "invalid_request_error", &message))?;
+        let Some(config) = config else {
+            return Ok(None);
+        };
+        if previous_usage_total(state).is_some_and(|total| !exceeds_threshold(total, &config)) {
+            return Ok(None);
+        }
+        if let Some(budget) = state.simple_budget.as_mut() {
+            let bytes = count_json_bytes(&state.messages)
+                .and_then(|history| count_json_bytes(&state.request_body)?.checked_add(history))
+                .ok_or_else(reject_compaction_budget)?;
+            let charge = bytes
+                .checked_mul(COMPACTION_SOURCE_MULTIPLIER)
+                .ok_or_else(reject_compaction_budget)?;
+            if !budget.reserve_additional_input(charge) {
+                return Err(reject_compaction_budget());
+            }
+        }
         let (params, conversation_text) = match should_compact(state, &self.config.tiktoken_encoding) {
             Ok(Some(pair)) => pair,
             Ok(None) => return Ok(None),
@@ -358,6 +413,53 @@ impl CompactFilter {
     }
 }
 
+/// Determine a transport cap before the callout can buffer a response. The
+/// later charge uses its actual JSON shape, while this worst-case allowance
+/// ensures even an unusually dense JSON tree fits before parsing begins.
+fn compaction_response_limit(budget: Option<SimpleBudget>) -> Result<usize, FilterAction> {
+    let Some(budget) = budget else {
+        return Ok(MAX_SUMMARIZATION_RESPONSE_BYTES);
+    };
+    let bytes = budget.remaining_bytes().unwrap_or(0) / COMPACTION_RESPONSE_MULTIPLIER;
+    if bytes == 0 {
+        return Err(reject_compaction_budget());
+    }
+    Ok(bytes.min(MAX_SUMMARIZATION_RESPONSE_BYTES))
+}
+
+/// Count already parsed JSON without building another serialized payload.
+fn count_json_bytes<T: serde::Serialize>(value: &T) -> Option<usize> {
+    let mut counter = JsonByteCounter(0);
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
+}
+
+/// Counts encoded JSON bytes without retaining the serialized payload.
+struct JsonByteCounter(usize);
+
+impl io::Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::other("compaction JSON size overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Budget failures always terminate the request, including fail-open callouts.
+fn reject_compaction_budget() -> FilterAction {
+    reject_compact(
+        413,
+        "invalid_request_error",
+        "compaction exceeds openai_agentic_loop.max_retained_bytes",
+    )
+}
+
 #[async_trait]
 impl HttpFilter for CompactFilter {
     fn name(&self) -> &'static str {
@@ -378,6 +480,10 @@ impl HttpFilter for CompactFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "reactive and explicit admission share the body hook"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -402,10 +508,18 @@ impl HttpFilter for CompactFilter {
         if !ensure_compactable_state(ctx) {
             return Ok(FilterAction::Release);
         }
-        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        let budgeted = ctx.extensions.get::<AgenticBudgetPolicy>().is_some();
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             warn!("ResponsesState missing after ensure_compactable_state");
             return Ok(FilterAction::Release);
         };
+        if budgeted && state.simple_budget.is_none() {
+            return Ok(reject_compact(
+                500,
+                "server_error",
+                "retained-payload budget state is missing",
+            ));
+        }
         let summary = match self.check_and_summarize(state).await {
             Ok(Some(summary)) => summary,
             Ok(None) | Err(FilterAction::Release) => return Ok(FilterAction::Release),

@@ -789,7 +789,7 @@ async fn budgeted_compaction_filter_rejects_before_callout() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions
-        .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
     let original = body.clone();
 
@@ -918,6 +918,37 @@ fn should_compact_skips_when_previous_usage_below_threshold() {
     state.previous_usage = Some(json!({"total_tokens": 500}));
     let result = should_compact(&state, "cl100k_base").unwrap();
     assert!(result.is_none(), "should skip when previous_usage is below threshold");
+}
+
+#[tokio::test]
+async fn reactive_compaction_rejects_source_expansion_before_callout_even_when_fail_open() {
+    let filter = make_filter("open");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "new turn",
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    state.messages = vec![json!({"role": "user", "content": "old context".repeat(40)})];
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+    state.simple_budget = SimpleBudget::new(4_096, 100);
+
+    let result = filter.check_and_summarize(&mut state).await;
+    let Err(FilterAction::Reject(rejection)) = result else {
+        panic!("source expansion must fail before the callout");
+    };
+    assert_eq!(rejection.status, 413);
+    let text = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(text.contains("max_retained_bytes"), "{text}");
+}
+
+#[test]
+fn reactive_compaction_callout_cap_uses_remaining_request_budget() {
+    let mut budget = SimpleBudget::new(65_536, 100).unwrap();
+    assert!(budget.reserve_additional_input(30_000));
+    let cap = compaction_response_limit(Some(budget)).unwrap();
+    assert!(cap > 0 && cap < MAX_SUMMARIZATION_RESPONSE_BYTES);
+    assert!(cap * COMPACTION_RESPONSE_MULTIPLIER <= budget.remaining_bytes().unwrap());
+    assert!(compaction_response_limit(None).unwrap() == MAX_SUMMARIZATION_RESPONSE_BYTES);
 }
 
 // =============================================================================
