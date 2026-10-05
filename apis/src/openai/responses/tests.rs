@@ -24,7 +24,6 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     for key in [
         "tools",
         "tool_choice",
-        "previous_response_id",
         "conversation",
         "prompt",
         "include",
@@ -45,6 +44,9 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     assert!(plain_agentic_request_supported(request.as_object().unwrap()));
     request.as_object_mut().unwrap().remove("store");
     assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+    request["previous_response_id"] = serde_json::Value::String("resp_prev".to_owned());
+    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+    request.as_object_mut().unwrap().remove("previous_response_id");
 }
 
 #[tokio::test]

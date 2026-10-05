@@ -5331,8 +5331,9 @@ class TestAgenticLoopVLLM:
         [
             {"stream": True, "store": False},
             {"store": False, "tools": [{"type": "web_search_preview"}]},
+            {"store": False, "conversation": "conv_existing"},
         ],
-        ids=["streaming", "hosted-tool"],
+        ids=["streaming", "hosted-tool", "conversation-append-back"],
     )
     def test_retained_budget_rejects_unsupported_sdk_requests(self, agentic_client, options):
         """The first budget slice rejects unmetered paths before inference."""
@@ -5364,6 +5365,18 @@ class TestAgenticLoopVLLM:
         )
         assert response.status == "completed", response
         assert response.object == "response", response
+
+    def test_retained_budget_restores_previous_plain_response(self, agentic_client):
+        """A stored text turn can be resumed with a request-wide budget."""
+        first = agentic_client.responses.create(model=VLLM_MODEL, input="Say hello briefly")
+        second = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say goodbye briefly",
+            previous_response_id=first.id,
+            store=False,
+        )
+        assert second.id != first.id
+        assert second.previous_response_id == first.id
 
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,

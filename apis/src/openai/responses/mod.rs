@@ -133,7 +133,7 @@ pub(crate) fn plain_agentic_budget(
         return Err(FilterAction::Reject(error::responses_error_rejection(
             400,
             "invalid_request_error",
-            "openai_agentic_loop.max_retained_bytes currently supports only buffered text requests without tools or history",
+            "openai_agentic_loop.max_retained_bytes currently supports buffered text and bounded previous_response_id restore; other paths are pending",
         )));
     }
     let charge = agentic_loop::budget::input_charge(bytes).unwrap_or(usize::MAX);
@@ -156,14 +156,7 @@ fn plain_agentic_request_supported(object: &serde_json::Map<String, serde_json::
         && !object.keys().any(|key| {
             matches!(
                 key.as_str(),
-                "tools"
-                    | "tool_choice"
-                    | "previous_response_id"
-                    | "conversation"
-                    | "prompt"
-                    | "include"
-                    | "background"
-                    | "context_management"
+                "tools" | "tool_choice" | "conversation" | "prompt" | "include" | "background" | "context_management"
             )
         })
 }

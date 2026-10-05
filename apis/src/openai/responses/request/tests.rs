@@ -135,7 +135,7 @@ async fn budgeted_create_rejects_unaccounted_owners() {
     for body in [
         json!({"input":"hello","store":false,"stream":true}),
         json!({"input":"hello","store":false,"tools":[{"type":"web_search_preview"}]}),
-        json!({"input":"hello","store":false,"previous_response_id":"resp_old"}),
+        json!({"input":"hello","store":false,"conversation":"conv_old"}),
         json!({"input":"hello","store":false,"context_management":{"type":"compaction"}}),
     ] {
         let mut ctx = make_filter_context(&request);
@@ -148,6 +148,29 @@ async fn budgeted_create_rejects_unaccounted_owners() {
             "{body}"
         );
         assert!(ctx.extensions.get::<ResponsesState>().is_none());
+    }
+}
+
+#[tokio::test]
+async fn budgeted_create_keeps_history_selector_for_bounded_restore() {
+    let request = create_request();
+    for body in [json!({"input":"hello","store":false,"previous_response_id":"resp_old"})] {
+        let mut ctx = make_filter_context(&request);
+        ctx.extensions
+            .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        let mut bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+        let action = default_filter()
+            .on_request_body(&mut ctx, &mut bytes, true)
+            .await
+            .unwrap();
+        assert!(matches!(action, FilterAction::Release), "{body}");
+        assert!(
+            ctx.extensions
+                .get::<ResponsesState>()
+                .and_then(|state| state.simple_budget)
+                .is_some(),
+            "request-wide budget must survive through bounded restore"
+        );
     }
 }
 

@@ -41,6 +41,11 @@ pub(crate) struct SimpleBudget {
 }
 
 impl SimpleBudget {
+    /// Headroom after all request-wide reserves, including the transport.
+    pub(crate) fn remaining_bytes(self) -> Option<usize> {
+        self.limit.checked_sub(self.charge()?)
+    }
+
     /// Admit a request after the allocation-free ingress scan.
     #[cfg(test)]
     pub(crate) fn new(limit: usize, input_charge: usize) -> Option<Self> {
@@ -211,6 +216,14 @@ mod tests {
         assert!(!budget.admit_output(&[b' '; 1]));
         assert!(budget.lower_limit(4_096));
         assert!(!budget.lower_limit(4_092));
+    }
+
+    #[test]
+    fn restored_owner_reduces_output_headroom() {
+        let mut budget = SimpleBudget::new(8_388_608, 1_000).unwrap();
+        let before = budget.remaining_bytes().unwrap();
+        assert!(budget.reserve_additional_input(128_000));
+        assert_eq!(budget.remaining_bytes(), Some(before - 128_000));
     }
 
     #[test]

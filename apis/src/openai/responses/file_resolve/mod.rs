@@ -393,23 +393,8 @@ impl HttpFilter for FileResolveFilter {
             },
         };
 
-        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some() {
-            // A string input has no content parts for this filter to resolve.
-            // The request validator has already charged this parsed body, and
-            // rehydrated history is still guarded until its copies are metered.
-            let no_resolution = parsed.get("input").is_some_and(serde_json::Value::is_string)
-                && ctx
-                    .extensions
-                    .get::<ResponsesState>()
-                    .is_some_and(|state| state.simple_budget.is_some() && !state.history_rehydrated);
-            if no_resolution {
-                return Ok(FilterAction::Continue);
-            }
-            return Ok(FilterAction::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                "file resolution is not yet supported with openai_agentic_loop.max_retained_bytes",
-            )));
+        if let Some(action) = budgeted_plain_file_action(ctx, &parsed) {
+            return Ok(action);
         }
 
         resolve_and_rewrite(self, ctx, body, parsed).await
@@ -448,6 +433,52 @@ impl HttpFilter for FileResolveFilter {
         if let Some(outbound) = self.outbound.as_ref() {
             outbound.apply_insecure_options(options);
         }
+    }
+}
+
+/// Bypass the resolver only when neither current input nor retained history
+/// contains content that this filter can expand.
+fn budgeted_plain_file_action(ctx: &HttpFilterContext<'_>, parsed: &serde_json::Value) -> Option<FilterAction> {
+    ctx.extensions.get::<AgenticBudgetPolicy>()?;
+    // Rehydrate has charged stored history before replacing state. Inspect
+    // both independent vectors because either can contain a file reference.
+    let no_resolution = parsed.get("input").is_some_and(serde_json::Value::is_string)
+        && ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+            state.simple_budget.is_some()
+                && state
+                    .messages
+                    .iter()
+                    .all(|item| !budgeted_history_needs_file_resolution(item))
+                && state
+                    .persisted_messages
+                    .iter()
+                    .all(|item| !budgeted_history_needs_file_resolution(item))
+        });
+    Some(if no_resolution {
+        FilterAction::Continue
+    } else {
+        FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "file resolution is not yet supported with openai_agentic_loop.max_retained_bytes",
+        ))
+    })
+}
+
+/// Skip the resolver only when every retained history projection has no
+/// file-bearing content. This borrowed walk never clones provider payloads.
+fn budgeted_history_needs_file_resolution(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(budgeted_history_needs_file_resolution),
+        serde_json::Value::Object(fields) => {
+            matches!(
+                fields.get("type").and_then(serde_json::Value::as_str),
+                Some("input_file")
+            ) || (fields.get("type").and_then(serde_json::Value::as_str) == Some("input_image")
+                && (fields.contains_key("file_id") || fields.contains_key("file_url")))
+                || fields.values().any(budgeted_history_needs_file_resolution)
+        },
+        _ => false,
     }
 }
 

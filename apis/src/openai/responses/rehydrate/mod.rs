@@ -29,7 +29,7 @@
 //!
 //! [`ResponsesState`]: super::state::ResponsesState
 
-use std::collections::HashSet;
+use std::{collections::HashSet, io};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -45,7 +45,8 @@ use tracing::{debug, trace, warn};
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
-    DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
+    AgenticBudgetPolicy, DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome,
+    canonical_openresponses_replay_item,
     error::responses_error_rejection,
     extract_conversation_id,
     state::{ResponsesState, strip_local_compaction_marker},
@@ -53,8 +54,20 @@ use super::{
 use crate::{
     is_event_stream_content_type,
     state_owner::{StateOwner, require_state_owner},
-    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
+    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
+
+/// A bounded read's raw columns, parsed JSON, replay copies, and replacement
+/// state can coexist. Sparse nested arrays expand sharply under `serde_json`'s
+/// Value representation, so reserve well beyond their encoded byte length.
+const RESTORED_PAYLOAD_MULTIPLIER: usize = 512;
+
+/// Return whether the current operation is a budgeted Responses create.
+fn budgeted_create(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        && ctx.request.method == http::Method::POST
+        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses"
+}
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -146,6 +159,12 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
+        if budgeted_create(ctx) && response_history_needs_file_expansion(&record) {
+            return Ok(reject_budgeted_file_history());
+        }
+        if let Err(action) = reserve_restored_response(ctx, &record) {
+            return Ok(action);
+        }
         let previous_tools = collect_mcp_tool_listings(&record);
         #[cfg(feature = "openai-mcp-tools")]
         let mut previous_tools = previous_tools;
@@ -1148,6 +1167,126 @@ fn stored_messages_for_conversation(record: ConversationRecord) -> Vec<Value> {
     }
 }
 
+/// Leave enough headroom for every live projection before Store decodes a row.
+/// A backend without bounded reads fails closed through its default method.
+fn restore_read_limit(ctx: &HttpFilterContext<'_>) -> Result<Option<usize>, FilterAction> {
+    if !budgeted_create(ctx) {
+        return Ok(None);
+    }
+    let budget = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.simple_budget)
+        .ok_or_else(|| reject_server_error("retained-payload budget state is missing"))?;
+    Ok(Some(
+        budget.remaining_bytes().unwrap_or(0) / RESTORED_PAYLOAD_MULTIPLIER,
+    ))
+}
+
+/// Charge Store's independently owned record before any replay or metadata copy.
+fn reserve_restored_bytes(ctx: &mut HttpFilterContext<'_>, bytes: Option<usize>) -> Result<(), FilterAction> {
+    if !budgeted_create(ctx) {
+        return Ok(());
+    }
+    let charge = bytes
+        .and_then(|bytes| bytes.checked_mul(RESTORED_PAYLOAD_MULTIPLIER))
+        .ok_or_else(reject_restored_payload_too_large)?;
+    let budget = ctx
+        .extensions
+        .get_mut::<ResponsesState>()
+        .and_then(|state| state.simple_budget.as_mut())
+        .ok_or_else(|| reject_server_error("retained-payload budget state is missing"))?;
+    if budget.reserve_additional_input(charge) {
+        Ok(())
+    } else {
+        Err(reject_restored_payload_too_large())
+    }
+}
+
+/// Reserve the complete stored response projection before deriving replay state.
+fn reserve_restored_response(ctx: &mut HttpFilterContext<'_>, record: &ResponseRecord) -> Result<(), FilterAction> {
+    if !budgeted_create(ctx) {
+        return Ok(());
+    }
+    let bytes = count_record_values(&[&record.response_object, &record.input, &record.messages])
+        .and_then(|bytes| bytes.checked_add(record.id.len()))
+        .and_then(|bytes| bytes.checked_add(record.model.len()));
+    reserve_restored_bytes(ctx, bytes)
+}
+
+/// `serde_json::to_writer` visits the decoded tree without allocating another
+/// payload. Its encoded length is a conservative size basis for every copy.
+fn count_record_values(values: &[&Value]) -> Option<usize> {
+    let mut counter = JsonByteCounter(0);
+    for value in values {
+        serde_json::to_writer(&mut counter, value).ok()?;
+    }
+    Some(counter.0)
+}
+
+/// Allocation-free count of serialized JSON bytes.
+struct JsonByteCounter(usize);
+
+impl io::Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::other("JSON size overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Return a client error when stored history cannot fit the request budget.
+fn reject_restored_payload_too_large() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        413,
+        "invalid_request_error",
+        "stored history exceeds openai_agentic_loop.max_retained_bytes",
+    ))
+}
+
+/// File resolution and document extraction can expand stored history after
+/// rehydration. Their request-wide charges land in their respective slices.
+fn response_history_needs_file_expansion(record: &ResponseRecord) -> bool {
+    if record.messages.as_array().is_some_and(|messages| !messages.is_empty()) {
+        history_needs_file_expansion(&record.messages)
+    } else {
+        history_needs_file_expansion(&record.input)
+            || record
+                .response_object
+                .get("output")
+                .is_some_and(history_needs_file_expansion)
+    }
+}
+
+/// Find stored content that downstream file filters can expand.
+fn history_needs_file_expansion(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(history_needs_file_expansion),
+        Value::Object(fields) => {
+            matches!(fields.get("type").and_then(Value::as_str), Some("input_file"))
+                || (fields.get("type").and_then(Value::as_str) == Some("input_image")
+                    && (fields.contains_key("file_id") || fields.contains_key("file_url")))
+                || fields.values().any(history_needs_file_expansion)
+        },
+        _ => false,
+    }
+}
+
+/// Keep unmetered file resolution out of this restore slice.
+fn reject_budgeted_file_history() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        400,
+        "invalid_request_error",
+        "stored file history is not yet supported with openai_agentic_loop.max_retained_bytes",
+    ))
+}
+
 /// Fetch the previous response and validate its status in one step.
 async fn fetch_and_validate_previous(
     ctx: &HttpFilterContext<'_>,
@@ -1304,7 +1443,15 @@ async fn fetch_previous_response(
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_response(prev_id).await.map_err(|e| {
+    let read_limit = restore_read_limit(ctx)?;
+    let result = match read_limit {
+        Some(limit) => store.get_response_bounded(prev_id, limit).await,
+        None => store.get_response(prev_id).await,
+    };
+    let record = result.map_err(|e| {
+        if matches!(&e, StoreError::PayloadTooLarge) {
+            return reject_restored_payload_too_large();
+        }
         warn!(error = %e, "rehydrate: failed to fetch previous response");
         reject_server_error("failed to fetch previous response")
     })?;
@@ -1424,11 +1571,10 @@ fn mcp_tool_names(tools: &[Value]) -> Vec<String> {
 /// metadata (assigned upstream), since the reconstructed state cannot derive it
 /// from the request body.
 fn install_rehydrated_state(ctx: &mut HttpFilterContext<'_>, mut state: ResponsesState) {
-    let store_persist_armed = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .is_some_and(|prev| prev.store_persist_armed);
-    state.store_persist_armed = store_persist_armed;
+    if let Some(previous) = ctx.extensions.get::<ResponsesState>() {
+        state.store_persist_armed = previous.store_persist_armed;
+        state.simple_budget = previous.simple_budget;
+    }
     state.response_id = ctx.get_metadata("responses.response_id").map(ToOwned::to_owned);
     write_previous_usage_metadata(ctx, state.previous_usage.as_ref());
     ctx.extensions.insert(state);

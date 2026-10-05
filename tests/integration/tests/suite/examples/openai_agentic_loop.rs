@@ -113,6 +113,45 @@ fn retained_budget_persists_default_store_plain_response() {
     assert_eq!(model.requests().len(), 1, "retrieve must not run inference");
 }
 
+#[test]
+fn retained_budget_restores_previous_plain_response() {
+    let first = r#"{"id":"resp_first","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_first","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}]}"#;
+    let second = r#"{"id":"resp_second","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_second","role":"assistant","content":[{"type":"output_text","text":"Second answer"}]}]}"#;
+    let model =
+        StatefulCapturingBackend::new(vec![(200, first.to_owned()), (200, second.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_restore_previous");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let first_raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&first_raw), 200, "first response: {first_raw}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&first_raw)).unwrap();
+    let first_id = created["id"].as_str().expect("created response id");
+    let next_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Next turn",
+        "store": false,
+        "previous_response_id": first_id,
+    });
+    let next_raw = http_send(proxy.addr(), &json_post("/v1/responses", &next_body.to_string()));
+    assert_eq!(parse_status(&next_raw), 200, "bounded restore: {next_raw}");
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2, "one inference per turn");
+    let second_sent: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+    assert!(
+        second_sent["input"].as_array().is_some_and(|items| items.len() >= 3),
+        "backend must receive previous input/output and new turn: {second_sent}"
+    );
+    assert!(
+        second_sent.get("previous_response_id").is_none(),
+        "locally rehydrated history must not also ask the backend to restore it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_budget_store_overflow_skips_persistence() {
     let response = serde_json::json!({
@@ -213,6 +252,7 @@ fn retained_budget_rejects_tools_and_streaming_before_inference() {
     for request_body in [
         r#"{"model":"gpt-4.1","input":"Hi","store":false,"stream":true}"#,
         r#"{"model":"gpt-4.1","input":"Hi","store":false,"tools":[{"type":"web_search_preview"}]}"#,
+        r#"{"model":"gpt-4.1","input":"Hi","store":false,"conversation":"conv_existing"}"#,
     ] {
         let raw = http_send(proxy.addr(), &json_post("/v1/responses", request_body));
         assert_eq!(parse_status(&raw), 400, "request: {request_body}");
