@@ -8,7 +8,7 @@ use http::Method;
 use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode, TrustedHeaderMutation};
 use serde_json::{Value, json};
 
-use super::super::state::ResponsesState;
+use super::{super::state::ResponsesState, budget::SimpleBudget};
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
@@ -53,6 +53,74 @@ fn from_config_rejects_zero_max_infer_iters() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 0").unwrap();
     let result = super::AgenticLoopFilter::from_config(&yaml);
     assert!(result.is_err(), "max_infer_iters=0 should be rejected");
+}
+
+#[tokio::test]
+async fn budgeted_loop_rejects_missing_initializer_before_dispatch() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions
+        .insert(super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+}
+
+#[test]
+fn budgeted_buffered_output_rejects_before_json_parse() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(4_096, 0).unwrap());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "object":"response", "output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]
+        }))
+        .unwrap(),
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budgeted_model_tool_output_rejects_before_dispatch_assignment() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(65_536, 0).unwrap());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "object":"response", "output":[{"type":"web_search_call","id":"ws_1","status":"in_progress"}]
+        }))
+        .unwrap(),
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+}
+
+#[test]
+fn budgeted_plain_buffered_response_succeeds() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(65_536, 0).unwrap());
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&json!({
+        "object":"response", "status":"completed", "output":[{"type":"message","content":[{"type":"output_text","text":"hello"}]}]
+    })).unwrap()));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    let response: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(response["output"][0]["content"][0]["text"], "hello");
 }
 
 // -----------------------------------------------------------------------------

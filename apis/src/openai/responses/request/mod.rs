@@ -118,7 +118,16 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         }
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if ctx.extensions.get::<super::AgenticBudgetPolicy>().is_some()
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(FilterAction::Reject(super::error::responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "compaction is not yet supported with openai_agentic_loop.max_retained_bytes",
+            )));
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -152,6 +161,11 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return publish_bodyless_operation(ctx, &self.config);
         }
 
+        let raw = body.as_deref().unwrap_or_default();
+        if let Some(action) = super::initial_agentic_budget_rejection(ctx, raw) {
+            return Ok(action);
+        }
+
         // The one parse feeds classification, promotion, and state alike. A body
         // that cannot be classified follows `on_invalid` instead.
         let (parsed, classified) = match parse_and_classify_create_body(body) {
@@ -167,7 +181,18 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(action);
         }
 
-        publish_request_facts(ctx, &classified, parsed, &self.config, matched.operation)?;
+        let budget = if matched.operation == ResponsesOperation::CreateResponse
+            && classified.format == AiRequestFormat::Responses
+        {
+            match super::plain_agentic_budget(ctx, &parsed, raw) {
+                Ok(budget) => budget,
+                Err(action) => return Ok(action),
+            }
+        } else {
+            None
+        };
+
+        publish_request_facts(ctx, &classified, parsed, &self.config, matched.operation, budget)?;
 
         Ok(FilterAction::Release)
     }
@@ -203,6 +228,7 @@ fn publish_request_facts(
     parsed: serde_json::Value,
     config: &ResponsesFormatConfig,
     operation: ResponsesOperation,
+    budget: Option<super::agentic_loop::budget::SimpleBudget>,
 ) -> Result<(), FilterError> {
     let mode = super::compute_mode(classified);
 
@@ -240,7 +266,7 @@ fn publish_request_facts(
     let conversation_id = resolve_conversation_id(ctx, &parsed);
 
     enrich_context(ctx, classified, &response_id, &conversation_id);
-    insert_responses_state(ctx, parsed, &response_id);
+    insert_responses_state(ctx, parsed, &response_id, budget);
 
     debug!(
         response_id = %response_id,
@@ -446,8 +472,14 @@ fn enrich_context(
 }
 
 /// Initialize canonical request state, including metadata that must survive IRR steps.
-fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
+fn insert_responses_state(
+    ctx: &mut HttpFilterContext<'_>,
+    parsed: serde_json::Value,
+    response_id: &str,
+    budget: Option<super::agentic_loop::budget::SimpleBudget>,
+) {
     let mut state = ResponsesState::from_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
+    state.simple_budget = budget;
     ctx.extensions.insert(state);
 }

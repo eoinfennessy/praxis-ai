@@ -34,6 +34,65 @@ fn create_request() -> Request {
     make_request(http::Method::POST, "/v1/responses")
 }
 
+#[tokio::test]
+async fn budgeted_plain_create_initializes_shared_charge() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let policy = super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap();
+    ctx.extensions.insert(policy);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":"hello","store":false}"#,
+    ));
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert!(ctx.extensions.get::<ResponsesState>().unwrap().simple_budget.is_some());
+}
+
+#[tokio::test]
+async fn budgeted_create_rejects_large_body_before_parse() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let config: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&config).unwrap());
+    let mut body = Some(Bytes::from(
+        format!(r#"{{"input":"{}","store":false}}"#, "a".repeat(200)).into_bytes(),
+    ));
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(ctx.extensions.get::<ResponsesState>().is_none());
+}
+
+#[tokio::test]
+async fn budgeted_create_rejects_unaccounted_owners() {
+    let request = create_request();
+    let filter = default_filter();
+    for body in [
+        json!({"input":"hello"}),
+        json!({"input":"hello","store":false,"stream":true}),
+        json!({"input":"hello","store":false,"tools":[{"type":"web_search_preview"}]}),
+        json!({"input":"hello","store":false,"previous_response_id":"resp_old"}),
+        json!({"input":"hello","store":false,"context_management":{"type":"compaction"}}),
+    ] {
+        let mut ctx = make_filter_context(&request);
+        ctx.extensions
+            .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        let mut bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
+        let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(rejection) if rejection.status == 400),
+            "{body}"
+        );
+        assert!(ctx.extensions.get::<ResponsesState>().is_none());
+    }
+}
+
 /// Drive one body through the filter and return the action.
 async fn run(filter: &dyn HttpFilter, request: &Request, body: &serde_json::Value) -> FilterAction {
     let mut ctx = make_filter_context(request);

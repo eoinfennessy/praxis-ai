@@ -13,6 +13,12 @@
 # Client-side function calls resolve to no dispatcher and are returned to the
 # client without looping.
 #
+# The first retained-payload guardrail accepts only buffered text creates with
+# explicit `store: false` and no tools or history. Streaming, persistence,
+# compaction, and hosted/client tools fail closed until their accounting lands
+# in follow-up PRs. The tool examples below document the intended pipeline but
+# currently return a Responses-formatted 400 before inference or dispatch.
+#
 # Configured `connector_id` values can be combined with `defer_loading: true`
 # and a `tool_search` tool so discovery waits for a later `tool_search_call`.
 # Connector IDs are pipeline-local; they are never forwarded to the
@@ -58,12 +64,16 @@
 #
 # Config knobs:
 #   max_infer_iters: application-level iteration cap (default 10)
+#   max_retained_bytes: request-wide retained-payload cap (default 64 MiB;
+#                       valid range 4 KiB through 256 MiB). The smallest
+#                       reachable loop cap applies to the listener.
 #   max_iterations:  infrastructure-level safety cap on IRR. It must be
 #                    at least max_infer_iters + 1 (initial inference plus
 #                    the allowed MCP-backed inference continuations).
 #
 # Streaming:
-#   With stream=true, each inference round is streamed through the same
+#   Streamed requests currently fail closed. After the stream owner follow-up,
+#   each inference round will be streamed through the same
 #   downstream Responses SSE lifecycle. Intermediate response lifecycle
 #   events are normalized by openai_stream_events while MCP and web-search
 #   transitions resume inference after each upstream stream completes.
@@ -72,7 +82,7 @@
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
-#     -d '{"model":"gpt-4.1","input":"Hello"}'
+#     -d '{"model":"gpt-4.1","input":"Hello","store":false}'
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
@@ -184,6 +194,8 @@ filter_chains:
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 11
+        # Bound core's buffered response before AI response filters run.
+        max_response_bytes: 8388608
         max_stream_response_bytes: 67108864
         # The IRR's 30s default is too short for production model streams.
         # Allow six minutes total for time-to-first-byte and logical streaming
@@ -285,6 +297,7 @@ filter_chains:
                   - authorization
               - filter: openai_agentic_loop
                 max_infer_iters: 10
+                max_retained_bytes: 67108864
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy

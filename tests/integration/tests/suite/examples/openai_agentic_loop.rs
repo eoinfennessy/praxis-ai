@@ -48,7 +48,7 @@ fn single_pass_completes_through_irr() {
     let config = load_agentic_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"Hello"}"#;
+    let body = r#"{"model":"gpt-4.1","input":"Hello","store":false}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
     assert_eq!(
@@ -65,6 +65,69 @@ fn single_pass_completes_through_irr() {
         model_body.get("parallel_tool_calls").is_none(),
         "an omitted parallel_tool_calls field must remain omitted"
     );
+}
+
+#[test]
+fn retained_budget_rejects_oversized_initial_input_before_inference() {
+    let model = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget(free_port(), model.port(), 4_096);
+    let proxy = start_proxy(&config);
+
+    // This stays below the listener's 128-byte raw cap so the Responses
+    // admission guard, rather than core's generic transport 413, rejects it.
+    let request_body = r#"{"model":"gpt-4.1","input":"Hi","store":false,"temperature":0,"seed":1}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", request_body));
+
+    assert_eq!(parse_status(&raw), 413);
+    assert!(!parse_body(&raw).is_empty(), "empty 413 response: {raw:?}");
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(model.requests().is_empty(), "rejected input must not reach inference");
+}
+
+#[test]
+fn retained_budget_rejects_oversized_buffered_output_without_dispatch() {
+    let response = serde_json::json!({
+        "id": "resp_provider",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "x".repeat(200)}],
+        }],
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_string())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget(free_port(), model.port(), 8_192);
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hi","store":false}"#),
+    );
+
+    assert_eq!(parse_status(&raw), 502);
+    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(body["error"]["type"], "server_error");
+    assert_eq!(model.requests().len(), 1, "overflow must stop after one inference");
+}
+
+#[test]
+fn retained_budget_rejects_tools_and_streaming_before_inference() {
+    let model = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+
+    for request_body in [
+        r#"{"model":"gpt-4.1","input":"Hi","store":false,"stream":true}"#,
+        r#"{"model":"gpt-4.1","input":"Hi","store":false,"tools":[{"type":"web_search_preview"}]}"#,
+        r#"{"model":"gpt-4.1","input":"Hi"}"#,
+    ] {
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", request_body));
+        assert_eq!(parse_status(&raw), 400, "request: {request_body}");
+        let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+    assert!(model.requests().is_empty(), "unsupported paths must not dispatch");
 }
 
 #[test]
@@ -7421,6 +7484,24 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
+}
+
+fn load_agentic_config_with_budget(
+    proxy_port: u16,
+    model_port: u16,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+        1,
+    );
+    assert_ne!(yaml, original, "expected the example's retained-payload limit");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic-loop config")
 }
 
 fn load_agentic_config_without_stream_events(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {

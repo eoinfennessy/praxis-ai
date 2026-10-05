@@ -328,6 +328,9 @@ pub(crate) enum McpApprovalState {
               not a state machine or refactorable enum"
 )]
 pub(crate) struct ResponsesState {
+    /// Conservative request-wide charge for the first plain Responses path.
+    /// Set only when a listener has an agentic retained-payload policy.
+    pub(crate) simple_budget: Option<super::agentic_loop::budget::SimpleBudget>,
     /// Maps file IDs to filenames for citation annotation extraction.
     pub citation_files: HashMap<String, String>,
 
@@ -893,6 +896,7 @@ impl Default for ResponsesState {
     #[expect(clippy::too_many_lines, reason = "exhaustive struct field initialization")]
     fn default() -> Self {
         Self {
+            simple_budget: None,
             citation_files: HashMap::new(),
             context_management: None,
             conversation: None,

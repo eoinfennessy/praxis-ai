@@ -110,6 +110,7 @@
 //! `openai_responses_validate` for every Responses API create
 //! request.
 
+pub(crate) mod budget;
 mod config;
 
 #[cfg(test)]
@@ -130,13 +131,66 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState, Rejection,
-    SubRequestResponseMode, TrustedHeaderMutation, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState, PipelineExtension,
+    Rejection, RequestExtensions, SubRequestResponseMode, TrustedHeaderMutation, body::MAX_JSON_BODY_BYTES,
+    parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
 
 use self::config::{AgenticLoopConfig, build_config};
+
+/// The smallest loop budget reachable by a listener, installed before any
+/// request filter runs. The serving pipeline derives it from its nested IRR
+/// steps, so validation and rehydration use the same limit as the loop.
+#[derive(Clone, Copy)]
+pub struct AgenticBudgetPolicy {
+    /// Effective byte ceiling for every reachable loop on this listener.
+    max_retained_bytes: usize,
+}
+
+impl AgenticBudgetPolicy {
+    /// Read the validated limit from one `openai_agentic_loop` entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] for an invalid loop configuration.
+    pub fn from_config(config: &serde_yaml::Value) -> Result<Self, FilterError> {
+        let cfg = if config.is_null() {
+            AgenticLoopConfig::default()
+        } else {
+            parse_filter_config("openai_agentic_loop", config)?
+        };
+        let cfg = build_config(cfg)?;
+        Ok(Self {
+            max_retained_bytes: cfg.max_retained_bytes.get(),
+        })
+    }
+
+    /// The effective request-wide byte limit.
+    #[must_use]
+    pub const fn max_retained_bytes(self) -> usize {
+        self.max_retained_bytes
+    }
+
+    /// Lower this policy to another reachable loop's configured limit.
+    #[must_use]
+    pub const fn min(self, other: Self) -> Self {
+        Self {
+            max_retained_bytes: if self.max_retained_bytes < other.max_retained_bytes {
+                self.max_retained_bytes
+            } else {
+                other.max_retained_bytes
+            },
+        }
+    }
+}
+
+impl PipelineExtension for AgenticBudgetPolicy {
+    fn prepare(&self, extensions: &mut RequestExtensions) {
+        extensions.insert(*self);
+    }
+}
 use super::{
     arm_agentic_stream_guard, enforce_agentic_stream_guard,
     error::responses_error_rejection,
@@ -300,9 +354,39 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+            && !ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.simple_budget.is_some())
+        {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                413,
+                "invalid_request_error",
+                "agentic retained-payload policy was not attached to this Responses create request",
+            )));
+        }
+
         let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+
+        if let Some(budget) = state.simple_budget.as_mut()
+            && !budget.lower_limit(self.config.max_retained_bytes.get())
+        {
+            let status = if state.iteration == 0 { 413 } else { 502 };
+            ctx.set_metadata("responses.skip_persist", "true");
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                status,
+                if status == 413 {
+                    "invalid_request_error"
+                } else {
+                    "server_error"
+                },
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+            )));
+        }
 
         // A locally-detected security-context failure (missing/invalid per-user callout
         // credential) is converted here FIRST, so a security terminal preempts a generic
@@ -340,12 +424,47 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
+        // Multiple loop instances can contribute one policy to a step. Only
+        // one of them may parse and accumulate the provider response.
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.simple_budget.is_some())
+            && let Some(iteration) = ctx.extensions.get::<IterationState>().map(IterationState::iteration)
+        {
+            let marker = iteration.to_string();
+            if ctx.get_metadata("responses.agentic_response_processed_iteration") == Some(marker.as_str()) {
+                return Ok(FilterAction::Continue);
+            }
+            ctx.set_metadata("responses.agentic_response_processed_iteration", marker);
+        }
+
         let Some(mut state) = ctx.extensions.remove::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
 
+        if let Some(budget) = state.simple_budget.as_mut()
+            && !body.as_ref().is_some_and(|bytes| budget.admit_output(bytes.len()))
+        {
+            ctx.set_metadata("responses.skip_persist", "true");
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                502,
+                "server_error",
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+            )));
+        }
+
         if let Some(bytes) = body.as_ref() {
-            extract_tool_calls_from_body(bytes, &mut state);
+            if extract_tool_calls_from_body(bytes, &mut state) {
+                ctx.set_metadata("responses.skip_persist", "true");
+                set_action(ctx, ACTION_DONE)?;
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    502,
+                    "server_error",
+                    "model response needs an unsupported tool or non-text owner under openai_agentic_loop.max_retained_bytes",
+                )));
+            }
         } else if !prepare_streamed_round(ctx, &mut state)? {
             ctx.extensions.insert(state);
             return Ok(FilterAction::Continue);
@@ -846,15 +965,18 @@ fn end_at_iteration_limit(
 
 /// Extract completed function-call items from a non-streaming response body
 /// and populate `state.tool_calls` and `state.messages`.
-fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
+fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> bool {
     let response = serde_json::from_slice::<Value>(body)
         .ok()
         .filter(is_responses_api_output);
     let Some(mut response) = response else {
         state.response_object = Value::Null;
         state.tool_calls.clear();
-        return;
+        return false;
     };
+    if state.simple_budget.is_some() && !plain_text_response(&response) {
+        return true;
+    }
     // Normalize private `function_call(name=file_search)` into canonical
     // `file_search_call`, gated on an actually configured hosted file-search
     // tool. The returned round-local indices identify the normalized items so
@@ -873,6 +995,22 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
         merge_usage(&mut state.usage, usage);
     }
     state.response_object = response;
+    false
+}
+
+/// The first budgeted slice accepts only text messages. Every tool-related
+/// output is rejected before its dispatcher sees an assignment.
+fn plain_text_response(response: &Value) -> bool {
+    response.get("output").and_then(Value::as_array).is_some_and(|items| {
+        items.iter().all(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("content").and_then(Value::as_array).is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .all(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+                })
+        })
+    })
 }
 
 /// Return whether one model round mixed server-owned MCP, web-search, pending

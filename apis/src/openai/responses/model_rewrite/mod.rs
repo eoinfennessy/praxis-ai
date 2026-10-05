@@ -135,6 +135,16 @@ impl ModelRewriteFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
+        #[cfg(feature = "openai-responses")]
+        if ctx.extensions.get::<super::AgenticBudgetPolicy>().is_some()
+            && is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "model rewriting is not yet supported with openai_agentic_loop.max_retained_bytes",
+            )));
+        }
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };

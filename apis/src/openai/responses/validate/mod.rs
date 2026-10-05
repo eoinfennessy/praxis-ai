@@ -132,6 +132,11 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
             return Ok(action);
         }
 
+        let raw = body.as_deref().unwrap_or_default();
+        if let Some(action) = super::initial_agentic_budget_rejection(ctx, raw) {
+            return Ok(action);
+        }
+
         let parsed = match parse_request_body(body) {
             Ok(v) => v,
             Err(action) => return Ok(action),
@@ -142,6 +147,10 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         if let Some(action) = super::reject_prompt_template(&parsed) {
             return Ok(action);
         }
+        let budget = match super::plain_agentic_budget(ctx, &parsed, raw) {
+            Ok(budget) => budget,
+            Err(action) => return Ok(action),
+        };
 
         let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
         let conversation_id = resolve_conversation_id(ctx, &parsed);
@@ -149,7 +158,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         enrich_context(ctx, &response_id, &conversation_id);
         #[cfg(feature = "openai-conversations")]
         crate::openai::conversations::capture_validated_append_owner(ctx);
-        insert_responses_state(ctx, parsed, &response_id);
+        insert_responses_state(ctx, parsed, &response_id, budget);
 
         debug!(
             response_id = %response_id,
@@ -221,9 +230,15 @@ fn early_validation_action(ctx: &HttpFilterContext<'_>, end_of_stream: bool) -> 
 }
 
 /// Initialize canonical request state, including metadata that must survive IRR steps.
-fn insert_responses_state(ctx: &mut HttpFilterContext<'_>, parsed: serde_json::Value, response_id: &str) {
+fn insert_responses_state(
+    ctx: &mut HttpFilterContext<'_>,
+    parsed: serde_json::Value,
+    response_id: &str,
+    budget: Option<super::agentic_loop::budget::SimpleBudget>,
+) {
     let mut state = ResponsesState::from_request_body(parsed);
     state.response_id = Some(response_id.to_owned());
+    state.simple_budget = budget;
     ctx.extensions.insert(state);
 }
 

@@ -826,6 +826,20 @@ impl HttpFilter for McpDispatchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+        if let Some(state) = ctx.extensions.get::<ResponsesState>()
+            && state.simple_budget.is_some()
+        {
+            // No budgeted request may execute MCP in this first slice. Skip
+            // even forwarded-header cloning on the plain path.
+            if !state.tool_calls.is_empty() || !state.mcp_tool_map.is_empty() || !state.deferred_mcp.is_empty() {
+                return Ok(FilterAction::Reject(responses_error_rejection(
+                    502,
+                    "server_error",
+                    "MCP dispatch is not yet supported with openai_agentic_loop.max_retained_bytes",
+                )));
+            }
+            return Ok(FilterAction::Continue);
+        }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         let forwarded_headers = self.forwarded_headers(ctx);
 

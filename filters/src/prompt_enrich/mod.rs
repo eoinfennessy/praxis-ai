@@ -147,13 +147,32 @@ impl HttpFilter for PromptEnrichFilter {
 
     async fn on_request_body(
         &self,
-        _ctx: &mut HttpFilterContext<'_>,
+        ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+
+        #[cfg(feature = "openai-responses")]
+        if ctx
+            .extensions
+            .get::<praxis_ai_apis::openai::AgenticBudgetPolicy>()
+            .is_some()
+            && ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses"
+        {
+            return Ok(FilterAction::Reject(
+                Rejection::status(400)
+                    .with_header("content-type", "application/json")
+                    .with_body(Bytes::from_static(
+                        br#"{"error":{"type":"invalid_request_error","message":"prompt enrichment is not yet supported with openai_agentic_loop.max_retained_bytes"}}"#,
+                    )),
+            ));
+        }
+        #[cfg(not(feature = "openai-responses"))]
+        let _ = ctx;
 
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);

@@ -75,7 +75,83 @@ pub(crate) mod stream_events;
 pub(crate) mod usage;
 
 #[cfg(feature = "openai-responses")]
-pub use agentic_loop::AgenticLoopFilter;
+pub use agentic_loop::{AgenticBudgetPolicy, AgenticLoopFilter};
+
+/// Preflight an agentic create body before the first JSON parser allocates.
+/// The same listener policy applies to every reachable loop instance.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option<FilterAction> {
+    let policy = ctx.extensions.get::<AgenticBudgetPolicy>()?;
+    if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+        return None;
+    }
+    let admitted =
+        agentic_loop::budget::input_charge(bytes).is_some_and(|charge| charge <= policy.max_retained_bytes());
+    (!admitted).then(|| {
+        FilterAction::Reject(error::responses_error_rejection(
+            413,
+            "invalid_request_error",
+            "request body exceeds openai_agentic_loop.max_retained_bytes",
+        ))
+    })
+}
+
+/// Admit only the buffered plain-text path whose retained owners this first
+/// guardrail covers. Other features acquire their own accounting in later PRs.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn plain_agentic_budget(
+    ctx: &HttpFilterContext<'_>,
+    parsed: &serde_json::Value,
+    bytes: &[u8],
+) -> Result<Option<agentic_loop::budget::SimpleBudget>, FilterAction> {
+    let Some(policy) = ctx.extensions.get::<AgenticBudgetPolicy>() else {
+        return Ok(None);
+    };
+    let Some(object) = parsed.as_object() else {
+        return Err(FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "a budgeted Responses request must be a JSON object",
+        )));
+    };
+    // A restricted create schema keeps store, restore, compaction, hosted tools,
+    // client tool lowering, and document extraction out of the first slice.
+    let supported = object.get("input").is_some_and(serde_json::Value::is_string)
+        && object.get("store") == Some(&serde_json::Value::Bool(false))
+        && object.get("stream").is_none_or(|value| value.as_bool() == Some(false))
+        && object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "model"
+                    | "input"
+                    | "instructions"
+                    | "store"
+                    | "stream"
+                    | "max_output_tokens"
+                    | "temperature"
+                    | "top_p"
+                    | "seed"
+                    | "user"
+            )
+        });
+    if !supported {
+        return Err(FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "the agentic retained-payload budget currently supports only buffered text requests with store:false and no tools or history",
+        )));
+    }
+    let charge = agentic_loop::budget::input_charge(bytes).unwrap_or(usize::MAX);
+    agentic_loop::budget::SimpleBudget::new(policy.max_retained_bytes(), charge)
+        .map(Some)
+        .ok_or_else(|| {
+            FilterAction::Reject(error::responses_error_rejection(
+                413,
+                "invalid_request_error",
+                "request body exceeds openai_agentic_loop.max_retained_bytes",
+            ))
+        })
+}
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
@@ -350,7 +426,19 @@ impl HttpFilter for ResponsesFormatFilter {
         }
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        #[cfg(feature = "openai-responses")]
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(FilterAction::Reject(error::responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "compaction is not yet supported with openai_agentic_loop.max_retained_bytes",
+            )));
+        }
+        #[cfg(not(feature = "openai-responses"))]
+        let _ = ctx;
         Ok(FilterAction::Continue)
     }
 
@@ -368,6 +456,11 @@ impl HttpFilter for ResponsesFormatFilter {
             Some(b) => b.as_ref(),
             None => &[],
         };
+
+        #[cfg(feature = "openai-responses")]
+        if let Some(action) = initial_agentic_budget_rejection(ctx, bytes) {
+            return Ok(action);
+        }
 
         let (classified, websocket_handshake) = classify_request(ctx, bytes);
 

@@ -140,11 +140,19 @@ fn resolve_listener_pipeline(
         entries.extend_from_slice(filters);
     }
 
+    #[cfg(feature = "openai-responses")]
+    let budget_policy = praxis_ai::prepare_agentic_budget_entries(&mut entries, &chains)
+        .unwrap_or_else(|error| panic!("invalid agentic budget pipeline: {error}"));
+
     let mut pipeline =
         FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options).unwrap();
+    #[cfg(feature = "openai-responses")]
+    let request_body_limit = praxis_ai::agentic_request_body_cap(config.body_limits.max_request_bytes, budget_policy);
+    #[cfg(not(feature = "openai-responses"))]
+    let request_body_limit = config.body_limits.max_request_bytes;
     pipeline
         .apply_body_limits(
-            config.body_limits.max_request_bytes,
+            request_body_limit,
             config.body_limits.max_response_bytes,
             config.insecure_options.allow_unbounded_body,
         )
@@ -156,6 +164,10 @@ fn resolve_listener_pipeline(
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     praxis_ai::install_pipeline_extensions(&mut pipeline);
+    #[cfg(feature = "openai-responses")]
+    if let Some(policy) = budget_policy {
+        pipeline.add_pipeline_extension(Box::new(policy));
+    }
     // Share the registry the store provisioner populates, so store-filter
     // requests through the harness resolve a provisioned backend.
     pipeline.add_pipeline_extension(Box::new(store_registry));

@@ -462,6 +462,17 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         if let Some(outcome) = request_disposition(ctx) {
             return Ok(outcome);
         }
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.simple_budget.is_some())
+        {
+            return Ok(SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "Chat translation is not yet supported with openai_agentic_loop.max_retained_bytes",
+            )));
+        }
 
         let serialized = match self.translated_request_bytes(ctx)? {
             Ok(bytes) => bytes,
