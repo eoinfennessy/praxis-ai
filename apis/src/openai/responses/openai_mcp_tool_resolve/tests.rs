@@ -39,6 +39,31 @@ fn config_accepts_scoped_connector_slots() {
 }
 
 #[tokio::test]
+async fn budgeted_mcp_resolve_rejects_before_discovery() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let raw =
+        br#"{"model":"test","tools":[{"type":"mcp","server_label":"corp","server_url":"http://127.0.0.1:9/mcp"}]}"#;
+    let mut body = Some(Bytes::from_static(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    match action {
+        FilterAction::Reject(rejection) => {
+            assert_eq!(rejection.status, 400);
+            let error = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+            assert!(error.contains("MCP tool resolution is not yet supported"), "{error}");
+        },
+        _ => panic!("budgeted MCP discovery must reject before the callout"),
+    }
+    assert_eq!(body.as_deref(), Some(raw.as_slice()));
+}
+
+#[tokio::test]
 async fn configured_connector_missing_scoped_context_fails_before_dispatch() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         "

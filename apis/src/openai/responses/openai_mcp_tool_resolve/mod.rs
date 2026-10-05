@@ -72,7 +72,7 @@ use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
-    bound_body_outcome,
+    AgenticBudgetPolicy, bound_body_outcome,
     error::responses_error_rejection,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
 };
@@ -80,6 +80,7 @@ use crate::{
     StateOwner,
     callout_headers::effective_body_callout_headers,
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
+    classifier::is_responses_create,
     json_body::{SerializedJson, serialize_json_body, serialized_len},
     mcp_client,
 };
@@ -637,6 +638,18 @@ impl HttpFilter for McpToolResolveFilter {
 
         if !has_mcp_tools(ctx) {
             return Ok(FilterAction::Continue);
+        }
+
+        // Discovery can retain a large tools/list result before validation
+        // admits the request, so reject this unsupported owner first.
+        if is_responses_create(&ctx.request.method, ctx.request.uri.path())
+            && ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+        {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "MCP tool resolution is not yet supported with openai_agentic_loop.max_retained_bytes",
+            )));
         }
 
         let Some(bytes) = body.as_ref().cloned() else {
