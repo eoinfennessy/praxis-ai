@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use praxis_filter::FilterAction;
+use praxis_filter::{ClientResponseHeadersCommitted, FilterAction};
 use secrecy::SecretString;
 use serde_json::json;
 
@@ -24,7 +24,7 @@ use crate::{
     callout_identity::McpCalloutIdentity,
     openai::responses::{
         DEFAULT_TENANT_ID,
-        agentic_loop::budget::SimpleBudget,
+        agentic_loop::{AgenticLoopFilter, budget::SimpleBudget},
         mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
         mcp_dispatch::{
             approval::{
@@ -2088,6 +2088,85 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
         state.mcp_tool_map.is_empty(),
         "exhausted budget must not rewrite deferred MCP tools"
     );
+}
+
+#[tokio::test]
+async fn deferred_discovery_budget_failure_ends_committed_stream_with_sse_error() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.extensions.insert(ClientResponseHeadersCommitted);
+    let request = json!({"model": "gpt-4.1", "input": "hello", "stream": true, "store": false});
+    let mut state = ResponsesState::from_request_body(request.clone());
+    state.iteration = 1;
+    state.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
+    state.deferred_mcp = vec![DeferredMcpConnector {
+        authorization: None,
+        allowed_tools: None,
+        connector_id: "corp_drive".to_owned(),
+        headers: None,
+        max_rewritten_body_bytes: 67_108_864,
+        max_tools: 128,
+        require_approval: None,
+        server_label: "drive".to_owned(),
+        server_url: "http://127.0.0.1:9/mcp".to_owned(),
+        timeout: std::time::Duration::from_secs(1),
+    }];
+    state.select_test_output(
+        "tool_search_call",
+        vec![json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"})],
+    );
+    let before = state.simple_budget.unwrap().remaining_bytes();
+    ctx.extensions.insert(state);
+
+    let callout = crate::mcp_client::McpCallout::fabricated(true).unwrap();
+    let action = super::discover_pending_connectors(
+        &mut ctx,
+        &serde_json::to_vec(&request).unwrap(),
+        &[],
+        &http::HeaderMap::new(),
+        &callout,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.simple_budget.unwrap().remaining_bytes(), before);
+    assert_eq!(
+        state.deferred_mcp.len(),
+        1,
+        "budget failure must not consume the connector"
+    );
+    let failure = state
+        .dispatch_failure
+        .as_ref()
+        .expect("delegate terminal to loop owner");
+    assert_eq!(failure.code, "server_error");
+    assert!(failure.message.contains("max_retained_bytes"));
+
+    let loop_filter = AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let action = loop_filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    let FilterAction::Reject(terminal) = action else {
+        panic!("loop owner must stop the committed stream");
+    };
+    assert_eq!(terminal.status, 200);
+    assert_eq!(
+        terminal
+            .headers
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map(|(_, value)| value.as_str()),
+        Some("text/event-stream"),
+    );
+    let body = std::str::from_utf8(terminal.body.as_deref().unwrap()).unwrap();
+    assert!(
+        body.contains("event: error"),
+        "committed stream must end with SSE: {body}"
+    );
+    assert!(!body.contains("[DONE]") && !body.starts_with('{'));
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]

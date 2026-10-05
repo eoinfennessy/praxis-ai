@@ -77,7 +77,7 @@ use super::{
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
+        McpToolIndex, McpToolMatch, ResolveError, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
     state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, McpExecutionBudget, ResponsesState},
@@ -1364,6 +1364,11 @@ async fn discover_pending_connectors(
     .await
     {
         Ok(()) => Ok(FilterAction::Continue),
+        // Deferred discovery runs on the loop's request-phase re-entry. A
+        // streamed first round may already have committed HTTP 200, so an
+        // HTTP 413 JSON Reject would corrupt that SSE stream. Let the loop
+        // owner emit its terminal SSE error through DispatchFailure.
+        Err(ResolveError::RetainedBudget) => Ok(McpDispatchFilter::budget_limit_action(ctx)),
         Err(err) => {
             let streaming = ctx
                 .get_metadata("openai_responses_format.stream")
