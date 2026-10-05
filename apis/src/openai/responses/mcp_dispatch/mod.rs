@@ -1439,14 +1439,14 @@ pub(crate) fn prepare_response_round(
     };
     drop(mcp_calls);
     drop(selected_calls);
-    if let Some(budget) = state.simple_budget.as_mut() {
-        if !staging_charge.is_some_and(|charge| budget.reserve_additional_input(charge)) {
-            return Err(DispatchFailure {
-                status: 502,
-                code: "server_error",
-                message: "MCP approval staging exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
-            });
-        }
+    if let Some(budget) = state.simple_budget.as_mut()
+        && !staging_charge.is_some_and(|charge| budget.reserve_additional_input(charge))
+    {
+        return Err(DispatchFailure {
+            status: 502,
+            code: "server_error",
+            message: "MCP approval staging exceeded openai_agentic_loop.max_retained_bytes".to_owned(),
+        });
     }
 
     let selected_calls = state.selected_tool_calls();

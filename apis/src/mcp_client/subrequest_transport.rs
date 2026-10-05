@@ -593,6 +593,21 @@ impl McpSubrequestClient {
         )
     }
 
+    /// Use a fresh control session whose wire and parser limits were reserved
+    /// by the owning Responses request before MCP discovery starts.
+    pub(crate) fn control_with_budget(
+        callout: McpCallout,
+        step_timeout: Duration,
+        owner: Option<StateOwner>,
+        limits: McpBudgetedCallLimits,
+    ) -> Self {
+        let mut client = Self::control(callout, step_timeout, owner);
+        client.tool_result_bytes = client.tool_result_bytes.min(limits.wire_limit);
+        client.stream_cumulative_cap = client.stream_cumulative_cap.min(limits.wire_limit);
+        client.budgeted_limits = Some(limits);
+        client
+    }
+
     /// Build a client for
     /// [`call_tool_with_forwarded_headers`](super::call_tool_with_forwarded_headers):
     /// `initialize` uses the control ceiling and the `tools/call` response is

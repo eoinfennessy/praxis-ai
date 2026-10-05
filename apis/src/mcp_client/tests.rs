@@ -2812,6 +2812,34 @@ async fn list_tools_rejects_oversized_cumulative_pagination() {
     );
 }
 
+#[tokio::test]
+async fn budgeted_listing_rejects_at_request_specific_cumulative_cap() {
+    let (url, ct) = start_multi_page_list_mcp_server(1_024, 3).await;
+    let limits = McpBudgetedCallLimits {
+        wire_limit: 1_024 * 1_024,
+        parse_charge_limit: 1_024 * 1_024,
+    };
+    let result = list_tools_with_forwarded_headers_budgeted(
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+        Some((limits, 2 * 1_024)),
+    )
+    .await;
+    ct.cancel();
+
+    assert!(
+        matches!(result, Err(McpClientError::ListingTooLarge { .. })),
+        "a request cap below the ordinary 4 MiB limit must stop pagination: {result:?}"
+    );
+}
+
 // =========================================================================
 // classify_deadline
 // =========================================================================

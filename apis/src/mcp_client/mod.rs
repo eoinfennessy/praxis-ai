@@ -361,7 +361,10 @@ pub(crate) async fn list_tools(
     clippy::too_many_arguments,
     reason = "trusted forwarded headers extend the existing API"
 )]
-#[expect(clippy::too_many_lines, reason = "transport setup and bounded listing are linear")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "keeps the unbudgeted MCP listing entry point available")
+)]
 pub(crate) async fn list_tools_with_forwarded_headers(
     server_url: &str,
     headers: Option<&serde_json::Value>,
@@ -373,6 +376,37 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     max_tools: usize,
     callout: &McpCallout,
 ) -> Result<Vec<serde_json::Value>, McpClientError> {
+    list_tools_with_forwarded_headers_budgeted(
+        server_url,
+        headers,
+        authorization,
+        forwarded_header_names,
+        forwarded_headers,
+        connector_context,
+        timeout,
+        max_tools,
+        callout,
+        None,
+    )
+    .await
+}
+
+/// Resolve an MCP listing with the request's reserved wire, parser, and
+/// cumulative decoded-listing ceilings. `None` preserves the legacy limits.
+#[expect(clippy::too_many_arguments, reason = "MCP callout parameters plus request budget")]
+#[expect(clippy::too_many_lines, reason = "transport setup and bounded listing are linear")]
+pub(crate) async fn list_tools_with_forwarded_headers_budgeted(
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+    timeout: Duration,
+    max_tools: usize,
+    callout: &McpCallout,
+    budget: Option<(McpBudgetedCallLimits, usize)>,
+) -> Result<Vec<serde_json::Value>, McpClientError> {
     // No upfront SSRF classifier: the subrequest transport validates the
     // dial target during the callout via `prepare_url_target`, so this path
     // resolves DNS exactly once. `initialize` and `tools/list` are
@@ -382,11 +416,12 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     // evaluated. Across pagination the decoded listing is additionally
     // bounded by `MAX_LISTING_RESPONSE_BYTES` (see `paginate_tools`).
     let display_url = parse_display_url(server_url);
-    let mcp_client = subrequest_transport::McpSubrequestClient::control(
-        callout.clone(),
-        timeout,
-        connector_context.map(|context| context.owner.clone()),
-    );
+    let owner = connector_context.map(|context| context.owner.clone());
+    let mcp_client = if let Some((limits, _)) = budget {
+        subrequest_transport::McpSubrequestClient::control_with_budget(callout.clone(), timeout, owner, limits)
+    } else {
+        subrequest_transport::McpSubrequestClient::control(callout.clone(), timeout, owner)
+    };
     // Take the signal handle before the client is moved into the rmcp
     // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
     // recorded during the exchange (which rmcp otherwise discards) can be
@@ -412,7 +447,10 @@ pub(crate) async fn list_tools_with_forwarded_headers(
             })
         })?;
         let client = running.insert(client);
-        let tools = Box::pin(paginate_tools(client, max_tools, &display_url))
+        let listing_limit = budget.map_or(MAX_LISTING_RESPONSE_BYTES, |(_, limit)| {
+            limit.min(MAX_LISTING_RESPONSE_BYTES)
+        });
+        let tools = Box::pin(paginate_tools(client, max_tools, listing_limit, &display_url))
             .await
             .map_err(|err| transport_signal_error(&signal, &display_url).unwrap_or(err))?;
         tools_to_json(tools)
@@ -802,6 +840,7 @@ const MAX_PAGES: usize = 100;
 async fn paginate_tools(
     client: &Peer<RoleClient>,
     max_tools: usize,
+    max_listing_bytes: usize,
     url: &McpDisplayUrl,
 ) -> Result<Vec<rmcp::model::Tool>, McpClientError> {
     let mut all_tools = Vec::new();
@@ -812,7 +851,7 @@ async fn paginate_tools(
         let page = Box::pin(client.list_tools(Some(params)))
             .await
             .map_err(|_source| McpClientError::ListTools { url: url.clone() })?;
-        accumulate_listing_bytes(&mut total_bytes, &page.tools, url)?;
+        accumulate_listing_bytes(&mut total_bytes, &page.tools, max_listing_bytes, url)?;
         all_tools.extend(page.tools);
         if all_tools.len() > max_tools {
             return Err(McpClientError::TooManyTools {
@@ -1077,14 +1116,15 @@ fn measure_tools_json_bytes(tools: &[rmcp::model::Tool]) -> usize {
 fn accumulate_listing_bytes(
     total_bytes: &mut usize,
     tools: &[rmcp::model::Tool],
+    max_listing_bytes: usize,
     url: &McpDisplayUrl,
 ) -> Result<(), McpClientError> {
     *total_bytes = total_bytes.saturating_add(measure_tools_json_bytes(tools));
-    if *total_bytes > MAX_LISTING_RESPONSE_BYTES {
+    if *total_bytes > max_listing_bytes {
         return Err(McpClientError::ListingTooLarge {
             url: url.clone(),
             bytes: *total_bytes,
-            max: MAX_LISTING_RESPONSE_BYTES,
+            max: max_listing_bytes,
         });
     }
     Ok(())

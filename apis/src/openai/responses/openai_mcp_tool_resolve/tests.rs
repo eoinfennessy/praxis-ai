@@ -39,7 +39,7 @@ fn config_accepts_scoped_connector_slots() {
 }
 
 #[tokio::test]
-async fn budgeted_mcp_resolve_rejects_before_discovery() {
+async fn budgeted_mcp_resolve_requires_shared_budget_before_discovery() {
     let filter = McpToolResolveFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&request);
@@ -54,13 +54,127 @@ async fn budgeted_mcp_resolve_rejects_before_discovery() {
 
     match action {
         FilterAction::Reject(rejection) => {
-            assert_eq!(rejection.status, 400);
+            assert_eq!(rejection.status, 413);
             let error = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
-            assert!(error.contains("MCP tool resolution is not yet supported"), "{error}");
+            assert!(error.contains("max_retained_bytes"), "{error}");
         },
         _ => panic!("budgeted MCP discovery must reject before the callout"),
     }
     assert_eq!(body.as_deref(), Some(raw.as_slice()));
+}
+
+#[tokio::test]
+async fn budgeted_eager_mcp_discovery_rewrites_tools_and_settles_reservation() {
+    let (server_url, ct) = start_single_tool_mcp_server().await;
+    let filter = McpToolResolveFilter::from_config_allow_private(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let request_body = serde_json::json!({
+        "model": "gpt-4o", "input": "hello", "store": false,
+        "tools": [{"type": "mcp", "server_label": "weather", "server_url": server_url}],
+        "tool_choice": {"type": "mcp", "server_label": "weather"}
+    });
+    let raw = serde_json::to_vec(&request_body).unwrap();
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.simple_budget = Some(
+        super::super::agentic_loop::budget::SimpleBudget::new_with_store(
+            128 * 1_024 * 1_024,
+            input_charge(&raw).unwrap(),
+            false,
+        )
+        .unwrap(),
+    );
+    let before = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(raw));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    ct.cancel();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "budgeted discovery should succeed"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state
+            .mcp_tool_map
+            .contains_key(&("weather".to_owned(), "get_weather".to_owned())),
+        "discovered tool must enter dispatch map"
+    );
+    assert!(
+        state.tools.iter().any(|tool| tool["name"] == "weather__get_weather"),
+        "tool must be rewritten"
+    );
+    assert_eq!(
+        state.tool_choice["type"], "allowed_tools",
+        "MCP choice must be rewritten"
+    );
+    assert!(
+        state.simple_budget.unwrap().remaining_bytes().unwrap() < before,
+        "retained copy must stay charged"
+    );
+    assert!(
+        body.as_ref()
+            .is_some_and(|raw| !raw.windows(5).any(|part| part == b"\"mcp\"")),
+        "MCP declaration must not reach the provider"
+    );
+}
+
+#[test]
+fn discovery_budget_rejects_before_parsing_when_shared_capacity_is_exhausted() {
+    let raw = br#"{"model":"gpt-4o","tools":[{"type":"mcp"}]}"#;
+    let mut state = ResponsesState {
+        simple_budget: Some(
+            super::super::agentic_loop::budget::SimpleBudget::new_with_store(
+                8 * 1_024 * 1_024,
+                input_charge(raw).unwrap(),
+                false,
+            )
+            .unwrap(),
+        ),
+        ..ResponsesState::default()
+    };
+    let remaining = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    assert!(
+        state
+            .simple_budget
+            .as_mut()
+            .unwrap()
+            .reserve_additional_input(remaining - 256 * 1_024),
+        "test must leave too little discovery capacity"
+    );
+    let before = state.simple_budget.unwrap().remaining_bytes();
+
+    assert!(matches!(
+        reserve_discovery_budget(&mut state, Some(raw)),
+        Err(ResolveError::RetainedBudget)
+    ));
+    assert_eq!(state.simple_budget.unwrap().remaining_bytes(), before);
+}
+
+#[test]
+fn budgeted_cache_listing_is_rejected_before_deep_clone() {
+    let url = "http://10.0.0.5/mcp";
+    let previous = vec![cached_weather_listing(url)];
+    let allowed = ["get_weather".to_owned()];
+    let budget = DiscoveryBudget {
+        reserved: 1_024,
+        limits: mcp_client::McpBudgetedCallLimits {
+            wire_limit: 512,
+            parse_charge_limit: 512,
+        },
+        listing_bytes: 1,
+        map_bytes: 1,
+    };
+
+    assert!(matches!(
+        find_cached_listing_budgeted(Some(&previous), "weather", url, None, Some(&allowed), Some(budget)),
+        Err(ResolveError::RetainedBudget)
+    ));
 }
 
 #[tokio::test]
@@ -1439,6 +1553,50 @@ fn task_result_is_retained_only_until_its_final_consumer() {
 }
 
 #[test]
+fn dispatch_metadata_is_preflighted_before_per_tool_cloning() {
+    let entry = serde_json::json!({
+        "server_label": "bulk",
+        "server_url": "http://127.0.0.1/mcp",
+        "require_approval": "x".repeat(256 * 1024),
+    });
+    let listed = vec![serde_json::json!({"name": "one"}); 800];
+    let tasks = vec![Some(listed)];
+    let entries = vec![entry];
+
+    assert!(matches!(
+        preflight_dispatch_metadata(&entries, &[Some(0)], &tasks, 64 * 1024 * 1024),
+        Err(ResolveError::RetainedBudget)
+    ));
+
+    let filtered = serde_json::json!({
+        "server_label": "bulk",
+        "server_url": "http://127.0.0.1/mcp",
+        "require_approval": "x".repeat(256 * 1024),
+        "allowed_tools": ["other"],
+    });
+    assert!(preflight_dispatch_metadata(&[filtered], &[Some(0)], &tasks, 64 * 1024 * 1024).is_ok());
+}
+
+#[test]
+fn repeated_mcp_tool_choice_selectors_are_bounded_before_expansion() {
+    let tool_map: HashMap<(String, String), serde_json::Value> = (0..100)
+        .map(|index| (("bulk".to_owned(), format!("tool_{index}")), serde_json::Value::Null))
+        .collect();
+    let selector = serde_json::json!({"type": "mcp", "server_label": "bulk"});
+    let one = serde_json::json!({"type": "allowed_tools", "tools": [selector.clone()]});
+    assert!(preflight_tool_choice_expansion(Some(&one), &tool_map, 1_000_000).is_ok());
+
+    let repeated = serde_json::json!({
+        "type": "allowed_tools",
+        "tools": vec![selector; 1_000],
+    });
+    assert!(matches!(
+        preflight_tool_choice_expansion(Some(&repeated), &tool_map, 1_000_000),
+        Err(ResolveError::RetainedBudget)
+    ));
+}
+
+#[test]
 fn dedup_entries_keeps_credentialed_independent() {
     let entries = vec![
         serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_a"}),
@@ -2375,13 +2533,13 @@ fn encode_function_name_sanitizes_invalid_chars() {
 #[test]
 fn encode_function_name_truncates_long_names() {
     let long_label = "a".repeat(40);
-    let long_tool = "b".repeat(40);
+    let long_tool = "b".repeat(90 * 1024);
     let name = encode_function_name(&long_label, &long_tool);
+    assert_eq!(name, format!("{}__{}", long_label, "b".repeat(22)));
+    assert_eq!(name.len(), MAX_FUNCTION_NAME_LEN);
     assert!(
-        name.len() <= MAX_FUNCTION_NAME_LEN,
-        "name should be truncated to {} chars, got {}",
-        MAX_FUNCTION_NAME_LEN,
-        name.len()
+        name.capacity() <= MAX_FUNCTION_NAME_LEN,
+        "truncated names must not retain the source allocation"
     );
 }
 
@@ -3879,6 +4037,91 @@ fn select_deferred_discovery_search(state: &mut ResponsesState) {
     state.select_test_output(
         "tool_search_call",
         vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_discovery", "status": "completed"})],
+    );
+}
+
+#[tokio::test]
+async fn budgeted_deferred_discovery_settles_rewritten_state() {
+    let (server_url, ct) = start_single_tool_mcp_server().await;
+    let mut state = ResponsesState {
+        tools: vec![
+            serde_json::json!({"type": "tool_search"}),
+            serde_json::json!({"type": "mcp", "server_label": "weather", "defer_loading": true}),
+        ],
+        request_body: serde_json::json!({"model": "gpt-4o", "input": "hello", "store": false, "tools": [
+            {"type": "tool_search"}, {"type": "mcp", "server_label": "weather", "defer_loading": true}
+        ]}),
+        deferred_mcp: vec![deferred_connector(&server_url, None, None)],
+        ..ResponsesState::default()
+    };
+    select_deferred_discovery_search(&mut state);
+    let raw = serde_json::to_vec(&state.request_body).unwrap();
+    state.simple_budget = Some(
+        super::super::agentic_loop::budget::SimpleBudget::new_with_store(
+            128 * 1_024 * 1_024,
+            input_charge(&raw).unwrap(),
+            false,
+        )
+        .unwrap(),
+    );
+    let before = state.simple_budget.unwrap().remaining_bytes().unwrap();
+
+    discover_deferred_connectors(&mut state).await.unwrap();
+    ct.cancel();
+
+    assert!(state.deferred_mcp.is_empty(), "pending connector must be consumed");
+    assert!(
+        state
+            .mcp_tool_map
+            .contains_key(&("weather".to_owned(), "get_weather".to_owned())),
+        "listed tool must enter dispatch map"
+    );
+    assert!(
+        state.simple_budget.unwrap().remaining_bytes().unwrap() < before,
+        "rewritten state must remain charged"
+    );
+}
+
+#[tokio::test]
+async fn budgeted_deferred_discovery_rejects_before_callout_when_exhausted() {
+    let mut state = ResponsesState {
+        tools: vec![serde_json::json!({"type": "tool_search"})],
+        request_body: serde_json::json!({"model": "gpt-4o", "input": "hello", "tools": [{"type": "tool_search"}]}),
+        deferred_mcp: vec![deferred_connector("http://127.0.0.1:9/mcp", None, None)],
+        ..ResponsesState::default()
+    };
+    select_deferred_discovery_search(&mut state);
+    let raw = serde_json::to_vec(&state.request_body).unwrap();
+    state.simple_budget = Some(
+        super::super::agentic_loop::budget::SimpleBudget::new_with_store(
+            8 * 1_024 * 1_024,
+            input_charge(&raw).unwrap(),
+            false,
+        )
+        .unwrap(),
+    );
+    let remaining = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    assert!(
+        state
+            .simple_budget
+            .as_mut()
+            .unwrap()
+            .reserve_additional_input(remaining - 256 * 1_024),
+        "test must exhaust discovery capacity"
+    );
+    let before = state.simple_budget.unwrap().remaining_bytes();
+
+    let error = discover_deferred_connectors(&mut state).await.unwrap_err();
+
+    assert!(
+        matches!(error, ResolveError::RetainedBudget),
+        "budget failure must precede network error: {error}"
+    );
+    assert_eq!(state.deferred_mcp.len(), 1, "connector must remain pending");
+    assert_eq!(
+        state.simple_budget.unwrap().remaining_bytes(),
+        before,
+        "failed reservation must not charge state"
     );
 }
 
