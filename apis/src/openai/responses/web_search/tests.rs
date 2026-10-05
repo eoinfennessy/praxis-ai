@@ -755,12 +755,17 @@ async fn on_request_body_empty_results_remain_completed() {
             "action": {"type": "search", "query": "rust language"}
         })],
     );
+    state.simple_budget = Some(SimpleBudget::new(8_388_608, 0).unwrap());
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.dispatch_failure.is_none(),
+        "a small budgeted result must complete"
+    );
     let output = &state.accumulated_output[0];
     assert_eq!(
         output["status"], "completed",

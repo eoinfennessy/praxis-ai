@@ -1462,6 +1462,28 @@ async fn budgeted_file_fanout_keeps_all_small_results_eligible() {
 }
 
 #[tokio::test]
+async fn exhausted_file_response_allowance_stops_before_paid_fanout() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "on_failure: open\n");
+    let mut state = one_pending_state(&["vs-a"]);
+    let mut budget = SimpleBudget::new(1_048_576, 0).unwrap();
+    let remaining = budget.remaining_bytes().unwrap();
+    let response_allowance = RETAINED_SEARCH_DECODER_HEADROOM + 4_096 + RETAINED_SEARCH_WIRE_FACTOR * 10;
+    assert!(budget.reserve_additional_input(remaining - response_allowance));
+    state.simple_budget = Some(budget);
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert!(
+        server.requests().is_empty(),
+        "no vector-store request should be dispatched"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[tokio::test]
 async fn request_budget_body_overflow_is_terminal_even_with_fail_open() {
     let server = MockServer::json(200, &json!({"data": [], "padding": "x".repeat(500_000)}));
     let filter = make_filter(server.port, "on_failure: open\n");
