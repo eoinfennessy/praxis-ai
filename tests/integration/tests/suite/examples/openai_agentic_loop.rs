@@ -115,6 +115,43 @@ fn retained_budget_preserves_provider_owned_fields() {
 }
 
 #[test]
+fn retained_budget_preserves_responses_with_chat_prompt_enrichment_filter() {
+    let response = r#"{"id":"resp_prompt_enrich","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let original = std::fs::read_to_string(example_config_path("openai/responses/agentic-loop.yaml"))
+        .expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "      - filter: openai_responses_format",
+        "      - filter: prompt_enrich\n        on_invalid: continue\n        prepend:\n          - role: system\n            content: Be helpful.\n\n      - filter: openai_responses_format",
+        1,
+    );
+    assert_ne!(yaml, original, "insert the chat prompt filter before Responses parsing");
+    let yaml = patch_yaml(&yaml, free_port(), &HashMap::from([("127.0.0.1:3001", model.port())]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded agentic config");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello","store":false}"#),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "chat prompt filter should leave Responses input intact: {raw}"
+    );
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(sent["input"], "Hello");
+    assert!(
+        sent.get("messages").is_none(),
+        "chat-only enrichment does not change Responses input"
+    );
+}
+
+#[test]
 fn retained_budget_preserves_text_message_array() {
     let response = r#"{"id":"resp_text_array","object":"response","status":"completed","output":[]}"#;
     let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();

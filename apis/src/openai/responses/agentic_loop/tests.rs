@@ -421,6 +421,44 @@ fn budgeted_buffered_output_rejects_before_json_parse() {
 }
 
 #[test]
+fn preparse_filter_reserves_against_existing_responses_state() {
+    let policy =
+        super::AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
+    state.simple_budget = Some(SimpleBudget::new(65_536, 1_000).unwrap());
+    ctx.extensions.insert(state);
+    let raw = br#"{"model":"gpt-4.1","input":"hello","messages":[]}"#;
+    let charge = super::AgenticBudgetPolicy::input_charge(raw).unwrap() + 2_000;
+    let before = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .simple_budget
+        .unwrap()
+        .remaining_bytes()
+        .unwrap();
+
+    assert!(policy.has_body_headroom(&ctx, raw, 0));
+    assert!(policy.reserve_body_projection(&mut ctx, raw, 2_000));
+    let after = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .simple_budget
+        .unwrap()
+        .remaining_bytes()
+        .unwrap();
+    assert_eq!(before - after, charge);
+    assert!(!policy.reserve_body_projection(&mut ctx, raw, before));
+
+    ctx.extensions.get_mut::<ResponsesState>().unwrap().simple_budget = None;
+    assert!(!policy.has_body_headroom(&ctx, raw, 0));
+    assert!(!policy.reserve_body_projection(&mut ctx, raw, 0));
+}
+
+#[test]
 fn budgeted_model_tool_output_rejects_before_dispatch_assignment() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");

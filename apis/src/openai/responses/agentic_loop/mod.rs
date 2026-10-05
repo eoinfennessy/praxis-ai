@@ -179,6 +179,41 @@ impl AgenticBudgetPolicy {
         self.max_retained_bytes / budget::INPUT_WIRE_MULTIPLIER
     }
 
+    /// Conservatively charge a JSON body before parsing it in another filter.
+    #[must_use]
+    pub fn input_charge(bytes: &[u8]) -> Option<usize> {
+        budget::input_charge(bytes)
+    }
+
+    /// Check a filter's temporary parse and added values against live headroom.
+    #[must_use]
+    pub fn has_body_headroom(self, ctx: &HttpFilterContext<'_>, bytes: &[u8], extra_charge: usize) -> bool {
+        let Some(charge) = Self::input_charge(bytes).and_then(|charge| charge.checked_add(extra_charge)) else {
+            return false;
+        };
+        match ctx.extensions.get::<ResponsesState>() {
+            Some(state) => state
+                .simple_budget
+                .is_some_and(|budget| budget.remaining_bytes().is_some_and(|remaining| charge <= remaining)),
+            None => charge <= self.max_retained_bytes,
+        }
+    }
+
+    /// Reserve a filter's rewritten body when Responses state already exists.
+    /// Before state creation the request filter rechecks the resulting body.
+    pub fn reserve_body_projection(self, ctx: &mut HttpFilterContext<'_>, bytes: &[u8], extra_charge: usize) -> bool {
+        let Some(charge) = Self::input_charge(bytes).and_then(|charge| charge.checked_add(extra_charge)) else {
+            return false;
+        };
+        match ctx.extensions.get_mut::<ResponsesState>() {
+            Some(state) => state
+                .simple_budget
+                .as_mut()
+                .is_some_and(|budget| budget.reserve_additional_input(charge)),
+            None => charge <= self.max_retained_bytes,
+        }
+    }
+
     /// Largest buffered inference response admitted by the core router.
     #[must_use]
     pub const fn max_irr_response_bytes(self) -> usize {

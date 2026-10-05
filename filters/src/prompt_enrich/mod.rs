@@ -20,6 +20,8 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_ai_apis::json_body::replace_json_body;
+#[cfg(feature = "openai-responses")]
+use praxis_ai_apis::openai::AgenticBudgetPolicy;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
@@ -79,6 +81,10 @@ pub struct PromptEnrichFilter {
     /// Pre-serialized messages to append after existing messages.
     append: Vec<serde_json::Value>,
 
+    /// Per-request charge for copies of the configured messages during enrichment.
+    #[cfg(feature = "openai-responses")]
+    enrichment_charge: usize,
+
     /// Maximum request body size to buffer.
     max_body_bytes: usize,
 
@@ -113,11 +119,15 @@ impl PromptEnrichFilter {
         let cfg: PromptEnrichConfig = parse_filter_config("prompt_enrich", config)?;
         validate_config(&cfg)?;
 
-        let prepend = cfg.prepend.iter().map(message_to_value).collect();
-        let append = cfg.append.iter().map(message_to_value).collect();
+        let prepend: Vec<_> = cfg.prepend.iter().map(message_to_value).collect();
+        let append: Vec<_> = cfg.append.iter().map(message_to_value).collect();
+        #[cfg(feature = "openai-responses")]
+        let enrichment_charge = configured_enrichment_charge(&prepend, &append);
 
         Ok(Box::new(Self {
             append,
+            #[cfg(feature = "openai-responses")]
+            enrichment_charge,
             max_body_bytes: cfg.max_body_bytes,
             on_invalid: cfg.on_invalid,
             prepend,
@@ -145,6 +155,10 @@ impl HttpFilter for PromptEnrichFilter {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the budgeted body preflight and enrichment share one borrowed body"
+    )]
     async fn on_request_body(
         &self,
         #[cfg_attr(
@@ -159,13 +173,16 @@ impl HttpFilter for PromptEnrichFilter {
             return Ok(FilterAction::Continue);
         }
 
-        #[cfg(feature = "openai-responses")]
-        if let Some(action) = budgeted_create_rejection(ctx) {
-            return Ok(action);
-        }
         let Some(raw) = body.as_ref() else {
             return Ok(FilterAction::Continue);
         };
+
+        #[cfg(feature = "openai-responses")]
+        let budget_policy = budgeted_create_policy(ctx);
+        #[cfg(feature = "openai-responses")]
+        if budget_policy.is_some_and(|policy| !policy.has_body_headroom(ctx, raw, 0)) {
+            return Ok(reject_retained_enrichment_budget());
+        }
 
         let mut value: serde_json::Value = match serde_json::from_slice(raw) {
             Ok(v) => v,
@@ -179,6 +196,11 @@ impl HttpFilter for PromptEnrichFilter {
             ));
         };
 
+        #[cfg(feature = "openai-responses")]
+        if budget_policy.is_some_and(|policy| !policy.reserve_body_projection(ctx, raw, self.enrichment_charge)) {
+            return Ok(reject_retained_enrichment_budget());
+        }
+
         messages.splice(0..0, self.prepend.iter().cloned());
         messages.extend(self.append.iter().cloned());
 
@@ -189,24 +211,37 @@ impl HttpFilter for PromptEnrichFilter {
     }
 }
 
-/// Reject configured prompt expansion before it copies a budgeted create body.
+/// Find the budget only for a Responses create on this listener.
 #[cfg(feature = "openai-responses")]
-fn budgeted_create_rejection(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
-    (ctx
-        .extensions
-        .get::<praxis_ai_apis::openai::AgenticBudgetPolicy>()
-        .is_some()
-        && ctx.request.method == http::Method::POST
-        && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses")
-        .then(|| {
-            FilterAction::Reject(
-                Rejection::status(400)
-                    .with_header("content-type", "application/json")
-                    .with_body(Bytes::from_static(
-                        br#"{"error":{"type":"invalid_request_error","message":"prompt enrichment is not yet supported with openai_agentic_loop.max_retained_bytes","param":null,"code":"invalid_request_error"}}"#,
-                    )),
-            )
+fn budgeted_create_policy(ctx: &HttpFilterContext<'_>) -> Option<AgenticBudgetPolicy> {
+    (ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses")
+        .then(|| ctx.extensions.get::<AgenticBudgetPolicy>().copied())
+        .flatten()
+}
+
+/// Charge configured JSON at construction, before request-time cloning.
+#[cfg(feature = "openai-responses")]
+fn configured_enrichment_charge(prepend: &[serde_json::Value], append: &[serde_json::Value]) -> usize {
+    prepend
+        .iter()
+        .chain(append)
+        .try_fold(0_usize, |total, message| {
+            let bytes = serde_json::to_vec(message).ok()?;
+            total.checked_add(AgenticBudgetPolicy::input_charge(&bytes)?)
         })
+        .unwrap_or(usize::MAX)
+}
+
+/// Reject an enrichment projection that exceeds the listener's retained budget.
+#[cfg(feature = "openai-responses")]
+fn reject_retained_enrichment_budget() -> FilterAction {
+    FilterAction::Reject(
+        Rejection::status(413)
+            .with_header("content-type", "application/json")
+            .with_body(Bytes::from_static(
+                br#"{"error":{"type":"invalid_request_error","message":"prompt enrichment exceeds openai_agentic_loop.max_retained_bytes","param":null,"code":"invalid_request_error"}}"#,
+            )),
+    )
 }
 
 // -----------------------------------------------------------------------------
