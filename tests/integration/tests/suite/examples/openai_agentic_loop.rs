@@ -387,6 +387,135 @@ fn retained_budget_appends_plain_conversation_and_restores_next_turn() {
     assert_eq!(listed["data"].as_array().map(Vec::len), Some(4));
 }
 
+#[test]
+fn budgeted_conversation_append_overflow_does_not_store_success() {
+    let response = r#"{"id":"resp_conv_append_overflow","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_append_overflow","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_append_atomicity");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 1_048_576, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let conversation_id = created["id"].as_str().expect("conversation ID");
+
+    // Admission and the model output fit. The retained input copy needed for
+    // append-back alone exceeds the remaining request budget.
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "x".repeat(2_400),
+        "store": true,
+        "conversation": conversation_id,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_ne!(parse_status(&raw), 200, "append overflow cannot report success: {raw}");
+    assert_eq!(
+        model.requests().len(),
+        1,
+        "inference must have completed before append admission"
+    );
+
+    let (status, _) = http_get(proxy.addr(), "/v1/responses/resp_conv_append_overflow", None);
+    assert_eq!(status, 404, "a failed append cannot leave a successful Store record");
+    let (status, items) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items"),
+        None,
+    );
+    assert_eq!(status, 200, "conversation items lookup: {items}");
+    let items: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(items["data"].as_array().map(Vec::len), Some(0));
+}
+
+#[test]
+fn budgeted_stream_conversation_append_overflow_emits_error_without_success_or_store() {
+    let response_id = "resp_stream_conv_append_overflow";
+    let events = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": response_id, "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0,
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "status": "completed",
+                    "output": [{"type":"message","id":"msg_stream_conv_append_overflow","role":"assistant","content":[{"type":"output_text","text":"answer"}]}],
+                },
+                "sequence_number": 1,
+            }),
+        ),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (model_port, model_requests, model_thread) =
+        start_streaming_model_with_pacing(vec![events], Some(Duration::from_millis(50)));
+    let db = TempSqlite::new("budgeted_stream_append_atomicity");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model_port, 1_048_576, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let conversation_id = created["id"].as_str().expect("conversation ID");
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "x".repeat(2_400),
+        "store": true,
+        "stream": true,
+        "conversation": conversation_id,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    let body = parse_body(&raw);
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "stream headers and prefix should already be committed: {raw}"
+    );
+    assert!(
+        body.contains("event: response.created"),
+        "the client should receive the streamed prefix: {body}"
+    );
+    assert_eq!(
+        body.matches("event: error").count(),
+        1,
+        "append overflow needs one terminal SSE error: {body}"
+    );
+    assert!(
+        !body.contains("event: response.completed"),
+        "success must be withheld: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "error streams have no success sentinel: {body}"
+    );
+    let frames = parse_sse_frames(&body);
+    let error = sole_event(&frames, "error");
+    assert_eq!(error.data["code"], "invalid_request_error");
+    assert_eq!(error.data["sequence_number"], 1);
+    assert!(
+        error.data["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("conversation append"))
+    );
+    assert_eq!(model_requests.lock().unwrap().len(), 1);
+    model_thread.join().expect("model should finish streaming");
+
+    let (status, _) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    assert_eq!(status, 404, "the failed stream cannot leave a Store success record");
+    let (status, items) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items"),
+        None,
+    );
+    assert_eq!(status, 200, "conversation items lookup: {items}");
+    let items: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(items["data"].as_array().map(Vec::len), Some(0));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_budget_store_overflow_skips_persistence() {
     let response = serde_json::json!({
@@ -6108,6 +6237,10 @@ type StreamingModel = (u16, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>);
 
 /// Start a two-turn model backend that emits each SSE event as a chunk.
 fn start_streaming_model(responses: Vec<Vec<String>>) -> StreamingModel {
+    start_streaming_model_with_pacing(responses, None)
+}
+
+fn start_streaming_model_with_pacing(responses: Vec<Vec<String>>, pacing: Option<Duration>) -> StreamingModel {
     let listener = TcpListener::bind("127.0.0.1:0").expect("streaming model should bind");
     let port = listener
         .local_addr()
@@ -6134,6 +6267,9 @@ fn start_streaming_model(responses: Vec<Vec<String>>) -> StreamingModel {
             for event in response {
                 write!(stream, "{:x}\r\n{event}\r\n", event.len()).expect("streaming model should write event chunk");
                 stream.flush().expect("streaming model should flush event chunk");
+                if let Some(delay) = pacing {
+                    thread::sleep(delay);
+                }
             }
             stream
                 .write_all(b"0\r\n\r\n")

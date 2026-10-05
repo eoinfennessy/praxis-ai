@@ -172,12 +172,6 @@ filter_chains:
 
       - filter: openai_operation
 
-      - filter: openai_conversations
-        backend: sqlite
-        database_url: "sqlite://responses.db?mode=rwc"
-        conversations_table: openai_conversations
-        items_table: openai_conversation_items
-
       - filter: openai_responses_format
         on_invalid: reject
         headers:
@@ -200,6 +194,14 @@ filter_chains:
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
+
+      # Response hooks run in reverse: append the conversation turn before
+      # Store can persist a successful response from the same exchange.
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
 
       - filter: openai_responses_rehydrate
 

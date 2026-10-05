@@ -33,8 +33,12 @@ use crate::{
     openai::{
         operation_classifier::OpenAiOperationMatch,
         responses::{
-            AgenticBudgetPolicy, agentic_loop::budget::input_charge, bound_body_outcome,
-            error::responses_error_rejection, state::ResponsesState,
+            AgenticBudgetPolicy,
+            agentic_loop::budget::input_charge,
+            bound_body_outcome,
+            error::{responses_error_rejection, responses_error_sse_payload},
+            fs_end_stream_with_error_ctx,
+            state::ResponsesState,
         },
     },
     operation::Transport,
@@ -60,7 +64,9 @@ use crate::{
 /// state without buffering SSE. With the default fail-closed policy, it persists
 /// before `response.completed` is released; `failure_mode: open` opts out of that
 /// guarantee. Incomplete or failed streams do not append a turn. The provider
-/// owns history on a direct OpenAI passthrough route.
+/// owns history on a direct OpenAI passthrough route. Place this filter after
+/// `openai_response_store` in the request chain so reverse response hooks append
+/// the conversation turn before storing its successful response.
 ///
 /// # YAML
 ///
@@ -598,7 +604,10 @@ impl HttpFilter for OpenaiConversationsFilter {
 
         let max_rebuild_bytes = match reserve_budgeted_append(ctx, body) {
             Ok(limit) => limit,
-            Err(action) => return Ok(action),
+            Err(error) if streaming => {
+                return replace_stream_completion_with_error(ctx, body, error.code(), error.message());
+            },
+            Err(error) => return Ok(error.rejection()),
         };
         let items = if streaming {
             extract_streaming_append_back_items(ctx, append_owner)
@@ -627,7 +636,16 @@ impl HttpFilter for OpenaiConversationsFilter {
                 .downcast_ref::<StoreError>()
                 .is_some_and(|store| matches!(store, StoreError::PayloadTooLarge))
             {
-                return Ok(reject_append_budget());
+                return if streaming {
+                    replace_stream_completion_with_error(
+                        ctx,
+                        body,
+                        AppendBudgetError::Exceeded.code(),
+                        AppendBudgetError::Exceeded.message(),
+                    )
+                } else {
+                    Ok(reject_append_budget())
+                };
             }
             return Err(error);
         }
@@ -692,32 +710,32 @@ fn budgeted_response_is_completed(ctx: &HttpFilterContext<'_>, body: &Option<Byt
 fn reserve_budgeted_append(
     ctx: &mut HttpFilterContext<'_>,
     body: &Option<Bytes>,
-) -> Result<Option<usize>, FilterAction> {
+) -> Result<Option<usize>, AppendBudgetError> {
     if ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
         return Ok(None);
     }
     let Some(bytes) = body.as_deref() else {
-        return Err(reject_append_budget());
+        return Err(AppendBudgetError::Exceeded);
     };
     let input_bytes = ctx
         .extensions
         .get::<ResponsesState>()
-        .ok_or_else(reject_missing_append_budget)
-        .and_then(|state| json_size(&state.input).ok_or_else(reject_append_budget))?;
+        .ok_or(AppendBudgetError::Missing)
+        .and_then(|state| json_size(&state.input).ok_or(AppendBudgetError::Exceeded))?;
     let item_charge = input_charge(bytes)
         .and_then(|charge| input_bytes.checked_mul(512).and_then(|input| charge.checked_add(input)))
-        .ok_or_else(reject_append_budget)?;
+        .ok_or(AppendBudgetError::Exceeded)?;
     let budget = ctx
         .extensions
         .get_mut::<ResponsesState>()
         .and_then(|state| state.simple_budget.as_mut())
-        .ok_or_else(reject_missing_append_budget)?;
+        .ok_or(AppendBudgetError::Missing)?;
     if !budget.reserve_additional_input(item_charge) {
-        return Err(reject_append_budget());
+        return Err(AppendBudgetError::Exceeded);
     }
-    let cache_allowance = budget.remaining_bytes().ok_or_else(reject_append_budget)?;
+    let cache_allowance = budget.remaining_bytes().ok_or(AppendBudgetError::Exceeded)?;
     if !budget.reserve_additional_input(cache_allowance) {
-        return Err(reject_append_budget());
+        return Err(AppendBudgetError::Exceeded);
     }
     Ok(Some(cache_allowance))
 }
@@ -748,7 +766,7 @@ fn reject_append_budget() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         413,
         "invalid_request_error",
-        "conversation append exceeds openai_agentic_loop.max_retained_bytes",
+        AppendBudgetError::Exceeded.message(),
     ))
 }
 
@@ -757,8 +775,82 @@ fn reject_missing_append_budget() -> FilterAction {
     FilterAction::Reject(responses_error_rejection(
         500,
         "server_error",
-        "conversation append is missing the retained-payload budget",
+        AppendBudgetError::Missing.message(),
     ))
+}
+
+/// Why append admission failed before any conversation items were copied.
+enum AppendBudgetError {
+    Exceeded,
+    Missing,
+}
+
+impl AppendBudgetError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Exceeded => "invalid_request_error",
+            Self::Missing => "server_error",
+        }
+    }
+
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Exceeded => "conversation append exceeds openai_agentic_loop.max_retained_bytes",
+            Self::Missing => "conversation append is missing the retained-payload budget",
+        }
+    }
+
+    fn rejection(&self) -> FilterAction {
+        match self {
+            Self::Exceeded => reject_append_budget(),
+            Self::Missing => reject_missing_append_budget(),
+        }
+    }
+}
+
+/// A completed SSE frame has already passed the inner stream composer. Core
+/// discards response-body `Reject` actions after headers commit, so replace
+/// that unreleased frame with an error before the outer Store hook sees it.
+fn replace_stream_completion_with_error(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    code: &str,
+    message: &str,
+) -> Result<FilterAction, FilterError> {
+    let replaced_events = body.as_deref().map_or(0, |chunk| {
+        chunk
+            .split(|&byte| byte == b'\n')
+            .filter(|line| line.starts_with(b"event: "))
+            .count()
+    });
+    // Release the withheld success frame before allocating the fixed-size
+    // control event. As with stream_events' overflow error, a terminal error
+    // needs no new payload allowance after the request limit has been hit.
+    *body = None;
+    if let Some(state) = ctx.get_filter_state_mut::<ConversationResponseState>() {
+        state.append_attempted = true;
+    }
+    fs_end_stream_with_error_ctx(ctx, code, message);
+    let sequence_number = ctx.extensions.get::<ResponsesState>().map_or(0, |state| {
+        // The composer consumed sequence numbers for every event in the
+        // withheld chunk. Reuse the first so the delivered prefix stays
+        // contiguous even when local tool events shared the terminal chunk.
+        state
+            .logical_stream_sequence
+            .saturating_sub(replaced_events.max(1) as u64)
+    });
+    let mut payload = responses_error_sse_payload(code, message);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("sequence_number".to_owned(), Value::from(sequence_number));
+    }
+    let encoded = serde_json::to_vec(&payload)
+        .map_err(|error| FilterError::from(format!("openai_conversations: encode stream error: {error}")))?;
+    let mut frame = Vec::with_capacity(b"event: error\ndata: \n\n".len() + encoded.len());
+    frame.extend_from_slice(b"event: error\ndata: ");
+    frame.extend_from_slice(&encoded);
+    frame.extend_from_slice(b"\n\n");
+    *body = Some(Bytes::from(frame));
+    Ok(FilterAction::Continue)
 }
 
 // -----------------------------------------------------------------------------
