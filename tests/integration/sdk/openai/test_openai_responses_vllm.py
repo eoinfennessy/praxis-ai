@@ -5353,6 +5353,15 @@ class TestAgenticLoopVLLM:
         stored = agentic_client.responses.retrieve(response.id)
         assert stored.id == response.id, "the bounded response must be retrievable"
 
+    def test_retained_budget_allows_text_message_array(self, agentic_client):
+        """The usual SDK message-array form stays available with a budget."""
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=[{"role": "user", "content": "Reply briefly: Hello."}],
+            store=False,
+        )
+        assert response.status == "completed", response
+
     def test_retained_budget_allows_buffered_chat_translation(
         self, translated_agentic_client
     ):

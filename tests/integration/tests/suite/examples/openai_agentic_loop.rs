@@ -89,6 +89,23 @@ fn retained_budget_allows_model_alias_before_validation() {
 }
 
 #[test]
+fn retained_budget_preserves_text_message_array() {
+    let response = r#"{"id":"resp_text_array","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let input = serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]);
+    let body = serde_json::json!({"model":"gpt-4.1","input":input,"store":false});
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body.to_string()));
+    assert_eq!(parse_status(&raw), 200, "text message array failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(outbound["input"], input);
+}
+
+#[test]
 fn retained_budget_persists_default_store_plain_response() {
     let response = r#"{"id":"resp_stored_plain","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_stored_plain","content":[{"type":"output_text","text":"Hello"}]}]}"#;
     let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();

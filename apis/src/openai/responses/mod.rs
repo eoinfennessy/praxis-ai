@@ -151,7 +151,7 @@ pub(crate) fn plain_agentic_budget(
 /// Keep owners with unbounded expansions out of the first budget slice.
 #[cfg(feature = "openai-responses")]
 fn plain_agentic_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
-    object.get("input").is_some_and(serde_json::Value::is_string)
+    text_only_input(object.get("input"))
         && object.get("stream") != Some(&serde_json::Value::Bool(true))
         && !object.keys().any(|key| {
             matches!(
@@ -159,6 +159,36 @@ fn plain_agentic_request_supported(object: &serde_json::Map<String, serde_json::
                 "tools" | "tool_choice" | "conversation" | "prompt" | "include" | "background" | "context_management"
             )
         })
+}
+
+/// Admit the common message-array form only when every content part is plain
+/// text. File, image, audio, and video parts retain owners that need their own
+/// admission before this guard can accept them.
+#[cfg(feature = "openai-responses")]
+fn text_only_input(input: Option<&serde_json::Value>) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+    match input {
+        serde_json::Value::String(_) => true,
+        serde_json::Value::Array(items) => items.iter().all(|item| {
+            let Some(message) = item.as_object() else {
+                return false;
+            };
+            if message.get("type").is_some_and(|kind| kind != "message") {
+                return false;
+            }
+            match message.get("content") {
+                Some(serde_json::Value::String(_)) => true,
+                Some(serde_json::Value::Array(parts)) => parts.iter().all(|part| {
+                    part.get("type").and_then(serde_json::Value::as_str) == Some("input_text")
+                        && part.get("text").is_some_and(serde_json::Value::is_string)
+                }),
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
 }
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;

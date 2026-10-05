@@ -438,7 +438,7 @@ fn budgeted_plain_file_action(ctx: &HttpFilterContext<'_>, parsed: &serde_json::
     ctx.extensions.get::<AgenticBudgetPolicy>()?;
     // Rehydrate has charged stored history before replacing state. Inspect
     // both independent vectors because either can contain a file reference.
-    let no_resolution = parsed.get("input").is_some_and(serde_json::Value::is_string)
+    let no_resolution = super::text_only_input(parsed.get("input"))
         && ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
             state.simple_budget.is_some()
                 && state

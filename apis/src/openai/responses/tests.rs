@@ -49,6 +49,35 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     request.as_object_mut().unwrap().remove("previous_response_id");
 }
 
+#[test]
+#[cfg(feature = "openai-responses")]
+fn budgeted_text_message_arrays_exclude_expanding_parts() {
+    for input in [
+        serde_json::json!([]),
+        serde_json::json!([{"role":"user","content":"Hello"}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]),
+    ] {
+        let request = serde_json::json!({"input": input, "store": false});
+        assert!(
+            plain_agentic_request_supported(request.as_object().unwrap()),
+            "{request}"
+        );
+    }
+
+    for input in [
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_file","file_data":"YQ=="}]}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,YQ=="}]}]),
+        serde_json::json!([{"type":"function_call_output","output":"Hello"}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":null}]}]),
+    ] {
+        let request = serde_json::json!({"input": input, "store": false});
+        assert!(
+            !plain_agentic_request_supported(request.as_object().unwrap()),
+            "{request}"
+        );
+    }
+}
+
 #[tokio::test]
 #[cfg(feature = "openai-responses")]
 async fn budgeted_legacy_classifier_rejects_compaction_in_body_phase() {
