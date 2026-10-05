@@ -357,6 +357,10 @@ impl HttpFilter for FileResolveFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "budget preflight and file resolution share one body hook"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
