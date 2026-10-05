@@ -140,6 +140,7 @@ impl SimpleBudget {
         };
         self.additional_input_charge = next;
         true
+    }
 
     /// Reserve the live item clones, event envelopes, and encoded SSE bytes
     /// before a local tool lifecycle is synthesized. One item can appear in
