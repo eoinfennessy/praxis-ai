@@ -151,9 +151,13 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         if let Some(action) = super::reject_prompt_template(&parsed) {
             return Ok(action);
         }
-        let budget = match super::plain_agentic_budget(ctx, &parsed, raw) {
-            Ok(budget) => budget,
-            Err(action) => return Ok(action),
+        let budget = if super::is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+            match super::plain_agentic_budget(ctx, &parsed, raw) {
+                Ok(budget) => budget,
+                Err(action) => return Ok(action),
+            }
+        } else {
+            None
         };
 
         let response_id = format!("resp_{}", ctx.id_generator.generate(ctx.time_source));
@@ -890,6 +894,25 @@ mod tests {
             matches!(action, FilterAction::Reject(_)),
             "POST /input_tokens without body should be rejected, not released"
         );
+    }
+
+    #[tokio::test]
+    async fn budgeted_listener_preserves_input_tokens_request() {
+        let filter = make_filter();
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses/input_tokens",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.extensions
+            .insert(crate::openai::responses::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Release));
+        assert!(ctx.extensions.get::<ResponsesState>().is_some());
+        assert!(ctx.extensions.get::<ResponsesState>().unwrap().simple_budget.is_none());
     }
 
     // -------------------------------------------------------------------------
