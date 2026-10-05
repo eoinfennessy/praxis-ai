@@ -465,7 +465,8 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         };
 
-        if let Some(budget) = state.simple_budget.as_mut()
+        if ctx.subrequest_response_mode() != SubRequestResponseMode::Streaming
+            && let Some(budget) = state.simple_budget.as_mut()
             && !body.as_ref().is_some_and(|bytes| budget.admit_output(bytes))
         {
             ctx.set_metadata("responses.skip_persist", "true");
@@ -1023,20 +1024,26 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> boo
 /// The first budgeted slice accepts plain messages and reasoning items. Every
 /// tool-related output is rejected before its dispatcher sees an assignment.
 fn plain_text_response(response: &Value) -> bool {
-    response.get("output").and_then(Value::as_array).is_some_and(|items| {
-        items.iter().all(|item| match item.get("type").and_then(Value::as_str) {
-            Some("reasoning") => true,
-            Some("message") => item.get("content").and_then(Value::as_array).is_some_and(|parts| {
-                parts.iter().all(|part| {
-                    matches!(
-                        part.get("type").and_then(Value::as_str),
-                        Some("output_text" | "refusal")
-                    )
-                })
-            }),
-            _ => false,
-        })
-    })
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().all(plain_text_output_item))
+}
+
+/// The same budgeted output shape is enforced for buffered and streamed items.
+pub(crate) fn plain_text_output_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("reasoning") => true,
+        Some("message") => item.get("content").and_then(Value::as_array).is_some_and(|parts| {
+            parts.iter().all(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("output_text" | "refusal")
+                )
+            })
+        }),
+        _ => false,
+    }
 }
 
 /// Return whether one model round mixed server-owned MCP, web-search, pending

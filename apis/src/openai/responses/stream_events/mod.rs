@@ -46,6 +46,7 @@ use crate::{
     is_event_stream_content_type,
     openai::{
         responses::{
+            agentic_loop::plain_text_output_item,
             error::{responses_error_rejection, responses_error_sse_payload},
             openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
             state::{EmittedItem, ResponsesState},
@@ -616,8 +617,17 @@ fn handle_parse_result(
 }
 
 /// Record a parse failure and suppress unnormalized logical-stream bytes.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one failure classification preserves the first sticky stream error"
+)]
 fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, error: &SseParseError) {
     warn!(%error, "SSE parse error in stream_events");
+    if matches!(error, SseParseError::StreamPoisoned) && ctx.get_metadata("responses.stream_error_code").is_some() {
+        // Keep the first failure's client-visible cause on repeated input.
+        *body = None;
+        return;
+    }
     ctx.set_metadata("responses.stream_parse_error", "true".to_owned());
     ctx.set_metadata("responses.stream_error_code", "server_error");
     // M3: surface a client-tool-restore-specific message when the failure is a
@@ -626,6 +636,18 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
     // dedicated message; all other error kinds keep the generic message.
     // Diagnostic-only — control flow is unchanged.
     match error {
+        SseParseError::RetainedPayloadLimitExceeded => {
+            ctx.set_metadata(
+                "responses.stream_error_message",
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+            );
+        },
+        SseParseError::UnsupportedBudgetedOutput => {
+            ctx.set_metadata(
+                "responses.stream_error_message",
+                "model response needs an unsupported tool or non-text owner under openai_agentic_loop.max_retained_bytes",
+            );
+        },
         SseParseError::ClientToolRestore { reason, .. } => {
             ctx.set_metadata(
                 "responses.stream_error_message",
@@ -666,6 +688,19 @@ fn parse_and_accumulate(
     }
 
     check_timeout(state, now)?;
+
+    // Charge the raw SSE transport before SseFrameParser copies a partial
+    // frame or ResponsesEvent allocates a parsed payload. The charge survives
+    // per-round re-arming in ResponsesState. A failed charge is sticky through
+    // stream_failed, so subsequent chunks cannot revive the logical stream.
+    if let Some(budget) = ctx
+        .extensions
+        .get_mut::<ResponsesState>()
+        .and_then(|responses| responses.simple_budget.as_mut())
+        && !budget.admit_stream_chunk(bytes)
+    {
+        return Err(SseParseError::RetainedPayloadLimitExceeded);
+    }
 
     // A prior chunk or round may have tripped the aggregate accumulation budget.
     // Fail every remaining chunk closed before parsing so a later terminal event
@@ -715,13 +750,61 @@ fn parse_chunk_events(
             continue;
         }
 
+        if let Some(budget) = ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .and_then(|responses| responses.simple_budget.as_mut())
+            && !budget.admit_stream_frame(&frame.data)
+        {
+            return Err(SseParseError::RetainedPayloadLimitExceeded);
+        }
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
+        if ctx
+            .extensions
+            .get::<ResponsesState>()
+            .is_some_and(|responses| responses.simple_budget.is_some())
+            && !budgeted_stream_event_supported(&event)
+        {
+            return Err(SseParseError::UnsupportedBudgetedOutput);
+        }
         record_completion(state, &event, now)?;
         charge_accumulation_budget(state, ctx, &event, frame)?;
         events.push(event);
     }
     Ok(events)
+}
+
+/// Budgeted streaming currently owns only text and reasoning response items.
+/// Check event payloads before the accumulator can copy or dispatch a tool.
+fn budgeted_stream_event_supported(event: &ResponsesEvent) -> bool {
+    match event {
+        ResponsesEvent::ResponseCreated(payload)
+        | ResponsesEvent::ResponseQueued(payload)
+        | ResponsesEvent::ResponseInProgress(payload) => payload
+            .get("response")
+            .and_then(|response| response.get("output"))
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.iter().all(plain_text_output_item)),
+        ResponsesEvent::ResponseCompleted(payload)
+        | ResponsesEvent::ResponseIncomplete(payload)
+        | ResponsesEvent::ResponseFailed(payload) => payload
+            .get("response")
+            .and_then(|response| response.get("output"))
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().all(plain_text_output_item)),
+        ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
+            payload.get("item").is_some_and(plain_text_output_item)
+        },
+        ResponsesEvent::ContentPartAdded(payload) | ResponsesEvent::ContentPartDone(payload) => payload
+            .get("part")
+            .and_then(|part| part.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|part_type| matches!(part_type, "output_text" | "refusal")),
+        ResponsesEvent::FunctionCallArgumentsDelta(_) | ResponsesEvent::FunctionCallArgumentsDone(_) => false,
+        ResponsesEvent::Unknown { event_type, .. } => !is_local_tool_progress_event(event_type),
+        _ => true,
+    }
 }
 
 /// Charge one parsed event's wire bytes against the request-wide accumulation
@@ -2262,6 +2345,14 @@ fn emit_deferred_terminal(
     // Match the wire-rewrite decision so the persisted store source cannot disagree
     // with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
+    if state.simple_budget.is_some()
+        && let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut)
+    {
+        // The terminal's provider snapshot already has another owner in
+        // response_object. Release its output before constructing the logical
+        // terminal so the peak does not retain a third complete output tree.
+        response.remove("output");
+    }
     let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
     // #937: `response_object` is now canonical and the client-visible terminal
     // frame is appended below as a deferred, non-end-of-stream chunk. Signal the
@@ -2340,6 +2431,10 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 ///
 /// Either way the id is only ever restored, never fabricated: a non-rehydrated
 /// turn keeps the real value the backend echoed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "terminal canonicalization reserves before copying its output"
+)]
 fn canonicalize_logical_response(
     state: &mut ResponsesState,
     restore_previous_response_id: bool,
@@ -2354,7 +2449,13 @@ fn canonicalize_logical_response(
     // stream — it stays empty, so fall back to the terminal event's own output
     // rather than clobber it with nothing. Mirrors `finalize_response_body`.
     let mut output = if state.accumulated_output.is_empty() {
-        state.output_items().to_vec()
+        if state.simple_budget.is_some() {
+            std::mem::take(state.output_items_mut())
+        } else {
+            state.output_items().to_vec()
+        }
+    } else if state.simple_budget.is_some() {
+        std::mem::take(&mut state.accumulated_output)
     } else {
         state.accumulated_output.clone()
     };
@@ -2371,6 +2472,14 @@ fn canonicalize_logical_response(
         &state.citation_files,
     ) {
         tracing::warn!(%error, "failed to annotate logical stream response citations");
+    }
+    if let Some(budget) = state.simple_budget.as_mut() {
+        let output_bytes = super::bounded_json_size(&output, usize::MAX)
+            .map_err(|_error| SseParseError::RetainedPayloadLimitExceeded)?
+            .ok_or(SseParseError::RetainedPayloadLimitExceeded)?;
+        if !budget.admit_stream_terminal(output_bytes) {
+            return Err(SseParseError::RetainedPayloadLimitExceeded);
+        }
     }
     if let Some(response) = state.response_object.as_object_mut() {
         if let Some(logical_id) = logical_id {

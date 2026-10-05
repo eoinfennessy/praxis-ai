@@ -19,15 +19,209 @@ use serde_json::json;
 
 use super::{
     ArmDecision, CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object,
-    arm_decision, canonicalize_logical_response, encode_local_completion, encode_local_error,
+    arm_decision, budgeted_stream_event_supported, canonicalize_logical_response, encode_local_completion,
+    encode_local_error,
 };
 use crate::{
     openai::{
-        responses::state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, SynthesisKind},
+        responses::{
+            agentic_loop::budget::SimpleBudget,
+            state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, SynthesisKind},
+        },
         sse::{SseFrameParser, SseParseError},
     },
     test_utils::{make_filter_context, make_request},
 };
+
+#[test]
+fn budgeted_stream_accepts_text_reasoning_and_refusal_but_rejects_tools() {
+    use crate::openai::sse::responses::ResponsesEvent;
+    assert!(budgeted_stream_event_supported(&ResponsesEvent::OutputItemDone(
+        json!({
+            "item": {"type": "reasoning", "summary": []}
+        })
+    )));
+    assert!(budgeted_stream_event_supported(&ResponsesEvent::OutputItemDone(
+        json!({
+            "item": {"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}
+        })
+    )));
+    assert!(!budgeted_stream_event_supported(&ResponsesEvent::OutputItemAdded(
+        json!({
+            "item": {"type": "function_call", "name": "run"}
+        })
+    )));
+    assert!(!budgeted_stream_event_supported(&ResponsesEvent::ResponseCompleted(
+        json!({
+            "response": {"output": [{"type": "web_search_call"}]}
+        })
+    )));
+    assert!(!budgeted_stream_event_supported(
+        &ResponsesEvent::FunctionCallArgumentsDelta(json!({
+            "delta": "{}"
+        }))
+    ));
+    assert!(budgeted_stream_event_supported(&ResponsesEvent::Unknown {
+        event_type: "response.provider_metadata".to_owned(),
+        data: json!({"type": "response.provider_metadata", "value": 1}),
+    }));
+    assert!(!budgeted_stream_event_supported(&ResponsesEvent::Unknown {
+        event_type: "response.web_search_call.in_progress".to_owned(),
+        data: json!({"type": "response.web_search_call.in_progress"}),
+    }));
+}
+
+#[test]
+fn retained_budget_overflow_poisoned_stream_emits_one_error_without_success() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut response = ctx.extensions.remove::<ResponsesState>().unwrap_or_default();
+    response.simple_budget = Some(SimpleBudget::new(262_144, 0).unwrap());
+    ctx.extensions.insert(response);
+
+    let mut first = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "object": "response", "status": "in_progress", "output": []}
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(first.as_ref().is_some_and(|bytes| !bytes.is_empty()));
+    let accepted_count = ctx.get_filter_state::<StreamEventsState>().unwrap().event_count;
+
+    let mut overflow = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {"id": "resp_1", "object": "response", "status": "completed", "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "x".repeat(10_000)}]}
+            ]}
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(overflow.is_none(), "the oversized success terminal must be suppressed");
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>().unwrap().event_count,
+        accepted_count
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+
+    let mut repeated = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {"id": "resp_1", "object": "response", "status": "completed", "output": []}
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut repeated, false).unwrap();
+    assert!(repeated.is_none(), "a failed charge must keep later events poisoned");
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>().unwrap().event_count,
+        accepted_count
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some("agentic retained payload exceeded openai_agentic_loop.max_retained_bytes")
+    );
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let wire = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    assert_eq!(wire.matches("event: error").count(), 1, "{wire}");
+    assert!(!wire.contains("response.completed"), "{wire}");
+    assert!(!wire.contains("[DONE]"), "{wire}");
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn retained_budget_allows_split_sse_frame_without_buffering_full_stream() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut response = ctx.extensions.remove::<ResponsesState>().unwrap_or_default();
+    response.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
+    ctx.extensions.insert(response);
+
+    let frame = make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_split", "object": "response", "status": "in_progress", "output": []}
+        }),
+    );
+    let split = frame.len() / 2;
+    let mut head = Some(frame.slice(..split));
+    filter.on_response_body(&mut ctx, &mut head, false).unwrap();
+    assert!(head.is_none());
+    assert_eq!(ctx.get_filter_state::<StreamEventsState>().unwrap().event_count, 0);
+
+    let mut tail = Some(frame.slice(split..));
+    filter.on_response_body(&mut ctx, &mut tail, false).unwrap();
+    assert!(
+        tail.as_ref()
+            .is_some_and(|bytes| bytes.starts_with(b"event: response.created\n"))
+    );
+    assert_eq!(ctx.get_filter_state::<StreamEventsState>().unwrap().event_count, 1);
+    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+}
+
+#[test]
+fn fragmented_compact_terminal_is_rejected_before_json_tree_allocation() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut response = ctx.extensions.remove::<ResponsesState>().unwrap_or_default();
+    response.simple_budget = Some(SimpleBudget::new(67_108_864, 2_272).unwrap());
+    ctx.extensions.insert(response);
+
+    let item = format!("{}0{}", "[".repeat(20), "]".repeat(20));
+    let nested = std::iter::repeat_n(item.as_str(), 12_000).collect::<Vec<_>>().join(",");
+    let wire = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{{\"type\":\"message\",\"content\":[{{\"type\":\"output_text\",\"text\":\"hello\"}}],\"extra\":[{nested}]}}]}}}}\n\n"
+    );
+    for chunk in wire.as_bytes().chunks(4_096) {
+        let mut body = Some(Bytes::copy_from_slice(chunk));
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+        assert!(body.is_none(), "no partial or rejected terminal may be emitted");
+    }
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    assert_eq!(ctx.get_filter_state::<StreamEventsState>().unwrap().event_count, 0);
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let terminal = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+    assert_eq!(terminal.matches("event: error").count(), 1);
+    assert!(!terminal.contains("response.completed"));
+}
+
+#[test]
+fn budgeted_terminal_moves_accumulated_output_before_store_copy() {
+    let item = json!({
+        "type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": "hello"}]
+    });
+    let mut state = ResponsesState {
+        simple_budget: Some(SimpleBudget::new(1_048_576, 0).unwrap()),
+        accumulated_output: vec![item.clone()],
+        response_object: json!({"id": "resp_1", "status": "completed", "output": [item]}),
+        ..ResponsesState::default()
+    };
+    let prior_allocation = state.accumulated_output.as_ptr();
+    let (output, _) = canonicalize_logical_response(&mut state, false).unwrap();
+    assert_eq!(
+        output.as_ptr(),
+        prior_allocation,
+        "the logical output should move into the terminal"
+    );
+    assert!(state.accumulated_output.is_empty());
+    assert_eq!(state.response_object["output"], serde_json::Value::Array(output));
+}
+
+#[test]
+fn budgeted_terminal_rejects_copy_before_growing_response_object() {
+    let mut state = ResponsesState {
+        simple_budget: Some(SimpleBudget::new(65_536, 35_000).unwrap()),
+        accumulated_output: vec![json!({
+            "type": "message", "id": "msg_1", "content": [{"type": "output_text", "text": "x".repeat(2_000)}]
+        })],
+        response_object: json!({"id": "resp_1", "status": "completed", "output": []}),
+        ..ResponsesState::default()
+    };
+    let failure = canonicalize_logical_response(&mut state, false).unwrap_err();
+    assert!(matches!(failure, SseParseError::RetainedPayloadLimitExceeded));
+    assert_eq!(state.response_object["output"], json!([]));
+}
 
 #[test]
 fn done_after_terminal_at_max_events_is_allowed() {

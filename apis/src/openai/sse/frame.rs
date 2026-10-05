@@ -295,6 +295,14 @@ pub(crate) enum SseParseError {
         limit: usize,
     },
 
+    /// Request-wide retained payload cannot admit the next SSE chunk before
+    /// frame assembly or event parsing.
+    RetainedPayloadLimitExceeded,
+
+    /// Budgeted plain-text streaming cannot dispatch or forward a provider
+    /// tool item until that owner participates in the retained-payload budget.
+    UnsupportedBudgetedOutput,
+
     /// A lowered client tool could not be restored to its canonical typed item
     /// on the streaming Responses path (#1159): malformed arguments envelope,
     /// missing completion artifact, out-of-order lifecycle, or a lossy retype.
@@ -357,6 +365,18 @@ impl fmt::Display for SseParseError {
                 f,
                 "SSE accumulation limit exceeded: {dimension} {value} exceeds {limit} limit"
             ),
+            Self::RetainedPayloadLimitExceeded => {
+                write!(
+                    f,
+                    "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes"
+                )
+            },
+            Self::UnsupportedBudgetedOutput => {
+                write!(
+                    f,
+                    "model response needs an unsupported tool or non-text owner under openai_agentic_loop.max_retained_bytes"
+                )
+            },
             Self::ClientToolRestore { key, reason } => {
                 write!(f, "client tool restoration failed for {key}: {reason}")
             },
