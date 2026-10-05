@@ -4,6 +4,7 @@
 //! Tests for the `openai_web_search` filter.
 
 use super::*;
+use crate::openai::responses::agentic_loop::budget::SimpleBudget;
 
 // -----------------------------------------------------------------------------
 // Helper: build filter from YAML
@@ -768,6 +769,92 @@ async fn on_request_body_empty_results_remain_completed() {
     let output = state.messages.last().unwrap();
     assert_eq!(output["type"], "function_call_output");
     assert_eq!(output["output"], "No search results found.");
+}
+
+#[tokio::test]
+async fn budgeted_web_search_rejects_oversized_body_without_publishing_results() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let calls = spawn_counting_body_mock(listener, "x".repeat(32_768));
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+    state.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
+    state.select_test_output(
+        "web_search_call",
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_budget",
+            "action": {"type": "search", "query": "rust language"}
+        })],
+    );
+    ctx.extensions.insert(state);
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut None, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert!(
+        state
+            .messages
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("function_call_output")),
+        "no successful bridge may be published"
+    );
+    assert!(
+        state
+            .persisted_messages
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) != Some("function_call_output")),
+        "no result may enter persisted history"
+    );
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn web_search_turn_reservation_covers_both_bridge_owners_and_source_projection() {
+    let action = serde_json::json!({"type": "search", "query": "rust"});
+    let results = vec![SearchResult {
+        title: "Rust".to_owned(),
+        url: "https://example.test".to_owned(),
+        snippet: "x".repeat(4_096),
+    }];
+    let ids = SearchCallIds::new("ws_1", &["rust"], 0, 0);
+    let (peak, retained) = web_search_turn_charges(&ids, &action, &results, true).unwrap();
+    let mut budget = SimpleBudget::new(1_048_576, 0).unwrap();
+    let remaining = budget.remaining_bytes().unwrap();
+    assert!(budget.reserve_additional_input(remaining - peak));
+    assert!(
+        budget.reserve_additional_input(peak),
+        "the exact admission boundary fits"
+    );
+    assert!(budget.settle_additional_input(peak, retained));
+    assert_eq!(budget.remaining_bytes(), Some(peak - retained));
+    assert!(!budget.reserve_additional_input(peak - retained + 1));
+}
+
+#[test]
+fn web_search_body_preflight_obeys_exact_wire_boundary() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let query = "rust";
+    let overhead = query.len() * 8 + 4_096;
+    for (wire_bytes, expected) in [(127, None), (128, Some(1)), (256, Some(2))] {
+        let mut ctx = crate::test_utils::make_filter_context(&request);
+        let mut budget = SimpleBudget::new(1_048_576, 0).unwrap();
+        let remaining = budget.remaining_bytes().unwrap();
+        assert!(budget.reserve_additional_input(remaining - overhead - wire_bytes));
+        let state = ResponsesState {
+            simple_budget: Some(budget),
+            ..ResponsesState::default()
+        };
+        ctx.extensions.insert(state);
+        assert_eq!(web_search_response_limit(&ctx, query, &[]), expected);
+    }
 }
 
 #[tokio::test]

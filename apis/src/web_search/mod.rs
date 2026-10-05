@@ -100,7 +100,10 @@ mod tests {
 
     #[test]
     #[expect(clippy::print_stderr, reason = "record fixed-baseline allocation evidence")]
-    #[expect(clippy::too_many_lines, reason = "compare complete result output and allocation baseline")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compare complete result output and allocation baseline"
+    )]
     fn large_web_result_format_avoids_buffer_growth() {
         let results = (0..64)
             .map(|index| SearchResult {
