@@ -57,7 +57,7 @@ fn retained_budget_preserves_buffered_chat_translation() {
         "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
     });
     let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
-    let (config, _db) = load_budgeted_chat_config("budgeted_chat_success", free_port(), backend.port(), 1_048_576);
+    let (config, _db) = load_budgeted_chat_config("budgeted_chat_success", free_port(), backend.port(), 8_388_608);
     let proxy = start_proxy(&config);
 
     let raw = http_send(
