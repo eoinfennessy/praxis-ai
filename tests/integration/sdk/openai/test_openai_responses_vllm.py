@@ -5326,23 +5326,26 @@ class TestClientToolCompatChatVLLM:
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 
-    def test_retained_budget_rejects_unsupported_sdk_requests(self, agentic_client):
-        """The first budget slice rejects unmetered paths before inference."""
-        for options in (
+    @pytest.mark.parametrize(
+        "options",
+        [
             {"stream": True, "store": False},
-            {
-                "store": False,
-                "tools": [{"type": "web_search_preview"}],
-            },
+            {"store": False, "tools": [{"type": "web_search_preview"}]},
             {},  # Omitted store defaults to persistence on the Responses API.
-        ):
-            with pytest.raises(BadRequestError) as exc_info:
-                agentic_client.responses.create(
-                    model=VLLM_MODEL,
-                    input="Hello",
-                    **options,
-                )
-            assert "openai_agentic_loop.max_retained_bytes" in str(exc_info.value)
+        ],
+        ids=["streaming", "hosted-tool", "default-store"],
+    )
+    def test_retained_budget_rejects_unsupported_sdk_requests(self, agentic_client, options):
+        """The first budget slice rejects unmetered paths before inference."""
+        with pytest.raises(BadRequestError) as exc_info:
+            agentic_client.responses.create(
+                model=VLLM_MODEL,
+                input="Hello",
+                **options,
+            )
+        assert "openai_agentic_loop.max_retained_bytes" in str(exc_info.value), (
+            f"{options} must reject before inference until its payload owners are metered"
+        )
 
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,
