@@ -1278,6 +1278,10 @@ impl ResponsesState {
     /// Returns a [`FilterAction::Reject`] carrying an HTTP 502 error envelope on
     /// citation-annotation failure, JSON size overflow, or serialization
     /// failure, closing the prior fail-open serialization gap.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "terminal output ownership and citation admission share one finalization transaction"
+    )]
     pub(crate) fn finalize_response_body(&mut self, body: &mut Option<Bytes>) -> Result<(), FilterAction> {
         if !self.response_object.is_object() {
             return Ok(());
@@ -1291,6 +1295,24 @@ impl ResponsesState {
             }
             if !self.usage.is_null() {
                 obj.insert("usage".to_owned(), self.usage.clone());
+            }
+        }
+        if let Some(budget) = self.simple_budget.as_mut() {
+            let staging = super::file_search_callout::citations::annotation_staging_bytes(
+                self.response_object
+                    .get("output")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(&[][..], Vec::as_slice),
+                &self.citation_files,
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, "failed to preflight final response citations");
+                finalize_rejection("failed to preflight final response citations")
+            })?;
+            if !budget.reserve_additional_input(staging) {
+                return Err(finalize_rejection(
+                    "retained payload exceeded during citation annotation",
+                ));
             }
         }
         annotate_response(&mut self.response_object, &self.citation_files).map_err(|error| {
@@ -2342,6 +2364,40 @@ mod tests {
         };
         assert_eq!(rejection.status, 502, "annotation failure returns a server error");
         assert!(body.is_none(), "no body is written on a finalize failure");
+    }
+
+    #[test]
+    fn final_citation_staging_obeys_exact_retained_budget_boundary() {
+        use crate::openai::responses::agentic_loop::budget::SimpleBudget;
+
+        let output = vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "source <|file-known|>"}]
+        })];
+        let citation_files = HashMap::from([("file-known".to_owned(), "known.txt".to_owned())]);
+        let staging = crate::openai::responses::file_search_callout::citations::annotation_staging_bytes(
+            &output,
+            &citation_files,
+        )
+        .expect("valid marker has a bounded staging charge");
+        assert!(staging > 0);
+        for (extra, succeeds) in [(0, true), (1, false)] {
+            let mut budget = SimpleBudget::new(1_048_576, 0).expect("test budget admits request");
+            let remaining = budget.remaining_bytes().expect("budget has headroom");
+            assert!(budget.reserve_additional_input(remaining - staging + extra));
+            let mut state = ResponsesState {
+                response_object: json!({"object": "response", "output": []}),
+                accumulated_output: output.clone(),
+                citation_files: citation_files.clone(),
+                simple_budget: Some(budget),
+                ..ResponsesState::default()
+            };
+            let mut body = None;
+            let result = state.finalize_response_body(&mut body);
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(body.is_some(), succeeds);
+        }
     }
 
     #[test]

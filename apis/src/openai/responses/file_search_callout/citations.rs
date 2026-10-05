@@ -3,7 +3,7 @@
 
 //! Final-response citation extraction and OpenAI annotation rewriting.
 
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, mem::size_of};
 
 use serde_json::Value;
 
@@ -53,6 +53,124 @@ struct CitationExtraction {
     cleaned: String,
     /// Original character ranges removed from the text.
     removals: Vec<RemovedRange>,
+}
+
+/// Bound both old and replacement buffers at a vector growth boundary.
+fn vec_growth_peak_bytes<T>(len: usize) -> Option<usize> {
+    if len == 0 {
+        return Some(0);
+    }
+    len.checked_mul(3)?.max(4).checked_mul(size_of::<T>())
+}
+
+/// Preflight all citation rewrite allocations while output is still borrowed.
+/// The returned charge covers the replacement text, generated JSON values,
+/// annotation vectors, and offset ranges while the original output is live.
+#[expect(
+    clippy::too_many_lines,
+    reason = "allocation-free mirror of the bounded citation scanner"
+)]
+pub(crate) fn annotation_staging_bytes(
+    output: &[Value],
+    citation_files: &HashMap<String, String>,
+) -> Result<usize, CitationRewriteError> {
+    if citation_files.is_empty() {
+        return Ok(0);
+    }
+    let overflow = || CitationRewriteError {
+        budget: "payload byte",
+        limit: usize::MAX,
+    };
+    let mut markers_remaining = MAX_CITATION_MARKERS;
+    let mut annotations_remaining = MAX_CITATION_ANNOTATIONS;
+    let mut staging = 0_usize;
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("message")
+            || item.get("role").and_then(Value::as_str) != Some("assistant")
+        {
+            continue;
+        }
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in content {
+            let Some(text) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| text.contains("<|file-"))
+            else {
+                continue;
+            };
+            // `extract_citations_bounded` allocates this buffer even when all
+            // marker candidates prove malformed.
+            staging = staging.checked_add(text.len()).ok_or_else(overflow)?;
+            let mut remaining = text;
+            let mut modified = false;
+            let mut removed_count = 0_usize;
+            let mut generated_count = 0_usize;
+            while let Some(marker_start) = remaining.find("<|file-") {
+                markers_remaining = markers_remaining.checked_sub(1).ok_or(CitationRewriteError {
+                    budget: "marker",
+                    limit: MAX_CITATION_MARKERS,
+                })?;
+                let candidate = remaining.get(marker_start..).unwrap_or_default();
+                let Some((file_id, after_marker)) = split_marker(candidate) else {
+                    remaining = candidate.get("<|file-".len()..).unwrap_or_default();
+                    continue;
+                };
+                if !is_valid_file_id(file_id) {
+                    remaining = candidate.get("<|file-".len()..).unwrap_or_default();
+                    continue;
+                }
+                modified = true;
+                removed_count = removed_count.checked_add(1).ok_or_else(overflow)?;
+                if let Some(filename) = citation_files.get(file_id)
+                    && filename.len() <= MAX_FILENAME_BYTES
+                {
+                    generated_count = generated_count.checked_add(1).ok_or_else(overflow)?;
+                    annotations_remaining = annotations_remaining.checked_sub(1).ok_or(CitationRewriteError {
+                        budget: "annotation",
+                        limit: MAX_CITATION_ANNOTATIONS,
+                    })?;
+                    // A serde_json map, keys, strings, and vector slot are all
+                    // retained for the generated annotation.
+                    let annotation_bytes = file_id
+                        .len()
+                        .checked_add(filename.len())
+                        .and_then(|bytes| bytes.checked_add(512))
+                        .ok_or_else(overflow)?;
+                    staging = staging.checked_add(annotation_bytes).ok_or_else(overflow)?;
+                }
+                remaining = after_marker;
+            }
+            if modified {
+                let existing = part.get("annotations").and_then(Value::as_array).map_or(0, Vec::len);
+                annotations_remaining = annotations_remaining
+                    .checked_sub(existing)
+                    .ok_or(CitationRewriteError {
+                        budget: "annotation",
+                        limit: MAX_CITATION_ANNOTATIONS,
+                    })?;
+                let merge_count = existing.checked_add(generated_count).ok_or_else(overflow)?;
+                let scratch = (if existing > 0 {
+                    vec_growth_peak_bytes::<RemovedRange>(removed_count)
+                } else {
+                    Some(0)
+                })
+                .and_then(|bytes| bytes.checked_add(vec_growth_peak_bytes::<Value>(generated_count)?))
+                .and_then(|bytes| {
+                    if generated_count == 0 {
+                        Some(bytes)
+                    } else {
+                        bytes.checked_add(vec_growth_peak_bytes::<Value>(merge_count)?)
+                    }
+                })
+                .ok_or_else(overflow)?;
+                staging = staging.checked_add(scratch).ok_or_else(overflow)?;
+            }
+        }
+    }
+    Ok(staging)
 }
 
 /// Response-wide allocation and work budget for citation rewriting.
