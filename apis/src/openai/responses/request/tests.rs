@@ -98,7 +98,7 @@ async fn budgeted_create_preserves_provider_owned_parameters() {
 }
 
 #[tokio::test]
-async fn budgeted_fused_request_rejects_compaction_in_body_phase() {
+async fn budgeted_fused_request_leaves_compaction_body_to_handler() {
     let filter = default_filter();
     let req = make_request(http::Method::POST, "/v1/responses/compact");
     let mut ctx = make_filter_context(&req);
@@ -107,7 +107,14 @@ async fn budgeted_fused_request_rejects_compaction_in_body_phase() {
     let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+    assert!(
+        matches!(action, FilterAction::Release),
+        "fused classifier must leave compact parsing to its budgeted owner"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "fused classifier must not retain a second compact input tree"
+    );
 }
 
 #[tokio::test]

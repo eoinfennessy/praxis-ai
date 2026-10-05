@@ -115,6 +115,29 @@ async fn skips_cancel_request_without_parsing_empty_body() {
     );
 }
 
+#[tokio::test]
+async fn budgeted_explicit_compact_leaves_store_read_to_compact_filter() {
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","previous_response_id":"resp_stored"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "compact must own the bounded Store read"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "rehydrate must not create another compact history owner"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Passthrough
 // -----------------------------------------------------------------------------

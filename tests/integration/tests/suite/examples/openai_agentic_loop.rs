@@ -170,6 +170,92 @@ fn retained_budget_restores_previous_plain_response() {
 }
 
 #[test]
+fn retained_budget_explicit_compact_persists_and_restores_summary() {
+    let first = r#"{"id":"resp_before_compact","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_before_compact","role":"assistant","content":[{"type":"output_text","text":"Original answer"}]}]}"#;
+    let summary = r#"{"id":"chatcmpl-summary","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Summary marker"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":23}}"#;
+    let follow_up = r#"{"id":"resp_after_compact","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![
+        (200, first.to_owned()),
+        (200, summary.to_owned()),
+        (200, follow_up.to_owned()),
+    ])
+    .start_with_shutdown();
+    let db = TempSqlite::new("budgeted_explicit_compact");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&created), 200, "store first turn: {created}");
+    let compacted = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_before_compact","input":"More context"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&compacted), 200, "budgeted compact: {compacted}");
+    let compacted_body: serde_json::Value = serde_json::from_str(&parse_body(&compacted)).unwrap();
+    assert_eq!(
+        compacted_body["object"], "response.compaction",
+        "explicit response shape"
+    );
+    let compact_id = compacted_body["id"].as_str().expect("compaction response id");
+    let (status, stored) = http_get(proxy.addr(), &format!("/v1/responses/{compact_id}"), None);
+    assert_eq!(status, 200, "compaction must persist: {stored}");
+
+    let next =
+        serde_json::json!({"model":"gpt-4.1","input":"Next turn","previous_response_id":compact_id,"store":false});
+    let next_raw = http_send(proxy.addr(), &json_post("/v1/responses", &next.to_string()));
+    assert_eq!(parse_status(&next_raw), 200, "restore compacted history: {next_raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3, "create, compact callout, and follow-up inference");
+    let outbound: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    assert!(
+        outbound["input"].to_string().contains("Summary marker"),
+        "follow-up must replay the compacted summary: {outbound}"
+    );
+}
+
+#[test]
+fn retained_budget_explicit_compact_rejects_oversized_stored_history_before_callout() {
+    let first = r#"{"id":"resp_large_for_compact","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_large","role":"assistant","content":[{"type":"output_text","text":"Original answer"}]}]}"#;
+    let db = TempSqlite::new("budgeted_explicit_compact_overflow");
+    let model = StatefulCapturingBackend::new(vec![(200, first.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+    let created = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"First turn"}"#),
+    );
+    assert_eq!(parse_status(&created), 200, "store first turn: {created}");
+    drop(proxy);
+    drop(model);
+
+    let callout = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_budget_and_store(free_port(), callout.port(), 8_192, db.url());
+    let proxy = start_proxy(&config);
+    let compacted = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses/compact",
+            r#"{"model":"gpt-4.1","previous_response_id":"resp_large_for_compact"}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&compacted),
+        413,
+        "stored history must exceed the small budget: {compacted}"
+    );
+    assert!(
+        callout.requests().is_empty(),
+        "Store overflow must stop before summarization"
+    );
+}
+
+#[test]
 fn retained_budget_appends_plain_conversation_and_restores_next_turn() {
     let first = r#"{"id":"resp_conv_first","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_first","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}]}"#;
     let second = r#"{"id":"resp_conv_second","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_second","role":"assistant","content":[{"type":"output_text","text":"Second answer"}]}]}"#;

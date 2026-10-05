@@ -371,6 +371,19 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
+        // The compact filter returns locally before IRR. Reaching the loop on
+        // this path means no compact owner accounted for its Store/callout work.
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+            && ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(FilterAction::Reject(responses_error_rejection(
+                400,
+                "invalid_request_error",
+                "compaction requires openai_responses_compact before openai_agentic_loop",
+            )));
+        }
+
         if is_responses_create(&ctx.request.method, ctx.request.uri.path())
             && ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
             && ctx

@@ -77,6 +77,20 @@ async fn budgeted_loop_leaves_non_create_requests_alone() {
     assert!(matches!(action, FilterAction::Continue));
 }
 
+#[tokio::test]
+async fn budgeted_loop_rejects_compact_without_earlier_handler() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses/compact");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions
+        .insert(super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(rejection) if rejection.status == 400),
+        "a missing compact handler must reject before IRR dispatch"
+    );
+}
+
 #[test]
 fn budgeted_buffered_output_rejects_before_json_parse() {
     let filter = make_filter();

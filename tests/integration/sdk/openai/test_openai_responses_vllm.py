@@ -1337,6 +1337,7 @@ def _write_agentic_config(
     translate_to_chat: bool = False,
     backend_endpoint: str | None = None,
     real_web_search: bool = False,
+    compaction_port: int | None = None,
 ) -> str:
     """Patch agentic-loop.yaml for mocked or credentialed agentic tests."""
     config = _load_example_config(AGENTIC_CONFIG_PATH, praxis_port)
@@ -1344,6 +1345,11 @@ def _write_agentic_config(
     if vllm is None:
         raise ValueError("translated agentic config requires a backend endpoint")
     config = config.replace('- "127.0.0.1:3001"', f'- "{vllm}"')
+    if compaction_port is not None:
+        config = config.replace(
+            'inference_url: "http://127.0.0.1:3001/v1/chat/completions"',
+            f'inference_url: "http://127.0.0.1:{compaction_port}/v1/chat/completions"',
+        )
     if config.count("read_timeout_ms:") != 1:
         raise RuntimeError(
             "agentic-loop.yaml must declare exactly one cluster read_timeout_ms; "
@@ -4679,12 +4685,14 @@ def search_server():
 
 
 @pytest.fixture(scope="session")
-def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
+def agentic_proxy(tmp_path_factory, request, mcp_server, search_server, compaction_server):
     """Start a Praxis proxy with the native Responses agentic loop."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("agentic-responses")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_agentic_config(port, db_path, mcp_server, search_server)
+    config_path = _write_agentic_config(
+        port, db_path, mcp_server, search_server, compaction_port=compaction_server
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -5408,6 +5416,17 @@ class TestAgenticLoopVLLM:
             assert len(items.data) >= 4, "both input and output turns must be appended"
         finally:
             agentic_client.conversations.delete(conversation.id)
+
+    def test_retained_budget_explicit_compact(self, agentic_client):
+        """The SDK can compact inline input and retrieve the bounded result."""
+        compacted = agentic_client.responses.compact(
+            model=VLLM_MODEL,
+            input="Summarize this short exchange.",
+        )
+        assert compacted.object == "response.compaction", compacted
+        assert compacted.output, compacted
+        retrieved = agentic_client.responses.retrieve(compacted.id)
+        assert retrieved.id == compacted.id
 
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,

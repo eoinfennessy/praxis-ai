@@ -140,6 +140,14 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         if let Some(action) = super::initial_agentic_budget_rejection(ctx, raw) {
             return Ok(action);
         }
+        // Explicit compact parses under its own ledger. Keeping this
+        // validator's request-body state would add uncharged input copies.
+        if ctx.extensions.get::<super::AgenticBudgetPolicy>().is_some()
+            && ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(FilterAction::Release);
+        }
 
         let parsed = match parse_request_body(body) {
             Ok(v) => v,
@@ -753,6 +761,24 @@ mod tests {
         assert!(
             matches!(action, FilterAction::Release),
             "request without classifier metadata should be released without validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn budgeted_compact_does_not_retain_validator_input_state() {
+        let filter = make_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.extensions
+            .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello"}"#));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Release), "compact owns its body parser");
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "validator must not retain an extra compact input tree"
         );
     }
 

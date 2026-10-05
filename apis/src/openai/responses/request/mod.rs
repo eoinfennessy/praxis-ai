@@ -136,8 +136,16 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if let Some(action) = super::budgeted_compaction_rejection(ctx) {
-            return Ok(action);
+        // Compact owns its parse and retained-payload ledger. The fused
+        // classifier must not retain a second unmetered request state.
+        if ctx.extensions.get::<super::AgenticBudgetPolicy>().is_some()
+            && ctx.request.method == http::Method::POST
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(
+                super::initial_agentic_budget_rejection(ctx, body.as_deref().unwrap_or_default())
+                    .unwrap_or(FilterAction::Release),
+            );
         }
 
         let Some(matched) = matched_body_bearing_operation(ctx) else {

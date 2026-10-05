@@ -53,6 +53,8 @@ pub(crate) struct SimpleBudget {
     store_output_charge: usize,
     /// Whether Store persists this create response and owns another output projection.
     store_response: bool,
+    /// Whether this response enters IRR's separately buffered transport.
+    irr_response: bool,
 }
 
 impl SimpleBudget {
@@ -69,12 +71,24 @@ impl SimpleBudget {
 
     /// Admit a create that will retain Store input and response projections.
     pub(crate) fn new_with_store(limit: usize, input_charge: usize, store_response: bool) -> Option<Self> {
+        Self::with_transport(limit, input_charge, store_response, true)
+    }
+
+    /// Admit a locally returned response that never enters IRR's buffer.
+    #[cfg(feature = "openai-compact")]
+    pub(crate) fn new_for_local_response(limit: usize, input_charge: usize) -> Option<Self> {
+        Self::with_transport(limit, input_charge, false, false)
+    }
+
+    /// Initialize the same ledger for routed and locally returned responses.
+    fn with_transport(limit: usize, input_charge: usize, store_response: bool, irr_response: bool) -> Option<Self> {
         let store_input_charge = if store_response { input_charge } else { 0 };
         // Core's response Vec may keep spare capacity alongside the live raw
-        // body. Reserve three times its validated `limit / 8` transport cap.
+        // body. Reserve three times its validated `limit / 8` transport cap
+        // only when this request actually enters the router.
         if input_charge
             .checked_add(store_input_charge)?
-            .checked_add(response_reserve(limit)?)?
+            .checked_add(if irr_response { response_reserve(limit)? } else { 0 })?
             > limit
         {
             return None;
@@ -89,6 +103,7 @@ impl SimpleBudget {
             stream_frame_node_charge: 0,
             store_output_charge: 0,
             store_response,
+            irr_response,
         })
     }
 
@@ -135,7 +150,7 @@ impl SimpleBudget {
             .and_then(|charge| charge.checked_add(self.input_charge))
             .and_then(|charge| charge.checked_add(self.additional_input_charge))
             .and_then(|charge| charge.checked_add(self.store_input_charge))
-            .and_then(|charge| charge.checked_add(response_reserve(self.limit)?))
+            .and_then(|charge| charge.checked_add(self.transport_reserve()?))
         else {
             return false;
         };
@@ -258,7 +273,7 @@ impl SimpleBudget {
         true
     }
 
-    /// Return the current charge including the IRR transport reserve.
+    /// Return the current charge including any IRR transport reserve.
     fn charge(self) -> Option<usize> {
         self.output_charge
             .checked_add(self.stream_wire_charge)?
@@ -267,7 +282,16 @@ impl SimpleBudget {
             .checked_add(self.input_charge)?
             .checked_add(self.additional_input_charge)?
             .checked_add(self.store_input_charge)?
-            .checked_add(response_reserve(self.limit)?)
+            .checked_add(self.transport_reserve()?)
+    }
+
+    /// Core holds an IRR response buffer only for routed requests.
+    fn transport_reserve(self) -> Option<usize> {
+        if self.irr_response {
+            response_reserve(self.limit)
+        } else {
+            Some(0)
+        }
     }
 }
 
@@ -362,6 +386,28 @@ mod tests {
         let before = budget.remaining_bytes().unwrap();
         assert!(budget.reserve_additional_input(128_000));
         assert_eq!(budget.remaining_bytes(), Some(before - 128_000));
+    }
+
+    #[test]
+    #[cfg(feature = "openai-compact")]
+    fn local_response_omits_only_irr_transport_reserve() {
+        let limit = 4_096;
+        let input = 100;
+        let mut routed = SimpleBudget::new_with_store(limit, input, false).unwrap();
+        let mut local = SimpleBudget::new_for_local_response(limit, input).unwrap();
+        assert_eq!(
+            local.remaining_bytes().unwrap() - routed.remaining_bytes().unwrap(),
+            response_reserve(limit).unwrap(),
+            "local responses do not use IRR's buffered response"
+        );
+        assert!(
+            local.reserve_additional_input(3_000),
+            "local owner must use freed headroom"
+        );
+        assert!(
+            !routed.reserve_additional_input(3_000),
+            "routed responses must retain their transport reserve"
+        );
     }
 
     #[test]

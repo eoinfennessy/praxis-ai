@@ -784,19 +784,19 @@ fn make_filter(on_failure: &str) -> CompactFilter {
 }
 
 #[tokio::test]
-async fn budgeted_compaction_filter_rejects_before_callout() {
+async fn budgeted_compaction_filter_rejects_oversized_body_before_store_or_callout() {
     let filter = make_filter("closed");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions
-        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
-    let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
+        .insert(AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 4096").unwrap()).unwrap());
+    let mut body = Some(Bytes::from(json!({"model":"test","input":"x".repeat(200)}).to_string()));
     let original = body.clone();
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     match action {
         FilterAction::Reject(rejection) => {
-            assert_eq!(rejection.status, 400, "budgeted compaction must reject before callout");
+            assert_eq!(rejection.status, 413, "budgeted compaction must reject before callout");
             let text = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
             assert!(text.contains("max_retained_bytes"), "{text}");
         },
@@ -1060,19 +1060,22 @@ async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
         .unwrap();
     let registry = ResponseStoreRegistry::new();
     registry.register(&std::sync::Arc::from("default"), backend).unwrap();
-    let request = parse_compact_request_body(&Some(Bytes::from_static(
+    let mut request = parse_compact_request_body(&Some(Bytes::from_static(
         br#"{"model":"gpt-4.1","previous_response_id":"resp_private"}"#,
     )))
     .unwrap();
 
     let wrong_store = registry.get_scoped("default", &other).unwrap();
-    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_store, &request).await else {
+    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_store, &mut request, &mut None).await
+    else {
         panic!("wrong-owner compaction must fail before its callout");
     };
     assert_eq!(rejection.status, 404);
 
     let owner_store = registry.get_scoped("default", &owner).unwrap();
-    let messages = collect_compact_messages(&owner_store, &request).await.unwrap();
+    let messages = collect_compact_messages(&owner_store, &mut request, &mut None)
+        .await
+        .unwrap();
     assert_eq!(messages, vec![json!({"role": "user", "content": "private"})]);
 }
 

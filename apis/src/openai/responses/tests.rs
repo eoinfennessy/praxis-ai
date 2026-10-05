@@ -77,7 +77,7 @@ fn budgeted_message_arrays_admit_text_and_file_parts() {
 
 #[tokio::test]
 #[cfg(feature = "openai-responses")]
-async fn budgeted_legacy_classifier_rejects_compaction_in_body_phase() {
+async fn budgeted_legacy_classifier_preflights_compaction_and_releases_to_handler() {
     let filter = ResponsesFormatFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -86,7 +86,10 @@ async fn budgeted_legacy_classifier_rejects_compaction_in_body_phase() {
     let mut body = Some(Bytes::from_static(br#"{"model":"test","input":"hello"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
+    assert!(
+        matches!(action, FilterAction::Release),
+        "bounded compact input should continue to the compact handler"
+    );
 }
 
 // -----------------------------------------------------------------------------

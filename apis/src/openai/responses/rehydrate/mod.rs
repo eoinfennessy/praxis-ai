@@ -259,6 +259,14 @@ impl HttpFilter for RehydrateFilter {
             return Ok(FilterAction::Continue);
         }
 
+        // Explicit compact owns its own bounded Store read and accounting.
+        // Rehydrating here would decode the same record without that bound.
+        if ctx.extensions.get::<AgenticBudgetPolicy>().is_some()
+            && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+        {
+            return Ok(FilterAction::Release);
+        }
+
         if is_responses_cancel_path(ctx.request.uri.path()) {
             return Ok(FilterAction::Release);
         }
