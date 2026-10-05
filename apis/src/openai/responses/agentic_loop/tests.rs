@@ -8,7 +8,7 @@ use http::Method;
 use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode, TrustedHeaderMutation};
 use serde_json::{Value, json};
 
-use super::{super::state::ResponsesState, budget::SimpleBudget};
+use super::{super::state::ResponsesState, budget::SimpleBudget, collect_output_items};
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
@@ -1812,6 +1812,33 @@ fn filter_results_schema_for_irr_consumers() {
 // -----------------------------------------------------------------------------
 // on_response_body: Body Extraction (non-streaming)
 // -----------------------------------------------------------------------------
+
+#[test]
+fn buffered_output_moves_into_canonical_owner_without_copying_payload() {
+    let mut response = json!({
+        "id": "resp_1",
+        "output": [{
+            "type": "message",
+            "id": "msg_1",
+            "content": [{"type": "output_text", "text": "large answer".repeat(1024)}]
+        }]
+    });
+    let text_before = response["output"][0]["content"][0]["text"].as_str().unwrap().as_ptr();
+    let mut state = ResponsesState::default();
+
+    collect_output_items(&mut response, &mut state, &[]);
+
+    assert_eq!(response["output"], json!([]));
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(
+        state.accumulated_output[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .as_ptr(),
+        text_before,
+        "the parsed payload allocation should move into accumulated output"
+    );
+}
 
 #[test]
 fn extracts_tool_calls_from_non_streaming_body() {

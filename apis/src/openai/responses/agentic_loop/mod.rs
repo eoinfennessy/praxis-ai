@@ -1013,7 +1013,7 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> boo
     // so the public response never ships an item without an id (issue #955). Runs
     // after normalization so translated file-search calls are seen as such.
     ensure_public_output_item_ids_in_response(&mut response);
-    collect_output_items(&response, state, &private_indices);
+    collect_output_items(&mut response, state, &private_indices);
     if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
         merge_usage(&mut state.usage, usage);
     }
@@ -1114,17 +1114,17 @@ fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
     clippy::too_many_lines,
     reason = "linear per-item classification of one response's output"
 )]
-fn collect_output_items(response: &Value, state: &mut ResponsesState, private_indices: &[usize]) {
-    let Some(Value::Array(output)) = response.get("output") else {
+fn collect_output_items(response: &mut Value, state: &mut ResponsesState, private_indices: &[usize]) {
+    let Some(Value::Array(output)) = response.get_mut("output") else {
         return;
     };
+    let output = std::mem::take(output);
     state.current_round_output_start = Some(state.accumulated_output.len());
     let mut pending_file_search: Vec<(usize, SynthesisKind)> = Vec::new();
-    for (round_index, item) in output.iter().enumerate() {
+    for (round_index, item) in output.into_iter().enumerate() {
         let absolute_index = state.accumulated_output.len();
-        state.accumulated_output.push(item.clone());
         match item.get("type").and_then(Value::as_str) {
-            Some("function_call") if is_dispatchable_function_call(item) => {
+            Some("function_call") if is_dispatchable_function_call(&item) => {
                 state.tool_calls.push(item.clone());
                 state.messages.push(item.clone());
                 state.persisted_messages.push(item.clone());
@@ -1143,7 +1143,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 state
                     .provider_compaction_ids
                     .extend(ResponsesState::provider_compaction_ids_from_messages(
-                        std::slice::from_ref(item),
+                        std::slice::from_ref(&item),
                     ));
             },
             Some("web_search_call") => {
@@ -1155,14 +1155,14 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 state.web_search_calls.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
-            Some("tool_search_call") if is_hosted_completed_tool_search(item) => {
+            Some("tool_search_call") if is_hosted_completed_tool_search(&item) => {
                 // Only a completed hosted search may trigger deferred
                 // `tools/list`. Client-executed searches return to the caller
                 // without listing or another inference round.
                 state.tool_search_calls.push(item.clone());
                 state.persisted_messages.push(item.clone());
             },
-            Some("tool_search_call") if is_completed_output_item(item) => {
+            Some("tool_search_call") if is_completed_output_item(&item) => {
                 state.persisted_messages.push(item.clone());
             },
             Some("file_search_call") => {
@@ -1173,7 +1173,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
                 state.persisted_messages.push(item.clone());
-                if is_pending_file_search_call(item) {
+                if is_pending_file_search_call(&item) {
                     let synthesis = if private_indices.binary_search(&round_index).is_ok() {
                         SynthesisKind::Private
                     } else {
@@ -1184,6 +1184,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
             },
             _ => {},
         }
+        state.accumulated_output.push(item);
     }
     record_file_search_assignments(state, pending_file_search);
     mark_provider_history(state);
