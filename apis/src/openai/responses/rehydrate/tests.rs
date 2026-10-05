@@ -309,7 +309,7 @@ async fn budgeted_restore_rejects_sparse_json_before_store_decode() {
 }
 
 #[tokio::test]
-async fn budgeted_restore_rejects_file_history_before_expansion() {
+async fn budgeted_restore_admits_file_history_for_metered_expansion() {
     let store = MockStore::with_completed_response(
         "resp_prev",
         json!("First turn"),
@@ -324,12 +324,49 @@ async fn budgeted_restore_rejects_file_history_before_expansion() {
     arm_retained_budget(&mut ctx, request_body, 8_388_608);
     let mut body = Some(Bytes::from(request_body));
 
+    let before = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .simple_budget
+        .unwrap()
+        .remaining_bytes()
+        .unwrap();
     let action = default_filter()
         .on_request_body(&mut ctx, &mut body, true)
         .await
         .unwrap();
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 400));
-    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().history_rehydrated);
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.history_rehydrated);
+    assert_eq!(state.messages[0]["content"][0]["file_id"], "file_prev");
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
+}
+
+#[tokio::test]
+async fn budgeted_conversation_restores_file_history_for_metered_expansion() {
+    let store = MockStore::with_conversation(
+        "conv_prev",
+        json!([{"role":"user","content":[{"type":"input_file","file_data":"YQ=="}]}]),
+    );
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"conversation":"conv_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let before = arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.history_rehydrated);
+    assert_eq!(state.messages[0]["content"][0]["file_data"], "YQ==");
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
 }
 
 #[tokio::test]

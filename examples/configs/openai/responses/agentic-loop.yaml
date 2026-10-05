@@ -13,10 +13,12 @@
 # Client-side function calls resolve to no dispatcher and are returned to the
 # client without looping.
 #
-# The retained-payload guardrail accepts buffered text creates with or without
-# Store persistence, finite Responses-to-Chat translation, bounded
-# previous_response_id restore, and plain conversation append-back.
-# Tools, streaming, compaction, and request-expanding filters fail closed until their accounting lands
+# The retained-payload guardrail accepts buffered text, file, and image inputs
+# with or without Store persistence, finite Responses-to-Chat translation,
+# bounded previous_response_id or conversation restore, and conversation
+# append-back. File resolution and document extraction reserve their expanded
+# content when those filters are configured in the request path.
+# Tools, streaming, and compaction fail closed until their accounting lands
 # in this draft PR. The tool examples below document the intended pipeline but
 # currently return a Responses-formatted 400 before inference or dispatch.
 #

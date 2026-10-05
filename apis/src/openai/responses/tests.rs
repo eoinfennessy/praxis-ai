@@ -19,7 +19,7 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
         "metadata": {"caller": "test"},
         "temperature": "provider validates this"
     });
-    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+    assert!(budgeted_request_supported(request.as_object().unwrap()));
 
     for key in [
         "tools",
@@ -31,52 +31,47 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     ] {
         request[key] = serde_json::Value::Null;
         assert!(
-            !plain_agentic_request_supported(request.as_object().unwrap()),
+            !budgeted_request_supported(request.as_object().unwrap()),
             "{key} still has an unmetered owner"
         );
         request.as_object_mut().unwrap().remove(key);
     }
 
     request["conversation"] = serde_json::Value::String("conv_123".to_owned());
-    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+    assert!(budgeted_request_supported(request.as_object().unwrap()));
 
     request["stream"] = serde_json::Value::Bool(true);
-    assert!(!plain_agentic_request_supported(request.as_object().unwrap()));
+    assert!(!budgeted_request_supported(request.as_object().unwrap()));
     request["stream"] = serde_json::Value::Bool(false);
-    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+    assert!(budgeted_request_supported(request.as_object().unwrap()));
     request.as_object_mut().unwrap().remove("store");
-    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+    assert!(budgeted_request_supported(request.as_object().unwrap()));
     request["previous_response_id"] = serde_json::Value::String("resp_prev".to_owned());
-    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
+    assert!(budgeted_request_supported(request.as_object().unwrap()));
     request.as_object_mut().unwrap().remove("previous_response_id");
 }
 
 #[test]
 #[cfg(feature = "openai-responses")]
-fn budgeted_text_message_arrays_exclude_expanding_parts() {
+fn budgeted_message_arrays_admit_text_and_file_parts() {
     for input in [
         serde_json::json!([]),
         serde_json::json!([{"role":"user","content":"Hello"}]),
         serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_file","file_data":"YQ=="}]}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_file","file_id":"file_1"}]}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,YQ=="}]}]),
     ] {
         let request = serde_json::json!({"input": input, "store": false});
-        assert!(
-            plain_agentic_request_supported(request.as_object().unwrap()),
-            "{request}"
-        );
+        assert!(budgeted_request_supported(request.as_object().unwrap()), "{request}");
     }
 
     for input in [
-        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_file","file_data":"YQ=="}]}]),
-        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,YQ=="}]}]),
         serde_json::json!([{"type":"function_call_output","output":"Hello"}]),
         serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":null}]}]),
     ] {
         let request = serde_json::json!({"input": input, "store": false});
-        assert!(
-            !plain_agentic_request_supported(request.as_object().unwrap()),
-            "{request}"
-        );
+        assert!(!budgeted_request_supported(request.as_object().unwrap()), "{request}");
     }
 }
 

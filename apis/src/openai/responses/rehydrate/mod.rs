@@ -159,9 +159,6 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        if budgeted_create(ctx) && response_history_needs_file_expansion(&record) {
-            return Ok(reject_budgeted_file_history());
-        }
         if let Err(action) = reserve_restored_response(ctx, &record) {
             return Ok(action);
         }
@@ -198,9 +195,6 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
-        if budgeted_create(ctx) && history_needs_file_expansion(&record.messages) {
-            return Ok(reject_budgeted_file_history());
-        }
         if let Err(action) = reserve_restored_conversation(ctx, &record) {
             return Ok(action);
         }
@@ -1266,43 +1260,6 @@ fn reject_restored_payload_too_large() -> FilterAction {
         413,
         "invalid_request_error",
         "stored history exceeds openai_agentic_loop.max_retained_bytes",
-    ))
-}
-
-/// File resolution and document extraction can expand stored history after
-/// rehydration. Their request-wide charges land in their respective slices.
-fn response_history_needs_file_expansion(record: &ResponseRecord) -> bool {
-    if record.messages.as_array().is_some_and(|messages| !messages.is_empty()) {
-        history_needs_file_expansion(&record.messages)
-    } else {
-        history_needs_file_expansion(&record.input)
-            || record
-                .response_object
-                .get("output")
-                .is_some_and(history_needs_file_expansion)
-    }
-}
-
-/// Find stored content that downstream file filters can expand.
-fn history_needs_file_expansion(value: &Value) -> bool {
-    match value {
-        Value::Array(items) => items.iter().any(history_needs_file_expansion),
-        Value::Object(fields) => {
-            matches!(fields.get("type").and_then(Value::as_str), Some("input_file"))
-                || (fields.get("type").and_then(Value::as_str) == Some("input_image")
-                    && (fields.contains_key("file_id") || fields.contains_key("file_url")))
-                || fields.values().any(history_needs_file_expansion)
-        },
-        _ => false,
-    }
-}
-
-/// Keep unmetered file resolution out of this restore slice.
-fn reject_budgeted_file_history() -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(
-        400,
-        "invalid_request_error",
-        "stored file history is not yet supported with openai_agentic_loop.max_retained_bytes",
     ))
 }
 

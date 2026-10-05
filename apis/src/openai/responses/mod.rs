@@ -111,8 +111,8 @@ pub(crate) fn budgeted_compaction_rejection(ctx: &HttpFilterContext<'_>) -> Opti
         })
 }
 
-/// Admit only the buffered plain-text path whose retained owners this first
-/// guardrail covers. Other features acquire their own accounting in later PRs.
+/// Admit buffered input whose independently owned copies and expansions have
+/// request-wide accounting. Remaining features stay gated in this draft.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn plain_agentic_budget(
     ctx: &HttpFilterContext<'_>,
@@ -129,11 +129,11 @@ pub(crate) fn plain_agentic_budget(
             "a budgeted Responses request must be a JSON object",
         )));
     };
-    if !plain_agentic_request_supported(object) {
+    if !budgeted_request_supported(object) {
         return Err(FilterAction::Reject(error::responses_error_rejection(
             400,
             "invalid_request_error",
-            "openai_agentic_loop.max_retained_bytes currently supports buffered text, bounded previous_response_id restore, and plain conversation append-back; other paths are pending",
+            "this Responses request path is not yet supported with openai_agentic_loop.max_retained_bytes",
         )));
     }
     let charge = agentic_loop::budget::input_charge(bytes).unwrap_or(usize::MAX);
@@ -148,10 +148,10 @@ pub(crate) fn plain_agentic_budget(
     })
 }
 
-/// Keep owners with unbounded expansions out of the first budget slice.
+/// Keep owners with unmetered expansions out of the current budget slice.
 #[cfg(feature = "openai-responses")]
-fn plain_agentic_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
-    text_only_input(object.get("input"))
+fn budgeted_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    budgeted_input_supported(object.get("input"))
         && object.get("stream") != Some(&serde_json::Value::Bool(true))
         && !object.keys().any(|key| {
             matches!(
@@ -161,10 +161,44 @@ fn plain_agentic_request_supported(object: &serde_json::Map<String, serde_json::
         })
 }
 
+/// File and image parts can pass the ingress charge. File resolution and
+/// document extraction reserve their additional owners before expansion.
+#[cfg(feature = "openai-responses")]
+fn budgeted_input_supported(input: Option<&serde_json::Value>) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+    match input {
+        serde_json::Value::String(_) => true,
+        serde_json::Value::Array(items) => items.iter().all(|item| {
+            let Some(message) = item.as_object() else {
+                return false;
+            };
+            if message.get("type").is_some_and(|kind| kind != "message") {
+                return false;
+            }
+            match message.get("content") {
+                Some(serde_json::Value::String(_)) => true,
+                Some(serde_json::Value::Array(parts)) => {
+                    parts
+                        .iter()
+                        .all(|part| match part.get("type").and_then(serde_json::Value::as_str) {
+                            Some("input_text") => part.get("text").is_some_and(serde_json::Value::is_string),
+                            Some("input_file" | "input_image") => true,
+                            _ => false,
+                        })
+                },
+                _ => false,
+            }
+        }),
+        _ => false,
+    }
+}
+
 /// Admit the common message-array form only when every content part is plain
 /// text. File, image, audio, and video parts retain owners that need their own
 /// admission before this guard can accept them.
-#[cfg(feature = "openai-responses")]
+#[cfg(feature = "openai-file-resolve-filter")]
 fn text_only_input(input: Option<&serde_json::Value>) -> bool {
     let Some(input) = input else {
         return false;

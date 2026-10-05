@@ -100,11 +100,13 @@ pub(super) struct AgenticLoopConfig {
     /// Conservative request-wide retained-payload ceiling. Valid from 4 `KiB`
     /// through 256 `MiB`, defaults to a non-disableable 64 `MiB`, and uses the
     /// smallest limit when several loop instances are reachable. The first
-    /// guardrail slice admits buffered text Responses creates with or without
-    /// Store persistence, finite Responses-to-Chat translation, bounded
-    /// `previous_response_id` restore, and plain conversation append-back.
-    /// Tools, streaming, compaction, and request-expanding filters reject
-    /// before inference until their owners have accounting.
+    /// guardrail slice admits buffered Responses creates with text, file, or
+    /// image input, with or without Store persistence, finite Responses-to-Chat
+    /// translation, bounded `previous_response_id` and conversation restore,
+    /// and transactional conversation append-back. File resolution and
+    /// document extraction reserve their additional owners before expansion.
+    /// Tools, streaming, and compaction reject before inference until their
+    /// remaining owners have accounting.
     /// Initial payloads are conservatively charged at 32 times raw bytes plus
     /// a per-node reserve; cumulative buffered provider output is charged at
     /// 64 times its wire bytes plus a larger per-node reserve. Store
