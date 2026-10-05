@@ -198,6 +198,12 @@ impl RehydrateFilter {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
+        if budgeted_create(ctx) && history_needs_file_expansion(&record.messages) {
+            return Ok(reject_budgeted_file_history());
+        }
+        if let Err(action) = reserve_restored_conversation(ctx, &record) {
+            return Ok(action);
+        }
         let stored = stored_messages_for_conversation(record);
         let state = build_state(parsed_body, stored, vec![], None);
         install_rehydrated_state(ctx, state);
@@ -1214,6 +1220,19 @@ fn reserve_restored_response(ctx: &mut HttpFilterContext<'_>, record: &ResponseR
     reserve_restored_bytes(ctx, bytes)
 }
 
+/// Reserve the conversation row before replay and append-back can copy it.
+fn reserve_restored_conversation(
+    ctx: &mut HttpFilterContext<'_>,
+    record: &ConversationRecord,
+) -> Result<(), FilterAction> {
+    if !budgeted_create(ctx) {
+        return Ok(());
+    }
+    let bytes = count_record_values(&[&record.metadata, &record.messages])
+        .and_then(|bytes| bytes.checked_add(record.conversation_id.len()));
+    reserve_restored_bytes(ctx, bytes)
+}
+
 /// `serde_json::to_writer` visits the decoded tree without allocating another
 /// payload. Its encoded length is a conservative size basis for every copy.
 fn count_record_values(values: &[&Value]) -> Option<usize> {
@@ -1337,7 +1356,15 @@ async fn fetch_conversation(
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_conversation(conv_id).await.map_err(|e| {
+    let read_limit = restore_read_limit(ctx)?;
+    let result = match read_limit {
+        Some(limit) => store.get_conversation_bounded(conv_id, limit).await,
+        None => store.get_conversation(conv_id).await,
+    };
+    let record = result.map_err(|e| {
+        if matches!(&e, StoreError::PayloadTooLarge) {
+            return reject_restored_payload_too_large();
+        }
         warn!(error = %e, "rehydrate: failed to fetch conversation");
         reject_server_error("failed to fetch conversation")
     })?;

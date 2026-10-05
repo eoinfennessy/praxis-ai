@@ -807,7 +807,7 @@ impl InMemoryStore {
             let raw_allowance = max_rebuild_bytes
                 .checked_sub(count.checked_mul(4).ok_or(StoreError::PayloadTooLarge)?)
                 .and_then(|bytes| bytes.checked_sub(4))
-                .map(|bytes| bytes / 26)
+                .map(|bytes| bytes / 512)
                 .ok_or(StoreError::PayloadTooLarge)?;
             let mut remaining = raw_allowance;
             for item in previous.iter().chain(items) {

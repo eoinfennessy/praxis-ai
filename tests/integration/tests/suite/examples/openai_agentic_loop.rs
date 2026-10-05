@@ -169,6 +169,49 @@ fn retained_budget_restores_previous_plain_response() {
     );
 }
 
+#[test]
+fn retained_budget_appends_plain_conversation_and_restores_next_turn() {
+    let first = r#"{"id":"resp_conv_first","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_first","role":"assistant","content":[{"type":"output_text","text":"First answer"}]}]}"#;
+    let second = r#"{"id":"resp_conv_second","object":"response","created_at":1760000001,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_conv_second","role":"assistant","content":[{"type":"output_text","text":"Second answer"}]}]}"#;
+    let model =
+        StatefulCapturingBackend::new(vec![(200, first.to_owned()), (200, second.to_owned())]).start_with_shutdown();
+    let db = TempSqlite::new("budgeted_conversation_append");
+    let config = load_agentic_config_with_budget_and_store(free_port(), model.port(), 8_388_608, db.url());
+    let proxy = start_proxy(&config);
+
+    let created = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(parse_status(&created), 200, "conversation create: {created}");
+    let created: serde_json::Value = serde_json::from_str(&parse_body(&created)).unwrap();
+    let id = created["id"].as_str().expect("conversation ID");
+    assert!(
+        id.starts_with("conv_"),
+        "local Conversations create must return an ID: {created}"
+    );
+    for input in ["First turn", "Second turn"] {
+        let request = serde_json::json!({"model":"gpt-4.1","input":input,"store":false,"conversation":id});
+        let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+        assert_eq!(parse_status(&raw), 200, "conversation turn: {raw}");
+    }
+
+    let requests = model.requests();
+    let inference: Vec<_> = requests.iter().filter(|request| !request.body.is_empty()).collect();
+    assert_eq!(
+        inference.len(),
+        2,
+        "model requests: {:?}",
+        requests.iter().map(|request| &request.body).collect::<Vec<_>>()
+    );
+    let second_sent: serde_json::Value = serde_json::from_str(&inference[1].body).unwrap();
+    assert!(
+        second_sent["input"].as_array().is_some_and(|items| items.len() >= 3),
+        "second inference must replay appended first turn: {second_sent}"
+    );
+    let (status, items) = http_get(proxy.addr(), &format!("/v1/conversations/{id}/items"), None);
+    assert_eq!(status, 200, "list appended items: {items}");
+    let listed: serde_json::Value = serde_json::from_str(&items).unwrap();
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(4));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_budget_store_overflow_skips_persistence() {
     let response = serde_json::json!({
@@ -269,7 +312,6 @@ fn retained_budget_rejects_tools_and_streaming_before_inference() {
     for request_body in [
         r#"{"model":"gpt-4.1","input":"Hi","store":false,"stream":true}"#,
         r#"{"model":"gpt-4.1","input":"Hi","store":false,"tools":[{"type":"web_search_preview"}]}"#,
-        r#"{"model":"gpt-4.1","input":"Hi","store":false,"conversation":"conv_existing"}"#,
     ] {
         let raw = http_send(proxy.addr(), &json_post("/v1/responses", request_body));
         assert_eq!(parse_status(&raw), 400, "request: {request_body}");

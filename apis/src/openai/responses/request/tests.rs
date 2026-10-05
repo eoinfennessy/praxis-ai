@@ -135,7 +135,6 @@ async fn budgeted_create_rejects_unaccounted_owners() {
     for body in [
         json!({"input":"hello","store":false,"stream":true}),
         json!({"input":"hello","store":false,"tools":[{"type":"web_search_preview"}]}),
-        json!({"input":"hello","store":false,"conversation":"conv_old"}),
         json!({"input":"hello","store":false,"context_management":{"type":"compaction"}}),
     ] {
         let mut ctx = make_filter_context(&request);

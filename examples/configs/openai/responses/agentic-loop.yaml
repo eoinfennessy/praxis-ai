@@ -14,9 +14,9 @@
 # client without looping.
 #
 # The retained-payload guardrail accepts buffered text creates with or without
-# Store persistence, finite Responses-to-Chat translation, and bounded
-# previous_response_id restore. Tools, conversation append-back, streaming,
-# compaction, and request-expanding filters fail closed until their accounting lands
+# Store persistence, finite Responses-to-Chat translation, bounded
+# previous_response_id restore, and plain conversation append-back.
+# Tools, streaming, compaction, and request-expanding filters fail closed until their accounting lands
 # in this draft PR. The tool examples below document the intended pipeline but
 # currently return a Responses-formatted 400 before inference or dispatch.
 #
@@ -164,12 +164,27 @@ listeners:
 filter_chains:
   - name: agentic-pipeline
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      - filter: openai_operation
+
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
+
       - filter: openai_responses_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
+        conditions:
+          - unless:
+              path_prefix: "/v1/conversations"
 
       # If client model aliases are needed, place
       # openai_responses_model_rewrite here, before validation. Its parsed
@@ -177,10 +192,6 @@ filter_chains:
       - filter: openai_responses_validate
 
       - filter: openai_tool_parse
-
-      - filter: state_owner
-        mode: single_tenant
-        tenant_id: default
 
       - filter: openai_response_store
         backend: sqlite

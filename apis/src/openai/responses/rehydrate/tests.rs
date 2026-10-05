@@ -333,6 +333,51 @@ async fn budgeted_restore_rejects_file_history_before_expansion() {
 }
 
 #[tokio::test]
+async fn budgeted_conversation_restores_plain_history_with_shared_charge() {
+    let store = MockStore::with_conversation(
+        "conv_prev",
+        json!([{"role":"user","content":"First turn"}, {"role":"assistant","content":"Hello"}]),
+    );
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"conversation":"conv_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let before = arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.messages.len(), 3);
+    assert!(state.simple_budget.unwrap().remaining_bytes().unwrap() < before);
+}
+
+#[tokio::test]
+async fn budgeted_conversation_rejects_large_row_before_replay() {
+    let store = MockStore::with_conversation("conv_prev", json!([{"role":"user","content":"x".repeat(128_000)}]));
+    let registry = setup_registry(store);
+    let request_body = r#"{"model":"gpt-4.1","input":"Next turn","store":false,"conversation":"conv_prev"}"#;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    arm_retained_budget(&mut ctx, request_body, 8_388_608);
+    let mut body = Some(Bytes::from(request_body));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 413));
+    assert!(!ctx.extensions.get::<ResponsesState>().unwrap().history_rehydrated);
+}
+
+#[tokio::test]
 async fn budget_policy_does_not_require_create_state_for_input_tokens() {
     let store = MockStore::with_completed_response("resp_prev", json!("First turn"), json!([]));
     let registry = setup_registry(store);
@@ -3749,6 +3794,21 @@ impl ResponseStore for MockStore {
             return Err(StoreError::PayloadTooLarge);
         }
         self.get_response(tenant_id, id).await
+    }
+
+    async fn get_conversation_bounded(
+        &self,
+        tenant_id: &StateOwner,
+        id: &str,
+        max_bytes: usize,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        let record = self.conversations.get(id).filter(|record| &record.owner == tenant_id);
+        if record.is_some_and(|record| {
+            count_record_values(&[&record.metadata, &record.messages]).is_none_or(|bytes| bytes > max_bytes)
+        }) {
+            return Err(StoreError::PayloadTooLarge);
+        }
+        ResponseStore::get_conversation(self, tenant_id, id).await
     }
 
     async fn delete_response(&self, _tenant_id: &StateOwner, _id: &str) -> Result<bool, StoreError> {

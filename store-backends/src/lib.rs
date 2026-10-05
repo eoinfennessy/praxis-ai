@@ -39,9 +39,9 @@ pub(crate) use praxis_ai_store::PoolConfig;
 #[cfg(feature = "postgres")]
 pub(crate) use praxis_ai_store::SslMode;
 
-/// Bound the SQL message-cache rebuild before loading item rows. JSON number
-/// normalization can expand a compact token to 24 bytes; decoded rows,
-/// parsed values, serialized cache, and the SQL argument can coexist.
+/// Bound the SQL message-cache rebuild before loading item rows. Sparse nested
+/// JSON can expand far beyond its wire length across row decoding, parsed
+/// values, the serialized cache, and SQL argument copies.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn conversation_rebuild_fits(raw_bytes: i64, row_count: i64, max_bytes: usize) -> bool {
     let Ok(raw_bytes) = usize::try_from(raw_bytes) else {
@@ -51,11 +51,12 @@ fn conversation_rebuild_fits(raw_bytes: i64, row_count: i64, max_bytes: usize) -
         return false;
     };
     raw_bytes
-        .checked_mul(26)
+        .checked_mul(512)
         .and_then(|bytes| bytes.checked_add(row_count.checked_mul(4)?))
         .and_then(|bytes| bytes.checked_add(4))
         .is_some_and(|bytes| bytes <= max_bytes)
 }
+
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) use praxis_ai_store::compression;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -89,5 +90,23 @@ pub(crate) fn redact_connection_error(url: &str, message: &str) -> String {
     match rest.split_once('@') {
         Some((_userinfo, after_at)) => format!("{before}://<redacted credentials>@{after_at}"),
         None => format!("{before}://{rest}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    use super::conversation_rebuild_fits;
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn sparse_json_rebuild_needs_structural_headroom() {
+        // 40 KiB of nested arrays expanded past 12 MiB across parser/copy peaks
+        // in the restore allocation probe. A 26x byte reserve admitted it.
+        assert!(
+            !conversation_rebuild_fits(40_018, 1, 8_388_608),
+            "sparse tree must reject"
+        );
+        assert!(conversation_rebuild_fits(128, 1, 8_388_608), "small JSON must fit");
     }
 }

@@ -102,6 +102,7 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
     bounded_item_rebuild_rolls_back(backend).await;
+    bounded_rebuild_rechecks_intervening_append(backend).await;
     item_sync_delete_rolls_back_without_parent(backend).await;
     item_ids_are_owner_scoped(backend).await;
     item_positions_are_owner_scoped_and_atomic(backend).await;
@@ -605,6 +606,64 @@ async fn bounded_item_rebuild_rolls_back(backend: &dyn PersistedStateBackend) {
     assert_eq!(
         after.messages, before.messages,
         "failed append must not change the cached messages"
+    );
+}
+
+/// A request's earlier bounded restore cannot authorize a later cache rebuild:
+/// another writer may grow the conversation between those two operations.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the restore, intervening write, and rollback assertions form one scenario"
+)]
+async fn bounded_rebuild_rechecks_intervening_append(backend: &dyn PersistedStateBackend) {
+    let o = owner("intervening-append");
+    let id = "conv_intervening_append";
+    backend
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: id.to_owned(),
+            owner: o.clone(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("create conversation");
+    backend
+        .create_items_and_sync_messages(&o, id, &[item(&o, id, "prior")])
+        .await
+        .expect("seed prior item");
+    let snapshot = backend
+        .get_conversation_bounded(&o, id, 65_536)
+        .await
+        .expect("bounded restore")
+        .expect("conversation exists");
+    assert_eq!(
+        snapshot.messages.as_array().map(Vec::len),
+        Some(1),
+        "restore sees the first item"
+    );
+
+    let mut concurrent = item(&o, id, "concurrent");
+    concurrent.item_data = serde_json::json!({"id":"concurrent", "content":"x".repeat(10_000)});
+    backend
+        .create_items_and_sync_messages(&o, id, &[concurrent])
+        .await
+        .expect("another writer appends after restore");
+    let rejected = backend
+        .create_items_and_sync_messages_bounded(&o, id, &[item(&o, id, "candidate")], 65_536)
+        .await;
+    assert!(
+        matches!(rejected, Err(StoreError::PayloadTooLarge)),
+        "intervening item must exceed the bound"
+    );
+    let listed = backend
+        .list_conversation_items(&o, id, None, 10, true)
+        .await
+        .expect("list items");
+    assert_eq!(listed.len(), 2, "failed candidate append must roll back");
+    assert!(
+        listed.iter().all(|record| record.item_id != "candidate"),
+        "candidate must roll back"
     );
 }
 

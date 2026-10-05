@@ -24,7 +24,6 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     for key in [
         "tools",
         "tool_choice",
-        "conversation",
         "prompt",
         "include",
         "background",
@@ -37,6 +36,9 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
         );
         request.as_object_mut().unwrap().remove(key);
     }
+
+    request["conversation"] = serde_json::Value::String("conv_123".to_owned());
+    assert!(plain_agentic_request_supported(request.as_object().unwrap()));
 
     request["stream"] = serde_json::Value::Bool(true);
     assert!(!plain_agentic_request_supported(request.as_object().unwrap()));
