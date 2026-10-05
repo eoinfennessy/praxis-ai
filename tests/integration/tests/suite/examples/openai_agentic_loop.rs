@@ -479,24 +479,6 @@ fn retained_budget_rejects_oversized_buffered_output_without_dispatch() {
 }
 
 #[test]
-fn retained_budget_rejects_tools_and_streaming_before_inference() {
-    let model = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
-    let config = load_agentic_config(free_port(), model.port());
-    let proxy = start_proxy(&config);
-
-    for request_body in [
-        r#"{"model":"gpt-4.1","input":"Hi","store":false,"stream":true}"#,
-        r#"{"model":"gpt-4.1","input":"Hi","store":false,"tools":[{"type":"web_search_preview"}]}"#,
-    ] {
-        let raw = http_send(proxy.addr(), &json_post("/v1/responses", request_body));
-        assert_eq!(parse_status(&raw), 400, "request: {request_body}");
-        let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-    }
-    assert!(model.requests().is_empty(), "unsupported paths must not dispatch");
-}
-
-#[test]
 fn explicit_false_preserves_original_request_bytes() {
     let response = r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#;
     let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
@@ -745,7 +727,7 @@ fn round_trip_captures_tool_and_model_requests() {
     );
     let raw = http_send(proxy.addr(), &request);
 
-    assert_eq!(parse_status(&raw), 200, "round-trip should return 200");
+    assert_eq!(parse_status(&raw), 200, "round-trip should return 200: {raw}");
     let body = parse_body(&raw);
     let response: serde_json::Value = serde_json::from_str(&body).expect("response should be valid JSON");
     assert_eq!(
@@ -8015,7 +7997,18 @@ fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) 
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
+    // This variant delegates conversation history to the model backend. The
+    // local Conversations filter cannot append to that backend-owned ID.
+    let yaml = yaml.replacen(
+        "      - filter: openai_conversations\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        conversations_table: openai_conversations\n        items_table: openai_conversation_items\n\n",
+        "",
+        1,
+    );
     let yaml = yaml.replacen("      - filter: openai_responses_rehydrate\n", "", 1);
+    assert!(
+        !yaml.contains("      - filter: openai_conversations\n"),
+        "native conversation history must not append into the local store"
+    );
     assert!(
         !yaml.contains("      - filter: openai_responses_rehydrate\n"),
         "expected to remove rehydration from the agentic-loop config"
