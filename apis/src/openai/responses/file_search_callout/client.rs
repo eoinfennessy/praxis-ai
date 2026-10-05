@@ -468,7 +468,7 @@ pub(crate) struct FileSearchClientConfig {
 ///
 /// A [`FileSearchCalloutFilter`](super::FileSearchCalloutFilter) builds one of
 /// these from its bound outbound pipeline and the live request context, then
-/// hands it to [`FileSearchClient::search`] so the whole fan-out routes through
+/// hands it to [`FileSearchClient::search_with_retained_limit`] so the whole fan-out routes through
 /// the same filtered sub-request transport.
 pub(crate) struct CalloutTransport<'a> {
     /// Prebuilt outbound filter chain every vector-store sub-request runs through.
