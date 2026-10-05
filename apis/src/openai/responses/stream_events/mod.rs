@@ -47,7 +47,6 @@ use crate::{
     is_event_stream_content_type,
     openai::{
         responses::{
-            agentic_loop::plain_text_output_item,
             error::{responses_error_rejection, responses_error_sse_payload},
             openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
             state::{ClientToolRestore, EmittedItem, ResponsesState},
@@ -658,12 +657,6 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
         SseParseError::RetainedPayloadLimitExceeded => {
             record_retained_payload_failure(ctx);
         },
-        SseParseError::UnsupportedBudgetedOutput => {
-            ctx.set_metadata(
-                "responses.stream_error_message",
-                "model response needs an unsupported tool or non-text owner under openai_agentic_loop.max_retained_bytes",
-            );
-        },
         SseParseError::ClientToolRestore { reason, .. } => {
             ctx.set_metadata(
                 "responses.stream_error_message",
@@ -854,15 +847,6 @@ fn parse_chunk_events(
     now: Instant,
 ) -> Result<Vec<ResponsesEvent>, SseParseError> {
     let mut events = Vec::with_capacity(frames.len());
-    let budgeted_tools = ctx.extensions.get::<ResponsesState>().and_then(|responses| {
-        responses.simple_budget.map(|_| {
-            responses
-                .request_body
-                .get("tools")
-                .and_then(Value::as_array)
-                .is_some_and(|tools| !tools.is_empty())
-        })
-    });
     for frame in frames {
         if frame.data == b"[DONE]" {
             state.deferred_done = true;
@@ -879,51 +863,11 @@ fn parse_chunk_events(
         }
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
-        if budgeted_tools.is_some_and(|tools| !budgeted_stream_event_supported(&event, tools)) {
-            return Err(SseParseError::UnsupportedBudgetedOutput);
-        }
         record_completion(state, &event, now)?;
         charge_accumulation_budget(state, ctx, &event, frame)?;
         events.push(event);
     }
     Ok(events)
-}
-
-/// Budgeted streaming currently owns only text and reasoning response items.
-/// Check event payloads before the accumulator can copy or dispatch a tool.
-fn budgeted_stream_event_supported(event: &ResponsesEvent, has_tools: bool) -> bool {
-    if has_tools {
-        // The request-side tool gate admits this only after the declaration,
-        // dispatch, and restoration owners have joined the shared budget.
-        return true;
-    }
-    match event {
-        ResponsesEvent::ResponseCreated(payload)
-        | ResponsesEvent::ResponseQueued(payload)
-        | ResponsesEvent::ResponseInProgress(payload) => payload
-            .get("response")
-            .and_then(|response| response.get("output"))
-            .and_then(Value::as_array)
-            .is_none_or(|items| items.iter().all(plain_text_output_item)),
-        ResponsesEvent::ResponseCompleted(payload)
-        | ResponsesEvent::ResponseIncomplete(payload)
-        | ResponsesEvent::ResponseFailed(payload) => payload
-            .get("response")
-            .and_then(|response| response.get("output"))
-            .and_then(Value::as_array)
-            .is_some_and(|items| items.iter().all(plain_text_output_item)),
-        ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
-            payload.get("item").is_some_and(plain_text_output_item)
-        },
-        ResponsesEvent::ContentPartAdded(payload) | ResponsesEvent::ContentPartDone(payload) => payload
-            .get("part")
-            .and_then(|part| part.get("type"))
-            .and_then(Value::as_str)
-            .is_some_and(|part_type| matches!(part_type, "output_text" | "refusal")),
-        ResponsesEvent::FunctionCallArgumentsDelta(_) | ResponsesEvent::FunctionCallArgumentsDone(_) => false,
-        ResponsesEvent::Unknown { event_type, .. } => !is_local_tool_progress_event(event_type),
-        _ => true,
-    }
 }
 
 /// Charge one parsed event's wire bytes against the request-wide accumulation

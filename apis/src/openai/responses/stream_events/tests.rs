@@ -19,8 +19,7 @@ use serde_json::json;
 
 use super::{
     ArmDecision, CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object,
-    arm_decision, budgeted_stream_event_supported, canonicalize_logical_response, encode_local_completion,
-    encode_local_error,
+    arm_decision, canonicalize_logical_response, encode_local_completion, encode_local_error,
 };
 use crate::{
     openai::{
@@ -67,7 +66,10 @@ fn terminal_event_moves_response_payload_without_a_full_tree_clone() {
 }
 
 #[test]
-#[expect(clippy::print_stderr, reason = "record count and peak evidence against the cloned baseline")]
+#[expect(
+    clippy::print_stderr,
+    reason = "record count and peak evidence against the cloned baseline"
+)]
 fn borrowed_terminal_wire_avoids_full_response_clone() {
     let response = json!({
         "id": "resp_1",
@@ -238,59 +240,6 @@ fn repeated_lowered_done_retains_one_completion_snapshot_per_item() {
 }
 
 #[test]
-fn budgeted_stream_accepts_text_reasoning_and_refusal_but_rejects_tools() {
-    use crate::openai::sse::responses::ResponsesEvent;
-    assert!(budgeted_stream_event_supported(
-        &ResponsesEvent::OutputItemDone(json!({
-            "item": {"type": "reasoning", "summary": []}
-        })),
-        false
-    ));
-    assert!(budgeted_stream_event_supported(
-        &ResponsesEvent::OutputItemDone(json!({
-            "item": {"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}
-        })),
-        false
-    ));
-    assert!(!budgeted_stream_event_supported(
-        &ResponsesEvent::OutputItemAdded(json!({
-            "item": {"type": "function_call", "name": "run"}
-        })),
-        false
-    ));
-    assert!(!budgeted_stream_event_supported(
-        &ResponsesEvent::ResponseCompleted(json!({
-            "response": {"output": [{"type": "web_search_call"}]}
-        })),
-        false
-    ));
-    assert!(!budgeted_stream_event_supported(
-        &ResponsesEvent::FunctionCallArgumentsDelta(json!({
-            "delta": "{}"
-        })),
-        false
-    ));
-    assert!(budgeted_stream_event_supported(
-        &ResponsesEvent::Unknown {
-            event_type: "response.provider_metadata".to_owned(),
-            data: json!({"type": "response.provider_metadata", "value": 1}),
-        },
-        false
-    ));
-    assert!(!budgeted_stream_event_supported(
-        &ResponsesEvent::Unknown {
-            event_type: "response.web_search_call.in_progress".to_owned(),
-            data: json!({"type": "response.web_search_call.in_progress"}),
-        },
-        false
-    ));
-    assert!(budgeted_stream_event_supported(
-        &ResponsesEvent::FunctionCallArgumentsDelta(json!({"delta":"{}"})),
-        true,
-    ));
-}
-
-#[test]
 fn retained_budget_overflow_poisoned_stream_emits_one_error_without_success() {
     let (filter, mut ctx) = make_armed_context();
     let mut response = ctx.extensions.remove::<ResponsesState>().unwrap_or_default();
@@ -379,6 +328,27 @@ fn budgeted_argument_deltas_stop_before_growing_the_argument_buffer() {
         500
     );
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+}
+
+#[test]
+fn budgeted_stream_preserves_typed_output_item() {
+    let (filter, mut ctx) = make_armed_context();
+    let mut response = ctx.extensions.remove::<ResponsesState>().unwrap_or_default();
+    response.simple_budget = Some(SimpleBudget::new(1_048_576, 0).unwrap());
+    ctx.extensions.insert(response);
+
+    let mut item = Some(make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "item": {"type":"message","id":"msg_audio","content":[{"type":"output_audio","audio":"YQ=="}]},
+            "output_index": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut item, false).unwrap();
+    let wire = String::from_utf8(item.unwrap().to_vec()).unwrap();
+    assert!(wire.contains("event: response.output_item.done"), "{wire}");
+    assert!(wire.contains("output_audio"), "{wire}");
+    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
 }
 
 #[test]

@@ -461,7 +461,7 @@ fn preparse_filter_reserves_against_existing_responses_state() {
 }
 
 #[test]
-fn budgeted_model_tool_output_rejects_before_dispatch_assignment() {
+fn budgeted_typed_model_output_preserves_response() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -470,13 +470,19 @@ fn budgeted_model_tool_output_rejects_before_dispatch_assignment() {
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&json!({
-            "object":"response", "output":[{"type":"web_search_call","id":"ws_1","status":"in_progress"}]
+            "object":"response", "status":"completed", "output":[
+                {"type":"message","content":[{"type":"output_audio","audio":"YQ=="}]},
+                {"type":"image_generation_call","status":"completed","result":"YQ=="}
+            ]
         }))
         .unwrap(),
     ));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 502));
+    assert!(matches!(action, FilterAction::Continue));
     assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    let response: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(response["output"][0]["content"][0]["audio"], "YQ==");
+    assert_eq!(response["output"][1]["result"], "YQ==");
 }
 
 #[test]

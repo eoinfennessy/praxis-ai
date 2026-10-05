@@ -5334,26 +5334,6 @@ class TestClientToolCompatChatVLLM:
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 
-    @pytest.mark.parametrize(
-        "options",
-        [
-            {"stream": True, "store": False},
-            {"store": False, "tools": [{"type": "web_search_preview"}]},
-        ],
-        ids=["streaming", "hosted-tool"],
-    )
-    def test_retained_budget_rejects_unsupported_sdk_requests(self, agentic_client, options):
-        """The first budget slice rejects unmetered paths before inference."""
-        with pytest.raises(BadRequestError) as exc_info:
-            agentic_client.responses.create(
-                model=VLLM_MODEL,
-                input="Hello",
-                **options,
-            )
-        assert "openai_agentic_loop.max_retained_bytes" in str(exc_info.value), (
-            f"{options} must reject before inference until its payload owners are metered"
-        )
-
     def test_retained_budget_allows_default_store_for_plain_text(self, agentic_client):
         """The default Store path persists a bounded plain text response."""
         response = agentic_client.responses.create(model=VLLM_MODEL, input="Hello")

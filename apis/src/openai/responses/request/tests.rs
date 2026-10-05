@@ -136,23 +136,26 @@ async fn budgeted_create_rejects_large_body_before_parse() {
 }
 
 #[tokio::test]
-async fn budgeted_create_rejects_unaccounted_owners() {
+async fn budgeted_create_admits_stream_tools_and_typed_input() {
     let request = create_request();
     let filter = default_filter();
     for body in [
-        json!({"input":"hello","store":false,"stream":true}),
-        json!({"input":"hello","store":false,"tools":[{"type":"web_search_preview"}]}),
+        json!({"model":"gpt-4.1","input":"hello","store":false,"stream":true}),
+        json!({"model":"gpt-4.1","input":"hello","store":false,"tools":[{"type":"web_search_preview"}],"tool_choice":"auto"}),
+        json!({"model":"gpt-4.1","input":[{"type":"function_call_output","call_id":"call_1","output":"done"}],"store":false}),
+        json!({"model":"gpt-4.1","input":[{"type":"mcp_approval_response","approval_request_id":"approval_1","approve":true}],"store":false}),
+        json!({"model":"gpt-4.1","input":[{"type":"message","role":"user","content":[{"type":"input_audio","input_audio":{"data":"YQ==","format":"wav"}}]}],"store":false}),
+        json!({"model":"gpt-4.1","input":"next","previous_response_id":"resp_1","context_management":[{"type":"compaction","compact_threshold":1000}]}),
     ] {
         let mut ctx = make_filter_context(&request);
         ctx.extensions
             .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
         let mut bytes = Some(Bytes::from(serde_json::to_vec(&body).unwrap()));
         let action = filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap();
-        assert!(
-            matches!(action, FilterAction::Reject(rejection) if rejection.status == 400),
-            "{body}"
-        );
-        assert!(ctx.extensions.get::<ResponsesState>().is_none());
+        assert!(matches!(action, FilterAction::Release), "{body}");
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        assert_eq!(state.request_body, body);
+        assert!(state.simple_budget.is_some());
     }
 }
 

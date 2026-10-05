@@ -526,15 +526,7 @@ impl HttpFilter for AgenticLoopFilter {
         }
 
         if let Some(bytes) = body.as_ref() {
-            if extract_tool_calls_from_body(bytes, &mut state) {
-                ctx.set_metadata("responses.skip_persist", "true");
-                set_action(ctx, ACTION_DONE)?;
-                return Ok(FilterAction::Reject(responses_error_rejection(
-                    502,
-                    "server_error",
-                    "model response needs an unsupported tool or non-text owner under openai_agentic_loop.max_retained_bytes",
-                )));
-            }
+            extract_tool_calls_from_body(bytes, &mut state);
         } else if !prepare_streamed_round(ctx, &mut state)? {
             ctx.extensions.insert(state);
             return Ok(FilterAction::Continue);
@@ -1051,18 +1043,15 @@ fn end_at_iteration_limit(
 
 /// Extract completed function-call items from a non-streaming response body
 /// and populate `state.tool_calls` and `state.messages`.
-fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> bool {
+fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
     let response = serde_json::from_slice::<Value>(body)
         .ok()
         .filter(is_responses_api_output);
     let Some(mut response) = response else {
         state.response_object = Value::Null;
         state.tool_calls.clear();
-        return false;
+        return;
     };
-    if state.simple_budget.is_some() && !plain_text_response(&response) {
-        return true;
-    }
     // Normalize private `function_call(name=file_search)` into canonical
     // `file_search_call`, gated on an actually configured hosted file-search
     // tool. The returned round-local indices identify the normalized items so
@@ -1081,32 +1070,6 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) -> boo
         merge_usage(&mut state.usage, usage);
     }
     state.response_object = response;
-    false
-}
-
-/// The first budgeted slice accepts plain messages and reasoning items. Every
-/// tool-related output is rejected before its dispatcher sees an assignment.
-fn plain_text_response(response: &Value) -> bool {
-    response
-        .get("output")
-        .and_then(Value::as_array)
-        .is_some_and(|items| items.iter().all(plain_text_output_item))
-}
-
-/// The same budgeted output shape is enforced for buffered and streamed items.
-pub(crate) fn plain_text_output_item(item: &Value) -> bool {
-    match item.get("type").and_then(Value::as_str) {
-        Some("reasoning") => true,
-        Some("message") => item.get("content").and_then(Value::as_array).is_some_and(|parts| {
-            parts.iter().all(|part| {
-                matches!(
-                    part.get("type").and_then(Value::as_str),
-                    Some("output_text" | "refusal")
-                )
-            })
-        }),
-        _ => false,
-    }
 }
 
 /// Return whether one model round mixed server-owned MCP, web-search, pending

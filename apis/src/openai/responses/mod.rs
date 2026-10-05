@@ -99,8 +99,7 @@ pub(crate) fn initial_agentic_budget_rejection(ctx: &HttpFilterContext<'_>, byte
     })
 }
 
-/// Admit input whose independently owned copies and expansions have
-/// request-wide accounting. Remaining features stay gated in this draft.
+/// Initialize request-wide accounting for a classified Responses create.
 #[cfg(feature = "openai-responses")]
 pub(crate) fn plain_agentic_budget(
     ctx: &HttpFilterContext<'_>,
@@ -117,13 +116,6 @@ pub(crate) fn plain_agentic_budget(
             "a budgeted Responses request must be a JSON object",
         )));
     };
-    if !budgeted_request_supported(object) {
-        return Err(FilterAction::Reject(error::responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "this Responses request path is not yet supported with openai_agentic_loop.max_retained_bytes",
-        )));
-    }
     let charge = agentic_loop::budget::input_charge(bytes).unwrap_or(usize::MAX);
     let will_store = object.get("store") != Some(&serde_json::Value::Bool(false));
     let budget = agentic_loop::budget::SimpleBudget::new_with_store(policy.max_retained_bytes(), charge, will_store);
@@ -136,51 +128,7 @@ pub(crate) fn plain_agentic_budget(
     })
 }
 
-/// Keep owners with unmetered expansions out of the current budget slice.
-#[cfg(feature = "openai-responses")]
-fn budgeted_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
-    budgeted_input_supported(object.get("input"))
-        && !object.keys().any(|key| matches!(key.as_str(), "tools" | "tool_choice"))
-}
-
-/// File and image parts can pass the ingress charge. File resolution and
-/// document extraction reserve their additional owners before expansion.
-#[cfg(feature = "openai-responses")]
-fn budgeted_input_supported(input: Option<&serde_json::Value>) -> bool {
-    match input {
-        None | Some(serde_json::Value::Null | serde_json::Value::String(_)) => true,
-        Some(serde_json::Value::Object(message)) => budgeted_message_supported(message),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .all(|item| item.as_object().is_some_and(budgeted_message_supported)),
-        _ => false,
-    }
-}
-
-/// An object input has the same owners whether sent alone or in an array.
-#[cfg(feature = "openai-responses")]
-fn budgeted_message_supported(message: &serde_json::Map<String, serde_json::Value>) -> bool {
-    if message.get("type").is_some_and(|kind| kind != "message") {
-        return false;
-    }
-    match message.get("content") {
-        Some(serde_json::Value::String(_)) => true,
-        Some(serde_json::Value::Array(parts)) => {
-            parts
-                .iter()
-                .all(|part| match part.get("type").and_then(serde_json::Value::as_str) {
-                    Some("input_text") => part.get("text").is_some_and(serde_json::Value::is_string),
-                    Some("input_file" | "input_image") => true,
-                    _ => false,
-                })
-        },
-        _ => false,
-    }
-}
-
-/// Admit the common message-array form only when every content part is plain
-/// text. File, image, audio, and video parts retain owners that need their own
-/// admission before this guard can accept them.
+/// Recognize requests whose file resolver can skip a second JSON projection.
 #[cfg(feature = "openai-file-resolve-filter")]
 fn text_only_input(input: Option<&serde_json::Value>) -> bool {
     let Some(input) = input else {
@@ -207,6 +155,7 @@ fn text_only_input(input: Option<&serde_json::Value>) -> bool {
         _ => false,
     }
 }
+
 #[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
