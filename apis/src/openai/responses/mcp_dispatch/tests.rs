@@ -18,12 +18,13 @@ use super::{
     content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
     extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
     mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
-    prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
+    prepare_response_round, process_call_result, reserve_mcp_execution, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
     openai::responses::{
         DEFAULT_TENANT_ID,
+        agentic_loop::budget::SimpleBudget,
         mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
         mcp_dispatch::{
             approval::{
@@ -74,6 +75,53 @@ fn rejected_calls_do_not_dilute_admitted_result_allowance() {
 }
 
 #[test]
+fn budgeted_mcp_batch_reserves_independent_call_slots_atomically() {
+    let mut state = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        ..ResponsesState::default()
+    };
+    let before = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    let execution = reserve_mcp_execution(&mut state, 2, TEST_MAX_RESULT_BYTES, TEST_MAX_TOTAL_RESULT_BYTES)
+        .expect("two small MCP calls should fit");
+    assert_eq!(execution.call_count, 2);
+    assert!(execution.wire_limit >= 512);
+    assert_eq!(
+        state.simple_budget.unwrap().remaining_bytes(),
+        Some(before - execution.reserved),
+    );
+
+    let mut tight = ResponsesState {
+        simple_budget: SimpleBudget::new(65_536, 1_000),
+        ..ResponsesState::default()
+    };
+    let remaining = tight.simple_budget.unwrap().remaining_bytes();
+    assert!(reserve_mcp_execution(&mut tight, 8, TEST_MAX_RESULT_BYTES, TEST_MAX_TOTAL_RESULT_BYTES).is_none());
+    assert_eq!(tight.simple_budget.unwrap().remaining_bytes(), remaining);
+}
+
+#[test]
+fn budgeted_mcp_call_with_small_result_cap_still_admits_initialize() {
+    let mut state = ResponsesState {
+        simple_budget: SimpleBudget::new(2_097_152, 1_000),
+        ..ResponsesState::default()
+    };
+    let execution = reserve_mcp_execution(&mut state, 1, 8_192, 8_192)
+        .expect("control response capacity must not depend on the tool result cap");
+    let initialize = br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"x","version":"1"}}}"#;
+    let parse_charge = crate::openai::responses::agentic_loop::budget::output_charge(initialize).unwrap();
+    assert!(parse_charge <= execution.parse_charge_limit);
+    assert_eq!(execution.result_limit, 8_192);
+
+    let mut too_tight = ResponsesState {
+        simple_budget: SimpleBudget::new(307_680, 0),
+        ..ResponsesState::default()
+    };
+    let before = too_tight.simple_budget.unwrap().remaining_bytes();
+    assert!(reserve_mcp_execution(&mut too_tight, 1, 8_192, 8_192).is_none());
+    assert_eq!(too_tight.simple_budget.unwrap().remaining_bytes(), before);
+}
+
+#[test]
 fn mcp_call_ids_must_be_present_nonempty_and_unique() {
     let distinct = vec![json!({"call_id": "call_1"}), json!({"call_id": "call_2"})];
     assert!(mcp_call_ids_are_unique_and_new(&call_refs(&distinct), &[]));
@@ -110,6 +158,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         connector_identity: None,
         session_pool: POOL.get_or_init(crate::mcp_client::McpSessionPool::new),
         pool_namespace: *NAMESPACE.get_or_init(crate::mcp_client::McpPoolNamespace::new),
+        transport_budget: None,
     }
 }
 
@@ -754,6 +803,13 @@ fn content_blocks_to_output_preserves_non_text_losslessly() {
         recovered, blocks,
         "#807: mixed text/non-text output must round-trip losslessly so no MCP content block is dropped"
     );
+}
+
+#[test]
+fn content_blocks_to_output_rejects_oversized_non_text_before_serializing() {
+    let blocks = vec![rmcp::model::ContentBlock::image("base64data", "image/png")];
+    let error = content_blocks_to_output(&blocks, 16).expect_err("serialized content must exceed the cap");
+    assert!(error.contains("per-result byte limit"));
 }
 
 #[test]
@@ -1667,6 +1723,45 @@ fn prepare_response_round_emits_resumable_approval() {
 }
 
 #[test]
+fn budgeted_ungated_mcp_round_does_not_reserve_approval_staging() {
+    let mut tool_map = sample_tool_map();
+    tool_map
+        .get_mut(&("weather".to_owned(), "get_weather".to_owned()))
+        .unwrap()["require_approval"] = json!("never");
+    let mut state = ResponsesState {
+        simple_budget: SimpleBudget::new(1_048_576, 0),
+        mcp_tool_map: tool_map,
+        tool_calls: vec![json!({"name":"weather__get_weather","call_id":"c1","arguments":"{}"})],
+        ..ResponsesState::default()
+    };
+    let before = state.simple_budget.unwrap().remaining_bytes();
+    prepare_response_round(&mut state, 1).unwrap();
+    assert_eq!(state.simple_budget.unwrap().remaining_bytes(), before);
+    assert_eq!(state.tool_calls.len(), 1);
+}
+
+#[test]
+fn budgeted_approval_staging_rejects_before_emitting_or_persisting() {
+    let mut state = ResponsesState {
+        simple_budget: SimpleBudget::new(4_096, 0),
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({
+            "name": "weather__get_weather",
+            "call_id": "c1",
+            "arguments": "{\"city\":\"Paris\"}"
+        })],
+        store_persist_armed: true,
+        ..ResponsesState::default()
+    };
+
+    let failure = prepare_response_round(&mut state, 1).unwrap_err();
+    assert_eq!(failure.status, 502);
+    assert!(failure.message.contains("max_retained_bytes"));
+    assert!(state.pending_approvals.is_empty());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[test]
 fn prepare_response_round_rejects_unresumable_approval() {
     for (request_body, expected_status) in [
         (json!({"model":"gpt-4.1", "store":false}), 400),
@@ -2088,6 +2183,59 @@ async fn on_request_body_executes_and_appends_results_before_proxy_serialization
 }
 
 #[tokio::test]
+async fn budgeted_mcp_dispatch_does_not_charge_idle_round_with_tool_map() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let state = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        mcp_tool_map: sample_tool_map(),
+        ..ResponsesState::default()
+    };
+    let before = state.simple_budget.unwrap().remaining_bytes();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(super::configured_max_calls_per_round(&ctx), Some(32));
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .simple_budget
+            .unwrap()
+            .remaining_bytes(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn budgeted_mcp_dispatch_settles_result_before_next_inference_round() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let state = ResponsesState {
+        simple_budget: SimpleBudget::new(8_388_608, 1_000),
+        mcp_tool_map: sample_tool_map(),
+        tool_calls: vec![json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "{}"})],
+        ..ResponsesState::default()
+    };
+    let before = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert!(state.dispatch_failure.is_none());
+    assert!(state.mcp_execution_budget.is_none(), "peak reservation must be settled");
+    let after = state.simple_budget.unwrap().remaining_bytes().unwrap();
+    assert!(after < before, "retained MCP output must remain charged");
+    assert!(after > before / 2, "transient callout capacity must be released");
+}
+
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "explicit MCP state setup and executed-result assertions"
@@ -2506,6 +2654,44 @@ async fn resume_approval_approve_executes_once_and_preserves_call() {
         "mcp_call must reference the authorizing approval"
     );
     assert!(state.tool_calls.is_empty(), "executed approved call must be cleared");
+}
+
+#[tokio::test]
+async fn budgeted_approval_exhaustion_leaves_pending_call_claimable() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_budget", "{\"city\":\"Paris\"}").await;
+    register_store(&mut ctx, Arc::clone(&store));
+    ctx.extensions.insert(ResponsesState {
+        simple_budget: SimpleBudget::new(131_072, 0),
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_budget", true, None)],
+        ..ResponsesState::default()
+    });
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert_eq!(rejection.status, 413);
+    assert!(reject_message(&rejection).contains("max_retained_bytes"));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .is_empty()
+    );
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    assert_eq!(
+        store
+            .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_budget"], 2_000)
+            .await
+            .unwrap(),
+        None,
+        "the exhausted request must not consume its durable approval",
+    );
 }
 
 #[tokio::test]

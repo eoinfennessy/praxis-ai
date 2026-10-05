@@ -3,7 +3,7 @@
 
 //! Adapt a praxis streaming response body into an rmcp SSE stream.
 //!
-//! [`sse_stream_from_body`] wraps a [`StreamingResponseBody`] as the
+//! [`sse_stream_from_body_with_budget`] wraps a [`StreamingResponseBody`] as the
 //! `BoxStream<Result<Sse, SseError>>` rmcp's `StreamableHttpPostResponse::Sse`
 //! and `get_stream` expect. Two independent byte budgets are enforced at the
 //! raw byte layer, *before* SSE parsing:
@@ -25,8 +25,10 @@ use praxis_filter::StreamingResponseBody;
 use sse_stream::{Error as SseError, Sse, SseStream};
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
+use crate::openai::responses::agentic_loop::budget::output_charge;
 
 /// Destination for an SSE size classification.
+#[derive(Clone)]
 pub(super) enum SseSignalTarget {
     /// One POST response owns a fixed signal generation.
     Fixed(Arc<OnceLock<TransportSignal>>),
@@ -205,10 +207,7 @@ struct ByteState {
 /// cap is `min(per_event_cap, max_sse_event_size)`). A breach of either budget
 /// records `signal` (first wins) and terminates the stream.
 #[allow(clippy::allow_attributes, dead_code, reason = "wired by selector filter in task 4")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "two-budget byte-layer adapter is inherently sequential"
-)]
+#[cfg(test)]
 pub(super) fn sse_stream_from_body(
     body: Box<dyn StreamingResponseBody>,
     per_event_cap: usize,
@@ -216,7 +215,29 @@ pub(super) fn sse_stream_from_body(
     max_sse_event_size: usize,
     signal: SseSignalTarget,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
+    sse_stream_from_body_with_budget(body, per_event_cap, operation_cap, max_sse_event_size, signal, None)
+}
+
+/// Apply a structural preparse ceiling to every completed MCP SSE event.
+/// The byte-layer limits still run before the SSE parser allocates a frame.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "adds one optional parse bound to the SSE adapter"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "two-budget byte-layer adapter is inherently sequential"
+)]
+pub(super) fn sse_stream_from_body_with_budget(
+    body: Box<dyn StreamingResponseBody>,
+    per_event_cap: usize,
+    operation_cap: usize,
+    max_sse_event_size: usize,
+    signal: SseSignalTarget,
+    parse_charge_limit: Option<usize>,
+) -> BoxStream<'static, Result<Sse, SseError>> {
     let effective_per_event = per_event_cap.min(max_sse_event_size);
+    let parse_signal = signal.clone();
     let state = ByteState {
         body,
         emitted: 0,
@@ -253,7 +274,18 @@ pub(super) fn sse_stream_from_body(
         }
     });
 
-    SseStream::from_bytes_stream(byte_stream).boxed()
+    SseStream::from_bytes_stream(byte_stream)
+        .map(move |event| {
+            if let (Some(limit), Ok(value)) = (parse_charge_limit, &event)
+                && let Some(data) = &value.data
+                && output_charge(data.as_bytes()).is_none_or(|charge| charge > limit)
+            {
+                parse_signal.record(TransportSignal::ResponseTooLarge { limit });
+                return Err(SseError::Body(Box::new(SseByteStreamError::Ceiling { limit })));
+            }
+            event
+        })
+        .boxed()
 }
 
 /// Test double for [`StreamingResponseBody`] that yields queued chunks and

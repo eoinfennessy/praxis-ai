@@ -361,6 +361,25 @@ pub(crate) enum McpApprovalState {
     ExecuteUngatedThenReturn,
 }
 
+/// Peak transport and result capacity reserved for one MCP execution batch.
+/// The reservation is settled to the retained result charge after dispatch.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct McpExecutionBudget {
+    /// Number of MCP calls admitted together.
+    pub call_count: usize,
+    /// Retained result limit passed to the dispatcher.
+    pub result_limit: usize,
+    /// Raw response ceiling applied before the MCP JSON parser.
+    pub wire_limit: usize,
+    /// Structural and wire charge allowed for one MCP response parse.
+    pub parse_charge_limit: usize,
+    /// Total peak capacity reserved in the request-wide ledger.
+    pub reserved: usize,
+    /// Argument parser capacity that is released with this batch.
+    pub transient_argument_charge: usize,
+}
+
 /// Request-scoped state shared across Responses API filters.
 ///
 /// Created by `openai_responses_validate` for every Responses API
@@ -520,6 +539,11 @@ pub(crate) struct ResponsesState {
 
     /// Lifecycle state for an MCP batch that must return after execution.
     pub mcp_approval_state: McpApprovalState,
+
+    /// Capacity already reserved before a durable approval batch was consumed.
+    /// Request-side execution reuses it rather than charging twice.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub(crate) mcp_execution_budget: Option<McpExecutionBudget>,
 
     /// Whether a local dispatcher exhausted the response-wide tool budget.
     ///
@@ -977,6 +1001,8 @@ impl Default for ResponsesState {
             mcp_connector_context_policy: McpConnectorContextPolicy::default(),
             max_tool_calls: None,
             mcp_approval_state: McpApprovalState::None,
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_execution_budget: None,
             deferred_tool_limit_completion: false,
             deferred_stream_done: false,
             mcp_tool_map: HashMap::new(),
