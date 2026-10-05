@@ -21,7 +21,7 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     });
     assert!(budgeted_request_supported(request.as_object().unwrap()));
 
-    for key in ["tools", "tool_choice", "context_management"] {
+    for key in ["tools", "tool_choice"] {
         request[key] = serde_json::Value::Null;
         assert!(
             !budgeted_request_supported(request.as_object().unwrap()),
@@ -36,6 +36,9 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     assert!(budgeted_request_supported(request.as_object().unwrap()));
 
     request["conversation"] = serde_json::Value::String("conv_123".to_owned());
+    assert!(budgeted_request_supported(request.as_object().unwrap()));
+
+    request["context_management"] = serde_json::json!([{"type":"compaction","compact_threshold":1000}]);
     assert!(budgeted_request_supported(request.as_object().unwrap()));
 
     request["stream"] = serde_json::Value::Bool(true);

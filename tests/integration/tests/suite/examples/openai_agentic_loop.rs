@@ -100,7 +100,8 @@ fn retained_budget_preserves_provider_owned_fields() {
         "store":false,
         "include":["reasoning.encrypted_content"],
         "background":false,
-        "prompt":null
+        "prompt":null,
+        "context_management":[{"type":"compaction","compact_threshold":1000}]
     });
 
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
@@ -108,7 +109,7 @@ fn retained_budget_preserves_provider_owned_fields() {
     let requests = model.requests();
     assert_eq!(requests.len(), 1);
     let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
-    for field in ["include", "background", "prompt"] {
+    for field in ["include", "background", "prompt", "context_management"] {
         assert_eq!(outbound[field], request[field], "{field} must survive the proxy");
     }
 }

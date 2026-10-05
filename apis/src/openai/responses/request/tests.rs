@@ -142,7 +142,6 @@ async fn budgeted_create_rejects_unaccounted_owners() {
     for body in [
         json!({"input":"hello","store":false,"stream":true}),
         json!({"input":"hello","store":false,"tools":[{"type":"web_search_preview"}]}),
-        json!({"input":"hello","store":false,"context_management":{"type":"compaction"}}),
     ] {
         let mut ctx = make_filter_context(&request);
         ctx.extensions
@@ -155,6 +154,28 @@ async fn budgeted_create_rejects_unaccounted_owners() {
         );
         assert!(ctx.extensions.get::<ResponsesState>().is_none());
     }
+}
+
+#[tokio::test]
+async fn budgeted_create_keeps_context_management_for_bounded_compaction() {
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    ctx.extensions
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+    let context = json!([{"type":"compaction","compact_threshold":1000}]);
+    let mut bytes = Some(Bytes::from(
+        serde_json::to_vec(&json!({"input":"hello","store":false,"context_management":context})).unwrap(),
+    ));
+
+    let action = default_filter()
+        .on_request_body(&mut ctx, &mut bytes, true)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.context_management, Some(context));
+    assert!(state.simple_budget.is_some());
 }
 
 #[tokio::test]

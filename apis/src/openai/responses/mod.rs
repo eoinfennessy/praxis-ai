@@ -141,9 +141,7 @@ pub(crate) fn plain_agentic_budget(
 fn budgeted_request_supported(object: &serde_json::Map<String, serde_json::Value>) -> bool {
     budgeted_input_supported(object.get("input"))
         && object.get("stream") != Some(&serde_json::Value::Bool(true))
-        && !object
-            .keys()
-            .any(|key| matches!(key.as_str(), "tools" | "tool_choice" | "context_management"))
+        && !object.keys().any(|key| matches!(key.as_str(), "tools" | "tool_choice"))
 }
 
 /// File and image parts can pass the ingress charge. File resolution and
