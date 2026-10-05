@@ -30,9 +30,28 @@ use super::{
 use crate::{
     CalloutCredentials, StateOwner,
     callout_policy::OnFailure,
-    openai::responses::state::{FileSearchAssignment, SynthesisKind},
+    openai::responses::{
+        agentic_loop::budget::SimpleBudget,
+        state::{FileSearchAssignment, SynthesisKind},
+    },
     subrequest::{SubRequestClient, SubRequestError, SubResponse},
 };
+
+#[test]
+fn retained_file_fanout_cap_has_exact_preflight_boundary() {
+    let mut budget = SimpleBudget::new(1_048_576, 0).unwrap();
+    let decoder_headroom = 2 * RETAINED_SEARCH_DECODER_HEADROOM + 4_096;
+    let remaining = budget.remaining_bytes().unwrap();
+    assert!(budget.reserve_additional_input(remaining - decoder_headroom - RETAINED_SEARCH_WIRE_FACTOR));
+    let mut state = ResponsesState {
+        simple_budget: Some(budget),
+        ..Default::default()
+    };
+    assert_eq!(file_search_body_limit(&state, 2), Some(1));
+    assert!(state.simple_budget.as_mut().unwrap().reserve_additional_input(1));
+    assert_eq!(file_search_body_limit(&state, 2), None);
+    assert_eq!(file_search_body_limit(&ResponsesState::default(), 2), Some(usize::MAX));
+}
 // -----------------------------------------------------------------------------
 // Configuration and transport validation
 // -----------------------------------------------------------------------------
@@ -1425,6 +1444,37 @@ async fn searches_multiple_stores_concurrently() {
         server.max_active() >= 2,
         "multiple vector-store requests must overlap in flight"
     );
+}
+
+#[tokio::test]
+async fn budgeted_file_fanout_keeps_all_small_results_eligible() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let mut state = one_pending_state(&["vs-a", "vs-b"]);
+    state.simple_budget = Some(SimpleBudget::new(8_388_608, 0).unwrap());
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert_eq!(server.requests().len(), 2);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.dispatch_failure.is_none());
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn request_budget_body_overflow_is_terminal_even_with_fail_open() {
+    let server = MockServer::json(200, &json!({"data": [], "padding": "x".repeat(500_000)}));
+    let filter = make_filter(server.port, "on_failure: open\n");
+    let mut state = one_pending_state(&["vs-a"]);
+    state.simple_budget = Some(SimpleBudget::new(8_388_608, 0).unwrap());
+    let pending = state.accumulated_output[0].clone();
+    let mut ctx = make_context(Some(state));
+
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.dispatch_failure.as_ref().map(|failure| failure.status), Some(502));
+    assert_eq!(state.accumulated_output[0], pending);
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]

@@ -510,7 +510,10 @@ mod tests {
 
     #[test]
     #[expect(clippy::print_stderr, reason = "record fixed-baseline allocation evidence")]
-    #[expect(clippy::too_many_lines, reason = "compare complete context output and allocation baseline")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "compare complete context output and allocation baseline"
+    )]
     fn high_cardinality_context_reuses_chunk_storage() {
         let result = SearchResult {
             attributes: None,

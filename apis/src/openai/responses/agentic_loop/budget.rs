@@ -129,6 +129,19 @@ impl SimpleBudget {
         true
     }
 
+    /// Release transient admission after its owners are dropped, leaving the
+    /// measured independently retained portion charged to this request.
+    pub(crate) fn settle_additional_input(&mut self, reserved: usize, retained: usize) -> bool {
+        let Some(released) = reserved.checked_sub(retained) else {
+            return false;
+        };
+        let Some(next) = self.additional_input_charge.checked_sub(released) else {
+            return false;
+        };
+        self.additional_input_charge = next;
+        true
+    }
+
     /// Preflight one more provider chunk before any response parser sees it.
     pub(crate) fn admit_output(&mut self, bytes: &[u8]) -> bool {
         let Some(additional) = output_charge(bytes) else {
