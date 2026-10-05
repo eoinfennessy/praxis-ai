@@ -89,6 +89,31 @@ fn retained_budget_allows_model_alias_before_validation() {
 }
 
 #[test]
+fn retained_budget_preserves_provider_owned_fields() {
+    let response = r#"{"id":"resp_provider_fields","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config(free_port(), model.port());
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model":"gpt-4.1",
+        "input":"Hello",
+        "store":false,
+        "include":["reasoning.encrypted_content"],
+        "background":false,
+        "prompt":null
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200, "budgeted provider fields failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    for field in ["include", "background", "prompt"] {
+        assert_eq!(outbound[field], request[field], "{field} must survive the proxy");
+    }
+}
+
+#[test]
 fn retained_budget_preserves_text_message_array() {
     let response = r#"{"id":"resp_text_array","object":"response","status":"completed","output":[]}"#;
     let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();

@@ -21,14 +21,7 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
     });
     assert!(budgeted_request_supported(request.as_object().unwrap()));
 
-    for key in [
-        "tools",
-        "tool_choice",
-        "prompt",
-        "include",
-        "background",
-        "context_management",
-    ] {
+    for key in ["tools", "tool_choice", "context_management"] {
         request[key] = serde_json::Value::Null;
         assert!(
             !budgeted_request_supported(request.as_object().unwrap()),
@@ -36,6 +29,11 @@ fn budgeted_plain_request_accepts_provider_owned_fields() {
         );
         request.as_object_mut().unwrap().remove(key);
     }
+
+    request["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+    request["background"] = serde_json::Value::Bool(false);
+    request["prompt"] = serde_json::Value::Null;
+    assert!(budgeted_request_supported(request.as_object().unwrap()));
 
     request["conversation"] = serde_json::Value::String("conv_123".to_owned());
     assert!(budgeted_request_supported(request.as_object().unwrap()));
