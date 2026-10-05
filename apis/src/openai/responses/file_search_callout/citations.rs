@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::model_context::{MAX_FILE_ID_BYTES, MAX_FILENAME_BYTES, is_valid_file_id};
 
-/// Maximum marker candidates processed in one output-text part.
+/// Maximum marker candidates processed across one response.
 const MAX_CITATION_MARKERS: usize = 4_096;
 
 /// Maximum existing plus generated annotations processed in one response.
@@ -97,7 +97,7 @@ impl CitationBudget {
 /// valid unknown markers are removed without producing an annotation.
 #[cfg(test)]
 fn extract_citations(text: &str, citation_files: &HashMap<String, String>) -> (String, Vec<Value>) {
-    match extract_citations_bounded(text, citation_files, &mut CitationBudget::default()) {
+    match extract_citations_bounded(text, citation_files, &mut CitationBudget::default(), false) {
         Ok(extraction) => (extraction.cleaned, extraction.annotations),
         Err(_error) => (text.to_owned(), Vec::new()),
     }
@@ -109,6 +109,7 @@ fn extract_citations_bounded(
     text: &str,
     citation_files: &HashMap<String, String>,
     budget: &mut CitationBudget,
+    collect_removals: bool,
 ) -> Result<CitationExtraction, CitationRewriteError> {
     let mut cleaned = String::with_capacity(text.len());
     let mut annotations = Vec::new();
@@ -167,10 +168,12 @@ fn extract_citations_bounded(
         } else {
             marker_start
         };
-        removals.push(RemovedRange {
-            start: removal_start,
-            end: marker_start.saturating_add(marker_chars),
-        });
+        if collect_removals {
+            removals.push(RemovedRange {
+                start: removal_start,
+                end: marker_start.saturating_add(marker_chars),
+            });
+        }
         record_valid_marker(file_id, citation_files, cleaned_chars, &mut annotations, budget)?;
         original_chars = original_chars.saturating_add(prefix_chars).saturating_add(marker_chars);
         remaining = after_marker;
@@ -291,7 +294,11 @@ fn annotate_text_part(
     if !text.contains("<|file-") {
         return Ok(false);
     }
-    let extraction = extract_citations_bounded(text, citation_files, budget)?;
+    let collect_removals = part
+        .get("annotations")
+        .and_then(Value::as_array)
+        .is_some_and(|annotations| !annotations.is_empty());
+    let extraction = extract_citations_bounded(text, citation_files, budget, collect_removals)?;
     if extraction.cleaned == text {
         return Ok(false);
     }
@@ -385,6 +392,33 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    #[expect(clippy::print_stderr, reason = "record fixed-baseline allocation evidence")]
+    fn citation_heavy_rewrite_skips_unused_offset_ranges() {
+        let text = "source <|file-a|>\n".repeat(MAX_CITATION_ANNOTATIONS);
+        let files = HashMap::from([("file-a".to_owned(), "a.txt".to_owned())]);
+        let optimized = || extract_citations_bounded(&text, &files, &mut CitationBudget::default(), false).unwrap();
+        let baseline = || extract_citations_bounded(&text, &files, &mut CitationBudget::default(), true).unwrap();
+        let current = optimized();
+        let previous = baseline();
+        assert_eq!(current.cleaned, previous.cleaned);
+        assert_eq!(current.annotations, previous.annotations);
+        assert!(current.removals.is_empty());
+        assert_eq!(previous.removals.len(), MAX_CITATION_ANNOTATIONS);
+
+        let current_allocations = allocation_counter::measure(|| {
+            std::hint::black_box(optimized());
+        });
+        let previous_allocations = allocation_counter::measure(|| {
+            std::hint::black_box(baseline());
+        });
+        eprintln!(
+            "hosted citation rewrite allocations: optimized={current_allocations:?}, baseline={previous_allocations:?}"
+        );
+        assert!(current_allocations.count_total < previous_allocations.count_total);
+        assert!(current_allocations.bytes_max < previous_allocations.bytes_max);
+    }
 
     #[test]
     fn extracts_provider_compatible_citations() {

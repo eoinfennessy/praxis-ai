@@ -1004,7 +1004,7 @@ pub(crate) fn build_tool_result_messages(
             content
         },
     };
-    let arguments = search_arguments(action).to_string();
+    let arguments = search_arguments(action);
     [
         serde_json::json!({
             "type": "function_call",
@@ -1022,11 +1022,20 @@ pub(crate) fn build_tool_result_messages(
 }
 
 /// Derive the private function arguments from the client-visible action.
-fn search_arguments(action: &Value) -> Value {
-    match action.get("queries") {
-        Some(queries) => serde_json::json!({"queries": queries}),
-        None => serde_json::json!({"query": action.get("query").and_then(Value::as_str).unwrap_or_default()}),
+fn search_arguments(action: &Value) -> String {
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum Arguments<'a> {
+        Queries { queries: &'a Value },
+        Query { query: &'a str },
     }
+    match action.get("queries") {
+        Some(queries) => serde_json::to_string(&Arguments::Queries { queries }),
+        None => serde_json::to_string(&Arguments::Query {
+            query: action.get("query").and_then(Value::as_str).unwrap_or_default(),
+        }),
+    }
+    .unwrap_or_else(|_error| "{}".to_owned())
 }
 
 /// Build the backend-valid continuation for a call missing `action.query`.
