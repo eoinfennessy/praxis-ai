@@ -953,14 +953,14 @@ fn budgeted_stream_event_supported(event: &ResponsesEvent, has_tools: bool) -> b
 /// buffered path would accept.
 ///
 /// Terminal lifecycle events (`response.completed`/`incomplete`/`failed`) are
-/// charged: their payload snapshots the full accumulated output plus usage into
-/// `response_object` and is retained a second time as the deferred terminal, so a
-/// terminal frame that alone exceeds the ceiling (yet still fits
-/// `max_buffer_bytes`) must fail closed like any other accumulator growth. The
-/// per-frame `added`/`done`/terminal charges over-count an item that also streams
-/// the paired envelopes; that is a deliberately conservative, fail-closed-earlier
-/// byte bound. The distinct item-count dimension is enforced separately from the
-/// retained output (see [`accumulation_count_exceeded`]).
+/// charged: their payload can snapshot the full accumulated output plus usage.
+/// The response tree moves into `response_object` while the deferred terminal
+/// keeps only envelope metadata. A terminal frame that alone exceeds the ceiling
+/// (yet still fits `max_buffer_bytes`) must fail closed like any other
+/// accumulator growth. Per-frame `added`/`done`/terminal charges may count one
+/// item more than once. This conservative charge can reject early while bounding
+/// retained state. The distinct item-count limit applies to the retained output
+/// separately (see [`accumulation_count_exceeded`]).
 ///
 /// Runs in phase 1 (parse) so a frame-bounded accumulator's growth aborts the chunk
 /// atomically before [`commit_chunk_events`] mutates shared state.
