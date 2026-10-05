@@ -2792,7 +2792,7 @@ class TestOpenAIResponsesVLLM:
     def test_streamed_append_failure_withholds_committed_terminal(
         self, witness_backend_client
     ):
-        """An append failure after early SSE delivery must abort before completion."""
+        """An append failure after early SSE delivery must abort without storing success."""
         client, _ = witness_backend_client
         conversation = client.conversations.create()
         gate = threading.Event()
@@ -2818,7 +2818,8 @@ class TestOpenAIResponsesVLLM:
             except (APIConnectionError, httpx.RemoteProtocolError, httpx.ReadError):
                 pass
             assert not any(event.type == "response.completed" for event in observed)
-            assert client.responses.retrieve(first.response.id).status == "completed"
+            with pytest.raises(NotFoundError):
+                client.responses.retrieve(first.response.id)
         finally:
             gate.set()
             ResponsesWitnessHandler.terminal_gate = None
@@ -2828,7 +2829,7 @@ class TestOpenAIResponsesVLLM:
     def test_streamed_local_completion_append_failure_withholds_terminal(
         self, witness_backend_client
     ):
-        """A request-side tool-limit completion must append before its SSE terminal."""
+        """A request-side tool-limit completion must append before storage and SSE success."""
         client, _ = witness_backend_client
         conversation = client.conversations.create()
         gate = threading.Event()
@@ -2857,7 +2858,8 @@ class TestOpenAIResponsesVLLM:
             except (APIConnectionError, httpx.RemoteProtocolError, httpx.ReadError):
                 pass
             assert not any(event.type == "response.completed" for event in observed)
-            assert client.responses.retrieve(first.response.id).status == "completed"
+            with pytest.raises(NotFoundError):
+                client.responses.retrieve(first.response.id)
         finally:
             gate.set()
             ResponsesWitnessHandler.terminal_gate = None

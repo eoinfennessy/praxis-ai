@@ -1561,6 +1561,10 @@ impl ConversationItemStore for SqliteResponseStore {
 )]
 impl SqliteResponseStore {
     /// Insert items and rebuild the owner-scoped cache in one transaction.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "parent check and bounded append share one SQLite transaction"
+    )]
     async fn create_items_and_sync_messages_with_limit(
         &self,
         owner: &StateOwner,
