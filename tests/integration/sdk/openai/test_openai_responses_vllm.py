@@ -5352,6 +5352,19 @@ class TestAgenticLoopVLLM:
         stored = agentic_client.responses.retrieve(response.id)
         assert stored.id == response.id, "the bounded response must be retrievable"
 
+    def test_retained_budget_allows_buffered_chat_translation(
+        self, translated_agentic_client
+    ):
+        """A normal SDK create still works through the bounded Chat adapter."""
+        response = translated_agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Reply briefly to this greeting: Hello.",
+            stream=False,
+            store=False,
+        )
+        assert response.status == "completed", response
+        assert response.object == "response", response
+
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,
     ):

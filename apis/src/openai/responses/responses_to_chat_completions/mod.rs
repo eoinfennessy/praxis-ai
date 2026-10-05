@@ -548,9 +548,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             Some(RESPONSE_TRANSFORM_STREAM) => Self::transform_stream_response(ctx, body, end_of_stream),
             Some(_) => {
                 if end_of_stream {
-                    if ctx.get_metadata(RESPONSE_TRANSFORM_KEY) == Some(RESPONSE_TRANSFORM_SUCCESS)
-                        && !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default())
-                    {
+                    if !reserve_finite_chat_response(ctx, body.as_deref().unwrap_or_default()) {
                         *body = None;
                         ctx.set_metadata("responses.skip_persist", "true");
                         return Ok(FilterAction::Reject(responses_error_rejection(

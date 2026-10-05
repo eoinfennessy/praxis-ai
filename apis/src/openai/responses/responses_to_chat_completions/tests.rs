@@ -45,6 +45,34 @@ async fn budgeted_buffered_text_translates_with_shared_request_reservation() {
 }
 
 #[tokio::test]
+async fn budgeted_chat_preserves_high_cardinality_forwarded_parameters() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let extra = (0..100)
+        .map(|index| (format!("key_{index}"), json!({})))
+        .collect::<serde_json::Map<_, _>>();
+    let value = json!({"model":"m","input":"hello","store":false,"extra_body":extra});
+    let wire = serde_json::to_vec(&value).unwrap();
+    let charge = crate::openai::responses::agentic_loop::budget::input_charge(&wire).unwrap();
+    let mut state = ResponsesState::from_request_body(value);
+    state.messages = vec![json!({"role":"user","content":"hello"})];
+    state.simple_budget = SimpleBudget::new_with_store(2_097_152, charge, false);
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from(wire));
+
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
+    let outbound: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(outbound["extra_body"].as_object().unwrap().len(), 100);
+}
+
+#[tokio::test]
 async fn budgeted_chat_request_overflow_rejects_before_dispatch() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
