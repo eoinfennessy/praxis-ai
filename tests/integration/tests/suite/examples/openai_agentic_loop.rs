@@ -68,6 +68,27 @@ fn single_pass_completes_through_irr() {
 }
 
 #[test]
+fn retained_budget_allows_model_alias_before_validation() {
+    let response = r#"{"id":"resp_model_alias","object":"response","status":"completed","output":[]}"#;
+    let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
+    let config = load_agentic_config_with_model_rewrite(free_port(), model.port());
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"client-alias","input":"Hello","store":false}"#,
+        ),
+    );
+    assert_eq!(parse_status(&raw), 200, "budgeted alias request failed: {raw}");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 1);
+    let outbound: serde_json::Value = serde_json::from_str(&requests[0].body).expect("provider request JSON");
+    assert_eq!(outbound["model"], "gpt-4.1");
+}
+
+#[test]
 fn retained_budget_persists_default_store_plain_response() {
     let response = r#"{"id":"resp_stored_plain","object":"response","created_at":1760000000,"model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_stored_plain","content":[{"type":"output_text","text":"Hello"}]}]}"#;
     let model = StatefulCapturingBackend::new(vec![(200, response.to_owned())]).start_with_shutdown();
@@ -7555,6 +7576,20 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config")
+}
+
+fn load_agentic_config_with_model_rewrite(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "      - filter: openai_responses_validate",
+        "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"client-alias\": \"gpt-4.1\"\n\n      - filter: openai_responses_validate",
+        1,
+    );
+    assert_ne!(yaml, original, "expected model rewrite before validation");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config with model rewrite")
 }
 
 fn load_agentic_config_with_budget(

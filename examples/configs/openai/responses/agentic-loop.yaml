@@ -171,6 +171,9 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
+      # If client model aliases are needed, place
+      # openai_responses_model_rewrite here, before validation. Its parsed
+      # body and replacement model are charged to max_retained_bytes.
       - filter: openai_responses_validate
 
       - filter: openai_tool_parse
