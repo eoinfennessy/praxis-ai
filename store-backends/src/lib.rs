@@ -43,6 +43,10 @@ pub(crate) use praxis_ai_store::SslMode;
 /// JSON can expand far beyond its wire length across row decoding, parsed
 /// values, the serialized cache, and SQL argument copies.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
+const CONVERSATION_REBUILD_MULTIPLIER: usize = 512;
+
+/// Check the complete cache projection against the caller's memory allowance.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 fn conversation_rebuild_fits(raw_bytes: i64, row_count: i64, max_bytes: usize) -> bool {
     let Ok(raw_bytes) = usize::try_from(raw_bytes) else {
         return false;
@@ -51,7 +55,7 @@ fn conversation_rebuild_fits(raw_bytes: i64, row_count: i64, max_bytes: usize) -
         return false;
     };
     raw_bytes
-        .checked_mul(512)
+        .checked_mul(CONVERSATION_REBUILD_MULTIPLIER)
         .and_then(|bytes| bytes.checked_add(row_count.checked_mul(4)?))
         .and_then(|bytes| bytes.checked_add(4))
         .is_some_and(|bytes| bytes <= max_bytes)

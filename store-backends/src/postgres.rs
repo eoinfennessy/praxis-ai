@@ -1885,9 +1885,10 @@ async fn pg_rebuild_messages(
              FROM measured LEFT JOIN LATERAL (\
                SELECT item_data, position, item_id FROM {items_table} \
                WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4 \
-                 AND (measured.raw_bytes::numeric * 26 + measured.row_count::numeric * 4 + 4) <= $5::text::numeric\
+                 AND (measured.raw_bytes::numeric * {} + measured.row_count::numeric * 4 + 4) <= $5::text::numeric\
              ) AS selected ON true \
-             ORDER BY selected.position ASC NULLS LAST, selected.item_id ASC NULLS LAST"
+             ORDER BY selected.position ASC NULLS LAST, selected.item_id ASC NULLS LAST",
+            super::CONVERSATION_REBUILD_MULTIPLIER
         );
         let sql_limit = max_rebuild_bytes.to_string();
         let rows = sqlx::query(AssertSqlSafe(bounded_sql.as_str()))

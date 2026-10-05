@@ -18,6 +18,7 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
@@ -591,6 +592,10 @@ impl HttpFilter for OpenaiConversationsFilter {
             return Ok(FilterAction::Continue);
         };
 
+        if !budgeted_response_is_completed(ctx, body) {
+            return Ok(FilterAction::Continue);
+        }
+
         let max_rebuild_bytes = match reserve_budgeted_append(ctx, body) {
             Ok(limit) => limit,
             Err(action) => return Ok(action),
@@ -657,6 +662,21 @@ fn contains_completed_terminal(body: &Option<Bytes>) -> bool {
     const EVENT_HEADER: &[u8] = b"event: response.completed\n";
     body.as_deref()
         .is_some_and(|chunk| chunk.windows(EVENT_HEADER.len()).any(|window| window == EVENT_HEADER))
+}
+
+/// Inspect only the response status before charging append-only owners. Serde
+/// skips other fields without materializing the provider's output tree.
+fn budgeted_response_is_completed(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> bool {
+    #[derive(Deserialize)]
+    struct Status {
+        status: Option<String>,
+    }
+    if ctx.extensions.get::<AgenticBudgetPolicy>().is_none() {
+        return true;
+    }
+    body.as_deref()
+        .and_then(|bytes| serde_json::from_slice::<Status>(bytes).ok())
+        .is_some_and(|response| response.status.as_deref() == Some("completed"))
 }
 
 /// Reserve the response-side item copies and the complete transactional cache
