@@ -994,6 +994,7 @@ impl McpSubrequestClient {
         body: Bytes,
         headers: HeaderMap,
         max_response_bytes: usize,
+        max_chunk_bytes: usize,
         signal: &Arc<OnceLock<TransportSignal>>,
     ) -> Result<(SubResponse, Option<Box<dyn StreamingResponseBody>>), StreamableHttpError<McpTransportError>> {
         let (executor, request, mut extensions, deadline) = self
@@ -1004,7 +1005,16 @@ impl McpSubrequestClient {
             .await
             .map_err(|_error| StreamableHttpError::Client(McpTransportError::Transport))?;
         match outcome {
-            CalloutOutcome::Response(CalloutResponse::Streaming { response, body }) => Ok((response, Some(body))),
+            CalloutOutcome::Response(CalloutResponse::Streaming { response, mut body }) => {
+                // The executor's cumulative backstop is deliberately looser than
+                // the adapter's limit. Keep one oversized chunk out of the adapter
+                // before it can be retained or parsed.
+                if !body.try_cap_chunk_bytes(max_chunk_bytes) {
+                    body.cancel().await;
+                    return Err(StreamableHttpError::Client(McpTransportError::Transport));
+                }
+                Ok((response, Some(body)))
+            },
             CalloutOutcome::Response(CalloutResponse::Buffered(response)) => Ok((response, None)),
             CalloutOutcome::ResponseTooLarge { actual, limit } => {
                 tracing::debug!(actual = ?actual, limit, "mcp streaming callout response exceeded size limit");
@@ -1252,6 +1262,9 @@ impl StreamableHttpClient for McpSubrequestClient {
                 Bytes::new(),
                 headers,
                 streaming_executor_backstop(self.stream_cumulative_cap()),
+                // One chunk can contain several valid SSE events, so the
+                // per-event wire cap would reject valid GET streams here.
+                self.stream_cumulative_cap(),
                 &signal,
             )
             .await?;
@@ -1301,6 +1314,7 @@ impl StreamableHttpClient for McpSubrequestClient {
                 Bytes::from(body),
                 headers,
                 streaming_executor_backstop(max_response_bytes),
+                max_response_bytes,
                 &signal,
             )
             .await?;

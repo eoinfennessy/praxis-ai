@@ -21,7 +21,7 @@
 use std::sync::{Arc, OnceLock};
 
 use futures::stream::{BoxStream, StreamExt as _};
-use praxis_filter::StreamingResponseBody;
+use praxis_filter::{CalloutResponseTooLarge, StreamingResponseBody};
 use sse_stream::{Error as SseError, Sse, SseStream};
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
@@ -71,6 +71,11 @@ pub(super) enum SseByteStreamError {
         /// The per-event ceiling that was exceeded.
         max_size: usize,
     },
+    /// Core withheld a chunk that exceeded the configured byte ceiling.
+    ChunkTooLarge {
+        /// The byte ceiling that was exceeded.
+        limit: usize,
+    },
     /// The underlying subrequest body errored mid-stream.
     Upstream,
 }
@@ -80,6 +85,7 @@ impl std::fmt::Display for SseByteStreamError {
         match self {
             Self::Ceiling { limit } => write!(f, "mcp sse stream exceeded the {limit}-byte ceiling"),
             Self::EventTooLarge { max_size } => write!(f, "mcp sse event exceeded the {max_size}-byte limit"),
+            Self::ChunkTooLarge { limit } => write!(f, "mcp sse chunk exceeded the {limit}-byte limit"),
             Self::Upstream => write!(f, "mcp sse upstream body error"),
         }
     }
@@ -269,7 +275,14 @@ pub(super) fn sse_stream_from_body_with_budget(
                     return Ok(Some((chunk, st)));
                 },
                 Ok(None) => return Ok(None),
-                Err(_error) => return Err(SseByteStreamError::Upstream),
+                Err(error) => {
+                    if let Some(overflow) = error.downcast_ref::<CalloutResponseTooLarge>() {
+                        let limit = overflow.limit;
+                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
+                        return Err(SseByteStreamError::ChunkTooLarge { limit });
+                    }
+                    return Err(SseByteStreamError::Upstream);
+                },
             }
         }
     });
@@ -373,6 +386,21 @@ mod tests {
 
     use super::{FakeStreamingBody, sse_stream_from_body};
     use crate::mcp_client::subrequest_transport::TransportSignal;
+
+    struct OversizedCalloutChunk;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::StreamingResponseBody for OversizedCalloutChunk {
+        async fn next_chunk(&mut self) -> Result<Option<Bytes>, praxis_filter::FilterError> {
+            Err(Box::new(praxis_filter::CalloutResponseTooLarge { limit: 4 }))
+        }
+
+        async fn suppress(&mut self) -> Result<(), praxis_filter::FilterError> {
+            Ok(())
+        }
+
+        async fn cancel(&mut self) {}
+    }
 
     fn cancelled_flag() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
@@ -481,5 +509,23 @@ mod tests {
         }
         assert!(saw_err, "an upstream body error must surface");
         assert!(signal.get().is_none(), "a transport error is not a size breach");
+    }
+
+    #[tokio::test]
+    async fn core_chunk_ceiling_error_records_size_signal() {
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(
+            Box::new(OversizedCalloutChunk),
+            4,
+            4,
+            16 * 1024 * 1024,
+            Arc::clone(&signal).into(),
+        );
+
+        assert!(stream.next().await.expect("stream error").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 4 })
+        ));
     }
 }
