@@ -71,11 +71,6 @@ pub(super) enum SseByteStreamError {
         /// The per-event ceiling that was exceeded.
         max_size: usize,
     },
-    /// Core withheld a chunk that exceeded the configured byte ceiling.
-    ChunkTooLarge {
-        /// The byte ceiling that was exceeded.
-        limit: usize,
-    },
     /// The underlying subrequest body errored mid-stream.
     Upstream,
 }
@@ -85,7 +80,6 @@ impl std::fmt::Display for SseByteStreamError {
         match self {
             Self::Ceiling { limit } => write!(f, "mcp sse stream exceeded the {limit}-byte ceiling"),
             Self::EventTooLarge { max_size } => write!(f, "mcp sse event exceeded the {max_size}-byte limit"),
-            Self::ChunkTooLarge { limit } => write!(f, "mcp sse chunk exceeded the {limit}-byte limit"),
             Self::Upstream => write!(f, "mcp sse upstream body error"),
         }
     }
@@ -256,18 +250,24 @@ pub(super) fn sse_stream_from_body_with_budget(
         loop {
             match st.body.next_chunk().await {
                 Ok(Some(chunk)) => {
+                    // Reject before scanning the chunk for SSE lines. A single
+                    // network chunk may contain several valid small events, so
+                    // only the cumulative ceiling applies to its raw length.
+                    let Some(total) = st
+                        .emitted
+                        .checked_add(chunk.len())
+                        .filter(|total| *total <= st.operation_cap)
+                    else {
+                        let limit = st.operation_cap;
+                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
+                        return Err(SseByteStreamError::Ceiling { limit });
+                    };
+                    st.emitted = total;
                     // Per-event (per-message) ceiling, before parsing.
                     if st.per_event.observe(&chunk).is_err() {
                         let limit = st.per_event.max_size;
                         st.signal.record(TransportSignal::ResponseTooLarge { limit });
                         return Err(SseByteStreamError::EventTooLarge { max_size: limit });
-                    }
-                    // Cumulative operation-stream ceiling.
-                    st.emitted = st.emitted.saturating_add(chunk.len());
-                    if st.emitted > st.operation_cap {
-                        let limit = st.operation_cap;
-                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
-                        return Err(SseByteStreamError::Ceiling { limit });
                     }
                     if chunk.is_empty() {
                         continue; // keep pulling; never yield an empty frame
@@ -279,7 +279,7 @@ pub(super) fn sse_stream_from_body_with_budget(
                     if let Some(overflow) = error.downcast_ref::<CalloutResponseTooLarge>() {
                         let limit = overflow.limit;
                         st.signal.record(TransportSignal::ResponseTooLarge { limit });
-                        return Err(SseByteStreamError::ChunkTooLarge { limit });
+                        return Err(SseByteStreamError::Ceiling { limit });
                     }
                     return Err(SseByteStreamError::Upstream);
                 },
@@ -387,10 +387,10 @@ mod tests {
     use super::{FakeStreamingBody, sse_stream_from_body};
     use crate::mcp_client::subrequest_transport::TransportSignal;
 
-    struct OversizedCalloutChunk;
+    struct OversizedCalloutStream;
 
     #[async_trait::async_trait]
-    impl praxis_filter::StreamingResponseBody for OversizedCalloutChunk {
+    impl praxis_filter::StreamingResponseBody for OversizedCalloutStream {
         async fn next_chunk(&mut self) -> Result<Option<Bytes>, praxis_filter::FilterError> {
             Err(Box::new(praxis_filter::CalloutResponseTooLarge { limit: 4 }))
         }
@@ -444,6 +444,22 @@ mod tests {
             matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 4 })),
             "cumulative breach records a 413 signal at the operation cap"
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_chunk_hits_cumulative_cap_before_event_scan() {
+        let body = Box::new(FakeStreamingBody::from_chunks(
+            [Bytes::from_static(b"data: aaaaaaaaaaaaa\n\n")],
+            cancelled_flag(),
+        ));
+        let signal = Arc::new(OnceLock::new());
+        let mut stream = sse_stream_from_body(body, 8, 12, 16 * 1024 * 1024, Arc::clone(&signal).into());
+
+        assert!(stream.next().await.expect("stream error").is_err());
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 12 })
+        ));
     }
 
     #[tokio::test]
@@ -512,10 +528,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_chunk_ceiling_error_records_size_signal() {
+    async fn core_stream_ceiling_error_records_size_signal() {
         let signal = Arc::new(OnceLock::new());
         let mut stream = sse_stream_from_body(
-            Box::new(OversizedCalloutChunk),
+            Box::new(OversizedCalloutStream),
             4,
             4,
             16 * 1024 * 1024,

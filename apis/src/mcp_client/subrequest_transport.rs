@@ -994,7 +994,6 @@ impl McpSubrequestClient {
         body: Bytes,
         headers: HeaderMap,
         max_response_bytes: usize,
-        max_chunk_bytes: usize,
         signal: &Arc<OnceLock<TransportSignal>>,
     ) -> Result<(SubResponse, Option<Box<dyn StreamingResponseBody>>), StreamableHttpError<McpTransportError>> {
         let (executor, request, mut extensions, deadline) = self
@@ -1005,16 +1004,7 @@ impl McpSubrequestClient {
             .await
             .map_err(|_error| StreamableHttpError::Client(McpTransportError::Transport))?;
         match outcome {
-            CalloutOutcome::Response(CalloutResponse::Streaming { response, mut body }) => {
-                // The executor's cumulative backstop is deliberately looser than
-                // the adapter's limit. Keep one oversized chunk out of the adapter
-                // before it can be retained or parsed.
-                if !body.try_cap_chunk_bytes(max_chunk_bytes) {
-                    body.cancel().await;
-                    return Err(StreamableHttpError::Client(McpTransportError::Transport));
-                }
-                Ok((response, Some(body)))
-            },
+            CalloutOutcome::Response(CalloutResponse::Streaming { response, body }) => Ok((response, Some(body))),
             CalloutOutcome::Response(CalloutResponse::Buffered(response)) => Ok((response, None)),
             CalloutOutcome::ResponseTooLarge { actual, limit } => {
                 tracing::debug!(actual = ?actual, limit, "mcp streaming callout response exceeded size limit");
@@ -1262,9 +1252,6 @@ impl StreamableHttpClient for McpSubrequestClient {
                 Bytes::new(),
                 headers,
                 streaming_executor_backstop(self.stream_cumulative_cap()),
-                // One chunk can contain several valid SSE events, so the
-                // per-event wire cap would reject valid GET streams here.
-                self.stream_cumulative_cap(),
                 &signal,
             )
             .await?;
@@ -1314,7 +1301,6 @@ impl StreamableHttpClient for McpSubrequestClient {
                 Bytes::from(body),
                 headers,
                 streaming_executor_backstop(max_response_bytes),
-                max_response_bytes,
                 &signal,
             )
             .await?;
@@ -1469,7 +1455,8 @@ async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
 /// Collect a streaming body into a single `Bytes` buffer, failing closed.
 ///
 /// Accumulates chunks into one bounded [`bytes::BytesMut`] and enforces a local
-/// byte `cap`. On overflow (`buf.len() > cap`) the size signal is recorded into
+/// byte `cap`. A chunk that would exceed it is rejected before being copied.
+/// On overflow the size signal is recorded into
 /// `signal` (first wins) so the typed 413 survives rmcp's opaque error mapping,
 /// the body is cancelled, and a typed [`McpTransportError::ResponseTooLarge`] is
 /// returned — never the truncated buffer.
@@ -1491,12 +1478,12 @@ async fn collect_body(
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > cap {
+                if buf.len().checked_add(chunk.len()).is_none_or(|total| total > cap) {
                     signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
                     body.cancel().await;
                     return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
                 }
+                buf.extend_from_slice(&chunk);
             },
             Ok(None) => {
                 body.cancel().await;
@@ -1522,7 +1509,7 @@ async fn collect_body(
 /// Distinct from [`collect_body`] on purpose: on the error path an oversize or
 /// truncated body must NOT surface as a 413. This helper takes no signal handle —
 /// so it structurally cannot record [`TransportSignal::ResponseTooLarge`] — and
-/// returns [`None`] on overflow (`buf.len() > cap`) or a `next_chunk()` error,
+/// returns [`None`] before copying an overflowing chunk or on a `next_chunk()` error,
 /// letting the caller fall back to the true HTTP status. The body is cancelled in
 /// every case; a clean EOF within `cap` returns `Some(bytes)`.
 async fn collect_capped(body: &mut Box<dyn StreamingResponseBody>, cap: usize) -> Option<Bytes> {
@@ -1530,11 +1517,11 @@ async fn collect_capped(body: &mut Box<dyn StreamingResponseBody>, cap: usize) -
     loop {
         match body.next_chunk().await {
             Ok(Some(chunk)) => {
-                buf.extend_from_slice(&chunk);
-                if buf.len() > cap {
+                if buf.len().checked_add(chunk.len()).is_none_or(|total| total > cap) {
                     body.cancel().await;
                     return None;
                 }
+                buf.extend_from_slice(&chunk);
             },
             Ok(None) => {
                 body.cancel().await;
