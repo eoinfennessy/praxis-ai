@@ -41,6 +41,8 @@ pub use files::routes::{FilesOperation, FilesOperationSpec, operation_specs as f
 pub use operation::OpenAiOperationSpec;
 #[cfg(feature = "openai-agentic-loop")]
 pub use responses::AgenticLoopFilter;
+#[cfg(feature = "openai-responses")]
+pub use responses::AgenticBudgetPolicy;
 #[cfg(feature = "openai-compact")]
 pub use responses::CompactFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
