@@ -28,8 +28,23 @@ const STREAM_PEAK_WIRE_MULTIPLIER: usize = 16;
 const STREAM_FRAME_NODE_RESERVE: usize = 512;
 /// Store builds another response-object projection from parsed terminal state.
 const STREAM_STORE_FRAME_NODE_RESERVE: usize = 256;
+/// Parsed output items a completed round leaves live in `accumulated_output` and
+/// the replayed message history. Measured on the serialized items, so it covers
+/// the accumulator copy, the next round's history copy, and their `serde_json`
+/// expansion. Smaller than the round-local provider charge so releasing a round
+/// nets headroom back while the kept output still accumulates across rounds.
+const RETAINED_OUTPUT_MULTIPLIER: usize = 32;
+/// Store keeps one more persisted projection of that retained output.
+const RETAINED_STORE_OUTPUT_MULTIPLIER: usize = 16;
 
 /// Request-scoped charge that survives every inference round.
+///
+/// The ledger separates two lifetimes. **Retained** owners live for the whole
+/// request and accumulate across rounds: the request body, restored history,
+/// tool results, and the output items kept in `accumulated_output`. **Round-local**
+/// owners exist only while one inference round is parsed — the buffered provider
+/// body, raw SSE transport, and parsed frame nodes — and are released at the
+/// round boundary once their payload has been reduced to retained state.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SimpleBudget {
     /// The smallest configured limit of every reachable loop instance.
@@ -40,13 +55,15 @@ pub(crate) struct SimpleBudget {
     additional_input_charge: usize,
     /// Additional allowance for the response Store's request input snapshot.
     store_input_charge: usize,
-    /// Conservative sum of provider payload charges from all rounds.
+    /// Retained output kept across rounds: items held in `accumulated_output` and
+    /// the replayed history, plus the terminal response projection. Grows as each
+    /// round's surviving output is retained; it is never released.
     output_charge: usize,
-    /// Cumulative raw SSE transport charged without retaining transient nodes
-    /// from every already-parsed event.
-    stream_wire_charge: usize,
-    /// Parsed frame structure retained in response state and terminal copies.
-    stream_frame_node_charge: usize,
+    /// The current round's transient provider representations: the buffered
+    /// response body, raw SSE transport, and parsed frame nodes. Their owners are
+    /// dropped when the round completes, so this is released at the round boundary
+    /// by [`SimpleBudget::retain_round_output`] instead of accumulating.
+    round_local_charge: usize,
     /// Separate allowance for Store's persisted response and history copies.
     store_output_charge: usize,
     /// Whether Store persists this create response and owns another output projection.
@@ -97,8 +114,7 @@ impl SimpleBudget {
             additional_input_charge: 0,
             store_input_charge,
             output_charge: 0,
-            stream_wire_charge: 0,
-            stream_frame_node_charge: 0,
+            round_local_charge: 0,
             store_output_charge: 0,
             store_response,
             irr_response,
@@ -156,36 +172,31 @@ impl SimpleBudget {
         self.reserve_additional_input(charge)
     }
 
-    /// Preflight one more provider chunk before any response parser sees it.
+    /// Preflight one buffered provider response before any response parser sees
+    /// it. The raw body, its parse scratch, and the per-round Store projection are
+    /// dropped once the round is reduced to retained state, so the charge is
+    /// round-local and released at the round boundary by
+    /// [`SimpleBudget::retain_round_output`].
     pub(crate) fn admit_output(&mut self, bytes: &[u8]) -> bool {
         let Some(additional) = output_charge(bytes) else {
             return false;
         };
-        let Some(next_output) = self.output_charge.checked_add(additional) else {
+        let Some(round_delta) = additional.checked_add(if self.store_response { additional } else { 0 }) else {
             return false;
         };
-        let Some(next_store) = self
-            .store_output_charge
-            .checked_add(if self.store_response { additional } else { 0 })
-        else {
+        let Some(next_round_local) = self.round_local_charge.checked_add(round_delta) else {
             return false;
         };
-        let Some(total) = next_output
-            .checked_add(self.stream_wire_charge)
-            .and_then(|charge| charge.checked_add(self.stream_frame_node_charge))
-            .and_then(|charge| charge.checked_add(next_store))
-            .and_then(|charge| charge.checked_add(self.input_charge))
-            .and_then(|charge| charge.checked_add(self.additional_input_charge))
-            .and_then(|charge| charge.checked_add(self.store_input_charge))
-            .and_then(|charge| charge.checked_add(self.transport_reserve()?))
+        let Some(total) = self
+            .retained_charge()
+            .and_then(|charge| charge.checked_add(next_round_local))
         else {
             return false;
         };
         if total > self.limit {
             return false;
         }
-        self.output_charge = next_output;
-        self.store_output_charge = next_store;
+        self.round_local_charge = next_round_local;
         true
     }
 
@@ -210,9 +221,6 @@ impl SimpleBudget {
         let Some(wire_delta) = bytes.len().checked_mul(STREAM_WIRE_MULTIPLIER) else {
             return false;
         };
-        let Some(next_wire) = self.stream_wire_charge.checked_add(wire_delta) else {
-            return false;
-        };
         let Some(store_delta) = bytes.len().checked_mul(if self.store_response {
             STREAM_STORE_WIRE_MULTIPLIER
         } else {
@@ -220,13 +228,19 @@ impl SimpleBudget {
         }) else {
             return false;
         };
-        let Some(next_store) = self.store_output_charge.checked_add(store_delta) else {
+        // The raw transport chunk and its per-round Store replay projection are
+        // round-local; the parser and event wire copies live only through this
+        // chunk, so their reserve is checked as a transient peak on top.
+        let Some(next_round_local) = self
+            .round_local_charge
+            .checked_add(wire_delta)
+            .and_then(|charge| charge.checked_add(store_delta))
+        else {
             return false;
         };
         let Some(total) = self
-            .charge()
-            .and_then(|charge| charge.checked_add(wire_delta))
-            .and_then(|charge| charge.checked_add(store_delta))
+            .retained_charge()
+            .and_then(|charge| charge.checked_add(next_round_local))
             .and_then(|charge| charge.checked_add(peak))
         else {
             return false;
@@ -234,8 +248,7 @@ impl SimpleBudget {
         if total > self.limit {
             return false;
         }
-        self.stream_wire_charge = next_wire;
-        self.store_output_charge = next_store;
+        self.round_local_charge = next_round_local;
         true
     }
 
@@ -256,17 +269,19 @@ impl SimpleBudget {
         let Some(delta) = nodes.checked_mul(per_node) else {
             return false;
         };
-        let Some(next) = self.stream_frame_node_charge.checked_add(delta) else {
+        // Parsed frame nodes are reduced to retained output items at the round
+        // boundary, so they are charged round-local here.
+        let Some(next_round_local) = self.round_local_charge.checked_add(delta) else {
             return false;
         };
         if self
-            .charge()
-            .and_then(|charge| charge.checked_add(delta))
+            .retained_charge()
+            .and_then(|charge| charge.checked_add(next_round_local))
             .is_none_or(|total| total > self.limit)
         {
             return false;
         }
-        self.stream_frame_node_charge = next;
+        self.round_local_charge = next_round_local;
         true
     }
 
@@ -300,11 +315,58 @@ impl SimpleBudget {
         true
     }
 
-    /// Return the current charge including any IRR transport reserve.
+    /// Retain a completed round's surviving output and release its round-local
+    /// provider representations.
+    ///
+    /// `output_bytes` is the serialized size of the items the round appended to
+    /// `accumulated_output`; those stay live in the accumulator and the replayed
+    /// history, so they move into the retained ledger. The buffered body, raw SSE
+    /// transport, and parsed frame nodes that produced them are now dropped, so
+    /// the round-local charge is released. A later round reuses that headroom
+    /// while the retained output still accumulates toward the limit.
+    ///
+    /// Returns `false` on arithmetic overflow or if the accumulated retained
+    /// output no longer fits the limit — the caller treats that as exhaustion.
+    /// The ledger is left unchanged on failure.
+    pub(crate) fn retain_round_output(&mut self, output_bytes: usize) -> bool {
+        let Some(retained) = output_bytes.checked_mul(RETAINED_OUTPUT_MULTIPLIER) else {
+            return false;
+        };
+        let Some(store_retained) = output_bytes.checked_mul(if self.store_response {
+            RETAINED_STORE_OUTPUT_MULTIPLIER
+        } else {
+            0
+        }) else {
+            return false;
+        };
+        let Some(next_output) = self.output_charge.checked_add(retained) else {
+            return false;
+        };
+        let Some(next_store) = self.store_output_charge.checked_add(store_retained) else {
+            return false;
+        };
+        let candidate = Self {
+            output_charge: next_output,
+            store_output_charge: next_store,
+            round_local_charge: 0,
+            ..*self
+        };
+        if candidate.charge().is_none_or(|total| total > self.limit) {
+            return false;
+        }
+        *self = candidate;
+        true
+    }
+
+    /// Return the current charge including the live round-local reserve.
     fn charge(self) -> Option<usize> {
+        self.retained_charge()?.checked_add(self.round_local_charge)
+    }
+
+    /// Return the request-wide retained charge, excluding the round-local reserve
+    /// that `retain_round_output` releases at each round boundary.
+    fn retained_charge(self) -> Option<usize> {
         self.output_charge
-            .checked_add(self.stream_wire_charge)?
-            .checked_add(self.stream_frame_node_charge)?
             .checked_add(self.store_output_charge)?
             .checked_add(self.input_charge)?
             .checked_add(self.additional_input_charge)?
@@ -593,5 +655,125 @@ mod tests {
         let mut budget = SimpleBudget::new(67_108_864, 2_272).unwrap();
         assert!(body.len() * OUTPUT_WIRE_MULTIPLIER < budget.limit);
         assert!(!budget.admit_output(body.as_bytes()));
+    }
+
+    #[test]
+    fn released_buffered_round_reuses_headroom() {
+        // Each round admits a large provider body, then retains only the small
+        // output that survives into `accumulated_output` and releases the body
+        // charge. Ten modest rounds must all admit because the body is reclaimed.
+        let limit = 8_388_608;
+        let body = vec![b'x'; 40 * 1024];
+        let mut budget = SimpleBudget::new(limit, 1_000).unwrap();
+        for _ in 0..10 {
+            assert!(budget.admit_output(&body), "round body admits");
+            assert!(budget.retain_round_output(1_024), "round retained and released");
+        }
+        assert!(budget.remaining_bytes().unwrap() > 0, "released rounds leave headroom");
+
+        // Without the release, the accumulated per-round body charges exhaust the
+        // same budget well before ten rounds.
+        let mut no_release = SimpleBudget::new(limit, 1_000).unwrap();
+        let admitted = (0..10).take_while(|_| no_release.admit_output(&body)).count();
+        assert!(admitted < 10, "accumulating every round's body exhausts the budget");
+    }
+
+    #[test]
+    fn released_streaming_round_reuses_headroom() {
+        // The streaming analogue: raw SSE transport and parsed frames are
+        // round-local and reclaimed each round once the output is retained.
+        let limit = 8_388_608;
+        let chunk = vec![b'x'; 32 * 1024];
+        let mut budget = SimpleBudget::new(limit, 1_000).unwrap();
+        for _ in 0..10 {
+            assert!(budget.admit_stream_chunk(&chunk), "chunk admits");
+            assert!(budget.admit_stream_frame(br#"{"delta":"x"}"#), "frame admits");
+            assert!(budget.retain_round_output(1_024), "round retained and released");
+        }
+        assert!(
+            budget.remaining_bytes().unwrap() > 0,
+            "released stream rounds leave headroom"
+        );
+    }
+
+    #[test]
+    fn retained_output_accumulates_to_ceiling() {
+        // Retained output is never released, so repeated rounds that keep real
+        // output eventually exhaust the budget even though each body is reclaimed.
+        let limit = 2_097_152;
+        let body = vec![b'x'; 8 * 1024];
+        let mut budget = SimpleBudget::new(limit, 1_000).unwrap();
+        let mut rounds = 0;
+        while rounds <= 1_000 {
+            if !budget.admit_output(&body) || !budget.retain_round_output(8 * 1024) {
+                break;
+            }
+            rounds += 1;
+        }
+        assert!(rounds > 0, "some rounds admit");
+        assert!(rounds <= 1_000, "retained output eventually hits the ceiling");
+    }
+
+    #[test]
+    fn store_round_reuses_headroom_and_retains_both_projections() {
+        // Store doubles both the round-local body charge and the retained output,
+        // so headroom reuse still holds and the stored projection accumulates.
+        let limit = 16_777_216;
+        let body = vec![b'x'; 40 * 1024];
+        let mut stored = SimpleBudget::new_with_store(limit, 1_000, true).unwrap();
+        let mut plain = SimpleBudget::new_with_store(limit, 1_000, false).unwrap();
+        for _ in 0..8 {
+            assert!(stored.admit_output(&body) && stored.retain_round_output(1_024));
+            assert!(plain.admit_output(&body) && plain.retain_round_output(1_024));
+        }
+        assert!(
+            stored.remaining_bytes().unwrap() < plain.remaining_bytes().unwrap(),
+            "the stored projection accumulates additional retained output"
+        );
+    }
+
+    #[test]
+    fn aborted_round_keeps_round_local_until_retained() {
+        // A round that never reaches the retain boundary (aborted or terminal)
+        // keeps its round-local charge; only an explicit retain releases it, so the
+        // ledger never silently drops a still-live owner.
+        let mut budget = SimpleBudget::new(8_388_608, 1_000).unwrap();
+        let body = vec![b'x'; 16 * 1024];
+        assert!(budget.admit_output(&body));
+        let during_round = budget.remaining_bytes().unwrap();
+        assert_eq!(budget.remaining_bytes().unwrap(), during_round, "no implicit release");
+        assert!(budget.retain_round_output(1_024));
+        assert!(
+            budget.remaining_bytes().unwrap() > during_round,
+            "retaining the round releases the round-local body charge"
+        );
+    }
+
+    #[test]
+    fn lower_limit_sees_retained_and_round_local_charges() {
+        let body = vec![b'x'; 16 * 1024];
+        // Mid-round, the live charge a later loop instance checks includes the
+        // round-local provider body. (`lower_limit` mutates the limit even when it
+        // rejects, so each case uses a fresh ledger.)
+        let mut mid_round = SimpleBudget::new(8_388_608, 1_000).unwrap();
+        assert!(mid_round.admit_output(&body));
+        assert!(mid_round.lower_limit(8_388_608), "the same limit still fits");
+
+        let mut mid_round_reject = SimpleBudget::new(8_388_608, 1_000).unwrap();
+        assert!(mid_round_reject.admit_output(&body));
+        assert!(
+            !mid_round_reject.lower_limit(1_000),
+            "a limit below the live round-local charge is rejected"
+        );
+
+        // After the round is retained, the round-local body is released, but the
+        // retained output still exceeds a tiny limit.
+        let mut retained = SimpleBudget::new(8_388_608, 1_000).unwrap();
+        assert!(retained.admit_output(&body));
+        assert!(retained.retain_round_output(16 * 1024));
+        assert!(
+            !retained.lower_limit(1_000),
+            "retained output still exceeds a tiny limit"
+        );
     }
 }

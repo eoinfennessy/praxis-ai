@@ -3386,6 +3386,106 @@ const EXPECTED_OUTPUT_TYPES: [&str; 6] = [
 const FINAL_TEXT: &str = "SF is 72F and it is 3pm PST.";
 
 #[test]
+fn retained_budget_reuses_released_round_body_headroom() {
+    // Each tool round returns a large round-local provider body: a top-level
+    // `filler` field the loop parses and drops, so only the small `function_call`
+    // survives into `accumulated_output`. The round body is charged before the
+    // parse (~16 KiB -> ~1 MiB under the output multiplier), then released once the
+    // round is retained. Four such rounds complete under a budget that accumulating
+    // every round's body charge would exceed by the second round, demonstrating
+    // that released round-local headroom is reused while retained output does not
+    // reset.
+    let filler = "x".repeat(16 * 1024);
+    let tool_round = |id: &str, tool: &str, arguments: &str| {
+        serde_json::json!({
+            "id": format!("resp_{id}"),
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": format!("fc_{id}"),
+                "call_id": id,
+                "name": format!("weather__{tool}"),
+                "arguments": arguments,
+                "status": "completed"
+            }],
+            // Round-local only: parsed and dropped, never retained in output.
+            "filler": filler,
+        })
+        .to_string()
+    };
+    let final_response = serde_json::json!({
+        "id": "resp_final",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}]
+        }],
+        "filler": filler,
+    })
+    .to_string();
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, tool_round("call_1", "get_weather", r#"{"location":"SF"}"#)),
+        (200, tool_round("call_2", "get_time", r#"{"timezone":"PST"}"#)),
+        (200, tool_round("call_3", "get_weather", r#"{"location":"NY"}"#)),
+        (200, final_response),
+    ])
+    .start_with_shutdown();
+
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(object_schema("location")),
+            McpToolFixture::new("get_time")
+                .with_description("Get the current time for a timezone")
+                .with_input_schema(object_schema("timezone")),
+        ],
+        ..McpMockConfig::default()
+    });
+
+    // One round's ~16 KiB body fits under this limit with the transport reserve,
+    // but four accumulated body charges (~4 MiB) would not. `store: false` keeps
+    // the comparison to the loop's own output accounting.
+    let budget = 3_145_728; // 3 MiB
+    let proxy_port = free_port();
+    let config = load_loopback_mcp_config_with_budget(proxy_port, model.port(), budget);
+    let proxy = start_proxy(&config);
+
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What is the weather and time?",
+        "store": false,
+        "tools": [{
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": mcp_url,
+            "allowed_tools": ["get_weather", "get_time"],
+            "require_approval": "never"
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "released round-local headroom must let every modest round run: {raw}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        4,
+        "all four inference rounds ran without a mid-loop retained-payload rejection"
+    );
+}
+
+#[test]
 fn two_tool_rounds_accumulate_output_and_usage() {
     // Round 1: the model asks to call the weather tool.
     let first_response = serde_json::json!({
@@ -9393,6 +9493,24 @@ fn load_agentic_rejection_config(proxy_port: u16, model_port: u16) -> praxis_cor
 
 fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     load_loopback_mcp_config_inner(proxy_port, model_port, false)
+}
+
+fn load_loopback_mcp_config_with_budget(
+    proxy_port: u16,
+    model_port: u16,
+    max_retained_bytes: usize,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = original.replacen(
+        "max_retained_bytes: 67108864",
+        &format!("max_retained_bytes: {max_retained_bytes}"),
+        1,
+    );
+    assert_ne!(yaml, original, "expected the example's retained-payload limit");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse bounded loopback MCP config")
 }
 
 fn load_agentic_guardrails_config(proxy_port: u16, model_port: u16, nemo_port: u16) -> praxis_core::config::Config {

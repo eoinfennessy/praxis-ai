@@ -966,6 +966,10 @@ const fn has_dispatchable_mcp_work(_state: &ResponsesState) -> bool {
 
 /// Decide the loop outcome: done (no dispatchable tool calls or model-owned
 /// finish), 508 (iteration limit), or loop (continue to tool execution).
+#[expect(
+    clippy::too_many_lines,
+    reason = "terminal finalization, exit checks, and the round-boundary retain share one decision"
+)]
 fn evaluate_loop_decision(
     ctx: &mut HttpFilterContext<'_>,
     state: &mut ResponsesState,
@@ -991,6 +995,17 @@ fn evaluate_loop_decision(
     match check_exit_conditions(state, config) {
         Some(ExitReason::IterationLimit) => end_at_iteration_limit(ctx, state),
         None => {
+            // The router discards this round's response body before the next
+            // request, so the buffered body (or raw SSE transport and parsed
+            // frames) this round charged are now dropped. Retain only the output
+            // items it left live in `accumulated_output` and release the
+            // round-local charge, so the next round reuses that headroom while the
+            // retained output still accumulates toward the limit. An output tree
+            // that no longer fits is a mid-loop exhaustion, handled like a buffered
+            // output overflow.
+            if let Some(reject) = release_completed_round(ctx, state)? {
+                return Ok(reject);
+            }
             state.iteration += 1;
             let (tc, wsc, fsc) = (
                 state.tool_calls.len(),
@@ -1011,6 +1026,39 @@ fn evaluate_loop_decision(
             Ok(FilterAction::Continue)
         },
     }
+}
+
+/// Release a completed round's round-local provider charge, retaining only the
+/// output items it left live in `accumulated_output`.
+///
+/// Returns `Ok(Some(reject))` when the retained output no longer fits the budget
+/// — a mid-loop exhaustion surfaced like a buffered output overflow — and
+/// `Ok(None)` when the round was retained (or the request is unbudgeted).
+fn release_completed_round(
+    ctx: &mut HttpFilterContext<'_>,
+    state: &mut ResponsesState,
+) -> Result<Option<FilterAction>, FilterError> {
+    let round_start = state.current_round_output_start.unwrap_or(0);
+    // Serialized size of just this round's output items; `None` means the tree
+    // does not even fit the raw body ceiling, which is itself over budget.
+    let retained = state
+        .accumulated_output
+        .get(round_start..)
+        .and_then(|items| super::bounded_json_size(items, MAX_JSON_BODY_BYTES).ok().flatten());
+    let fits = state
+        .simple_budget
+        .as_mut()
+        .is_none_or(|budget| retained.is_some_and(|bytes| budget.retain_round_output(bytes)));
+    if fits {
+        return Ok(None);
+    }
+    ctx.set_metadata("responses.skip_persist", "true");
+    set_action(ctx, ACTION_DONE)?;
+    Ok(Some(FilterAction::Reject(responses_error_rejection(
+        502,
+        "server_error",
+        "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+    ))))
 }
 
 /// Rewrite queued hosted searches to `incomplete` when they cannot consume
