@@ -488,7 +488,7 @@ impl HttpFilter for AgenticLoopFilter {
 }
 
 /// The single terminal outcome a completed round can resolve to before the loop
-/// decision, carried so [`on_response_body`] moves the owned `ResponsesState`
+/// decision, carried so `on_response_body` moves the owned `ResponsesState`
 /// through one call site rather than three.
 enum RoundTerminal {
     /// The model stopped on `length`; preserve the incomplete response.
@@ -502,7 +502,7 @@ enum RoundTerminal {
 /// Dispatch a round's terminal outcome through one by-value `state` move site.
 ///
 /// `#[inline(never)]` keeps the three terminal paths' move-slots and locals off
-/// the sole [`on_response_body`] frame, which otherwise trips
+/// the sole `on_response_body` frame, which otherwise trips
 /// `clippy::large_stack_frames` under some target/feature combinations.
 #[inline(never)]
 fn finish_terminal_round(
