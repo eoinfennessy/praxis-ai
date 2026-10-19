@@ -19,9 +19,10 @@
 # append-back, and explicit POST /v1/responses/compact with bounded Store and
 # summarization callouts. File resolution and document extraction reserve their
 # expanded content when those filters are configured in the request path.
-# Tool requests remain gated until their dispatch accounting lands.
-# in this draft PR. The tool examples below document the intended pipeline but
-# currently return a Responses-formatted 400 before inference or dispatch.
+# MCP and hosted-tool requests reserve discovery, dispatch, and result
+# headroom before adding their payloads to the request. See the
+# retained-payload budget guide for each filter's responsibility:
+# docs/architecture/responses-retained-payload.md
 #
 # Configured `connector_id` values can be combined with `defer_loading: true`
 # and a `tool_search` tool so discovery waits for a later `tool_search_call`.
