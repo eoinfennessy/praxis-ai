@@ -1162,11 +1162,19 @@ impl HttpFilter for McpDispatchFilter {
         if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.mcp_operator_approval_floor = self.minimum_approval;
         }
+        // Skip dispatch prep when this round has nothing to dispatch. Connector
+        // entries are the exception: their ambient owner/credential/header context
+        // must be bound onto the tool map this round so a floor-forced approval's
+        // target fingerprint (minted in the response phase) matches the fingerprint
+        // recomputed on resume, which binds the same context. Skipping the bind
+        // here would fingerprint an unbound connector entry at grant and a bound
+        // one at resume, so the approval could never be resumed.
         if let Some(state) = ctx.extensions.get::<ResponsesState>()
             && state.simple_budget.is_some()
             && state.selected_tool_calls().is_empty()
             && state.deferred_mcp.is_empty()
             && (state.iteration != 0 || !state.messages.iter().any(is_approval_response))
+            && !state.mcp_tool_map.values().any(is_connector_tool_entry)
         {
             return Ok(FilterAction::Continue);
         }
