@@ -482,6 +482,12 @@ fn validate_agentic_irr_caps(
         inside_irr: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for entry in entries {
+            // Only enforce loop placement when the loop can actually be
+            // registered. With `openai-agentic-loop` disabled (but the Responses
+            // budget still active), `openai_agentic_loop` is an unknown filter:
+            // let registration report that rather than pre-empting it with a
+            // placement error here.
+            #[cfg(feature = "openai-agentic-loop")]
             if entry.filter_type == "openai_agentic_loop" && !inside_irr {
                 return Err("openai_agentic_loop requires a bounded iterative_request_router step".into());
             }
