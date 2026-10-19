@@ -406,6 +406,7 @@ impl McpDispatchFilter {
     /// call here executes.
     #[expect(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "callout threads the per-request MCP subrequest executor through the dispatch batch"
     )]
     async fn execute_pending_calls(
@@ -1263,8 +1264,7 @@ impl HttpFilter for McpDispatchFilter {
         // call to a policy-denied tool, which must be rejected rather than passed
         // through: keep processing when denied verdicts exist (#1724).
         if !needs_discovery
-            && (selected_calls.is_empty()
-                || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied()))
+            && (selected_calls.is_empty() || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied()))
         {
             return Ok(FilterAction::Continue);
         }
@@ -1367,9 +1367,7 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         };
         let selected_calls = state.selected_tool_calls();
-        if selected_calls.is_empty()
-            || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied())
-        {
+        if selected_calls.is_empty() || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied()) {
             return Ok(FilterAction::Continue);
         }
 
@@ -1480,9 +1478,7 @@ pub(crate) fn prepare_response_round(
     // model-generated calls to policy-denied tools that the dispatcher will
     // reject. Keep validating them (per-round cap, unique call ids) rather than
     // skipping straight to dispatch (#1724).
-    if selected_calls.is_empty()
-        || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied())
-    {
+    if selected_calls.is_empty() || (state.mcp_tool_map.is_empty() && !state.mcp_admission.has_denied()) {
         return Ok(());
     }
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);

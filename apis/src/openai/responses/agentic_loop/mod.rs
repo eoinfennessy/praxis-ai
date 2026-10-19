@@ -413,7 +413,9 @@ impl HttpFilter for AgenticLoopFilter {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "the loop admits output before its sole parse and transition decision"
+        clippy::large_stack_frames,
+        reason = "the loop admits output before its sole parse and transition decision; \
+                  the owned ResponsesState moved into extensions dominates the frame"
     )]
     fn on_response_body(
         &self,
