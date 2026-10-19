@@ -510,8 +510,7 @@ fn build_pingora_server(
     let (store_registries, store_service, _store_reload, store_readiness) =
         praxis_ai::store_provision::build_store_wiring(config).expect("harness store config should be valid");
     #[cfg(all(feature = "store", not(feature = "_store-backend")))]
-    let store_registries: std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> =
-        std::collections::HashMap::new();
+    let store_registries: HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry> = HashMap::new();
 
     #[cfg(feature = "_store-backend")]
     let readiness = HarnessStoreReadiness {
