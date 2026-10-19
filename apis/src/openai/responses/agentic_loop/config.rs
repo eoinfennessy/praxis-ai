@@ -104,15 +104,15 @@ pub(super) struct AgenticLoopConfig {
     /// Store persistence, buffered and streaming output, Responses-to-Chat
     /// translation, MCP dispatch, and hosted tools across inference rounds.
     /// Initial payloads are conservatively charged at 32 times raw bytes plus
-    /// a per-node reserve; cumulative buffered provider output is charged at
+    /// a per-node reserve; each round's buffered provider output is charged at
     /// 64 times its wire bytes plus a larger per-node reserve. Store
     /// persistence doubles those conservative charges for its independent
     /// request input snapshot and response persistence projection. Finite Chat
     /// translation reserves its additional request and response JSON owners
     /// before allocating them. Streaming reserves raw chunks, parsed frames,
-    /// terminal output, and separately retained tool results. Store history
-    /// reads are capped before decoding;
-    /// the decoded record, replay, and replacement state are charged at 512
+    /// terminal output, and separately retained tool results. When a create
+    /// restores history, Store reads are capped before decoding. The decoded
+    /// record, replay, and replacement state are charged at 256
     /// times the stored record's serialized bytes. Conversation append-back
     /// uses a transactional bounded cache rebuild. The listener also clamps
     /// its raw request body limit to at most one

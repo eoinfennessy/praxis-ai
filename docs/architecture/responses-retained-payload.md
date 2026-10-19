@@ -34,20 +34,26 @@ reuse headroom; the remaining round-local charge ends with the request.
 
 ### One request across two rounds
 
+Using the worked example below, the request makes one tool call and finishes
+after the second model reply. The total **falls between rounds** because the
+first provider response's temporary charge is released. Its surviving output
+remains charged.
+
 ```mermaid
-flowchart LR
-    A["Admit request<br/>Keep input and router reserves"] --> B["Model round 1<br/>Add temporary provider charge"]
-    B --> C["Continue<br/>Keep output items; release provider charge"]
-    C --> D["Execute tool<br/>Keep its result for history and output"]
-    D --> E["Model round 2<br/>Add a new temporary provider charge"]
-    E --> F{"Continue?"}
-    F -->|Yes| C
-    F -->|No| G["Complete response<br/>Drop request ledger"]
+flowchart TB
+    A["Start<br/>801.25 KiB charged<br/>Input + router reserve"]
+    B["Round 1 response<br/>1,441.25 KiB charged<br/>Add 640 KiB temporary charge"]
+    C["Continue: charge falls<br/>1,441.25 → 865.25 KiB<br/>Release 640 KiB, keep 64 KiB output"]
+    D["Tool result<br/>885.25 KiB charged<br/>Keep another 20 KiB"]
+    E["Round 2 response<br/>1,525.25 KiB charged<br/>Add 640 KiB temporary charge"]
+    F["Finish<br/>Request ledger ends"]
+    A --> B --> C --> D --> E --> F
 ```
 
-The arrow back to **Continue** repeats the same accounting step for each
-additional model round. The retained input, previous output items, tool
-results, and router reserve remain charged while the new round runs.
+The 576 KiB drop at **Continue** is the 640 KiB provider charge released minus
+the 64 KiB output charge retained for later rounds. Response 2 ends the
+request, so its temporary charge stays until the ledger is dropped. If round 2
+also calls a tool, the same release and retain step repeats before round 3.
 
 ## Scope and configuration
 
@@ -84,6 +90,27 @@ and 8 MiB respectively. The raw request cap applies to **other routes on the
 same listener too**. A dedicated listener avoids imposing it on unrelated
 traffic. The iterative router must contain the loop in a bounded step.
 
+## What the ledger tracks
+
+The ledger charges payloads owned during one budgeted Responses request. A
+reference in the incoming JSON is distinct from content the proxy later loads
+for that reference. Only filters on the configured request path add their
+charges.
+
+| Payload | What is charged | Lifetime |
+| --- | --- | --- |
+| Incoming request | The raw JSON body and an allowance for its parsed structure. An inline `file_data` value or a `file_id` string is part of this body. | Retained across inference rounds. |
+| Restored history | Bounded Store reads for `previous_response_id` or a conversation, followed by the stored record and the replay state built from it. The record includes response input, output, and messages, or conversation metadata and messages. | Retained across inference rounds. Reading a response or conversation without creating a new budgeted request does not use this ledger. |
+| Resolved files | When `openai_file_resolve` fetches a `file_id` or resolves a `file_url`, the file content, metadata, resolution results, and expanded request body. The `file_id` string alone does not charge the file's contents; a reference passed through without fetching has no fetched-content charge. | Fetched content and rewritten request projections remain charged while the request uses them. |
+| Extracted documents | When `openai_doc_extract` converts supported text-safe inline `input_file` content to text, the decoded text, rewritten body, and corresponding history projections. | Retained across inference rounds. |
+| Provider response | A buffered response body, or incoming SSE chunks and parsed frames. The ledger also reserves for the iterative router's response buffer. | Provider body and stream charges are round-local and are released on continuation; the router reserve lasts for the request. |
+| Kept output and tools | Output items kept for the final response or replay, plus configured MCP discovery and calls, hosted search results, approvals, and model-facing and public tool output. | Kept output and tool results accumulate across rounds; temporary callout reservations can be settled after their owners are dropped. |
+| Rewrites and completion | Configured model rewrites, prompt enrichment, Responses-to-Chat translation, Store input and output projections, and conversation append-back. Explicit compaction has its own budget for restored history and summarization. | Charged while their request-side owners are live. Store adds projections when `store` is omitted or `true`. |
+
+This inventory describes **accounting allowances**, not measured allocations.
+It does not measure process memory or add together separate requests. Per-file,
+body, tool, and Store limits still apply independently.
+
 ### How charges are calculated
 
 The transport caps limit bytes received on the wire. The request ledger then
@@ -99,10 +126,18 @@ For a JSON body with `B` wire bytes and `E` counted JSON syntax elements:
 | --- | --- | --- |
 | Initial request body | `32 × B + 256 × E` bytes | Covers the raw and parsed input and temporary request-side representations. |
 | A round's buffered provider response (round-local) | `64 × B + 8,192 × E` bytes; another equal charge with Store | Covers the raw body, parsing, and transient response-state representations for one round. The loop replaces this charge with the surviving output charge when it continues. Small JSON values can still require allocated map or vector capacity. |
-| Retained output per continued round | `32 × O` bytes for the `O` serialized bytes the round keeps in `accumulated_output`; another `16 × O` with Store | Kept items stay in the final output list; some also enter model-facing history. These charges accumulate across continued rounds. |
+| Retained output per continued round | `32 × O` bytes for the `O` serialized bytes the round keeps in `accumulated_output`; another `16 × O` with Store | Kept items stay in the final output list; some also enter model-facing history. These charges accumulate across continued rounds. A terminal round keeps its round-local charge until the request ends. |
 | Store input | Another charge equal to the initial request-body charge | Reserves for the independently owned input snapshot when `store` is omitted or `true`. `store: false` avoids this and the Store output charges above. |
 | Streamed provider response (round-local) | `32 × C` for cumulative raw SSE bytes `C`, plus `512 × F` for counted JSON elements `F` in completed frames; Store adds `32 × C + 256 × F` | Covers the stream's transport and parsed frames for this round. Each incoming chunk also checks a temporary `16 × chunk bytes` peak; that peak is not accumulated. |
 | Iterative-router response buffer | `3 × (limit ÷ 8)` bytes | Reserves for the core buffer and possible spare capacity before the provider responds. This is 24 MiB at the default 64 MiB limit. |
+
+For a create that restores history, the Store read is capped at the remaining
+headroom divided by 256. Once loaded, the ledger charges `256 × R`, where `R`
+is the serialized size of the stored response fields or conversation fields
+that the restore uses, including their identifiers. This covers the decoded
+record and the replay state built from it. Explicit compaction has a separate
+ledger and uses a 512× Store-read allowance. These caps apply to charged
+payload, not the entire database or process memory.
 
 `E` counts parts **inside the JSON document**, not physical servers or
 machines. It includes the start of each object or array, each key string,
@@ -136,8 +171,9 @@ the released headroom, while the 16 KiB or 24 KiB continues to count.
 Here is a simplified ledger simulation for a two-round request with
 `store: false` and a **2 MiB** limit. Assume a 1 KiB input body with five
 counted JSON elements, two 8 KiB provider responses with 16 counted elements
-each, and 2 KiB of output items kept from each round. The tool result adds an
-illustrative 20 KiB retained charge after its temporary callout allowance is
+each, and 2 KiB of output items kept from the first round. The second round
+finishes the request. The tool result adds an illustrative 20 KiB retained
+charge after its temporary callout allowance is
 settled. An actual tool request also incurs charges for tool declarations,
 dispatch, and any configured request filters. These are **ledger charges**,
 not measured heap usage or a complete HTTP fixture.
@@ -149,16 +185,17 @@ not measured heap usage or a complete HTTP fixture.
 | Continue: keep output 1, release response 1 | 865.25 KiB | 0 | 865.25 KiB |
 | Keep tool result | 885.25 KiB | 0 | 885.25 KiB |
 | Parse model response 2 | 885.25 KiB | 640 KiB | 1,525.25 KiB |
-| Continue: keep output 2, release response 2 | 949.25 KiB | 0 | 949.25 KiB |
 
 The opening charge is `32 × 1 KiB + 256 × 5` = **33.25 KiB** for input,
 plus `3 × (2 MiB ÷ 8)` = **768 KiB** for the router buffer. Each model response
-temporarily adds `64 × 8 KiB + 8,192 × 16` = **640 KiB**. Each continuation
-replaces that with `32 × 2 KiB` = **64 KiB** for the output items it keeps.
-Without releasing response 1's temporary charge, the second response would
-bring this simplified example to **2,101.25 KiB**, above the 2,048 KiB limit.
-With the release, the second response is charged at **1,525.25 KiB**, while
-the previous output and tool result continue to count.
+adds `64 × 8 KiB + 8,192 × 16` = **640 KiB**. The first continuation
+replaces that charge with `32 × 2 KiB` = **64 KiB** for the output items it
+keeps. If response 1's temporary charge remained alongside those kept items,
+the second response would bring this simplified example to **2,165.25 KiB**,
+above the 2,048 KiB limit. With the release, response 2 is charged at
+**1,525.25 KiB**, while the previous output and tool result continue to
+count. Because response 2 ends the request, its round-local charge is not
+released for another round; it disappears when the request ledger is dropped.
 
 Streaming uses the chunk and frame charges in the table instead of the
 buffered-response formula. On continuation, surviving output gets the same
