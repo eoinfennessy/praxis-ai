@@ -36,13 +36,23 @@ fn load_budgeted_chat_config(
 ) -> (praxis_core::config::Config, TempSqlite) {
     let db = TempSqlite::new(test_name);
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("example config should exist");
-    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url()).replace(
-        "              - filter: responses_to_chat_completions",
+    let with_db = yaml.replace("sqlite://responses.db?mode=rwc", db.url());
+    let anchor = "              - filter: openai_responses_to_chat_completions";
+    let budgeted = with_db.replace(
+        anchor,
         &format!(
-            "              - filter: openai_agentic_loop\n                max_retained_bytes: {max_retained_bytes}\n              - filter: responses_to_chat_completions"
+            "              - filter: openai_agentic_loop\n                max_retained_bytes: {max_retained_bytes}\n{anchor}"
         ),
     );
-    let patched = patch_yaml(&yaml, listener_port, &HashMap::from([("127.0.0.1:3001", backend_port)]));
+    assert_ne!(
+        budgeted, with_db,
+        "expected to insert the budgeted loop before Chat translation"
+    );
+    let patched = patch_yaml(
+        &budgeted,
+        listener_port,
+        &HashMap::from([("127.0.0.1:3001", backend_port)]),
+    );
     let config = praxis_core::config::Config::from_yaml(&patched).expect("budgeted Chat config should parse");
     (config, db)
 }

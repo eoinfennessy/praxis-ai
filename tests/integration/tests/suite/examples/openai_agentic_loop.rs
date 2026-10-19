@@ -121,8 +121,8 @@ fn retained_budget_preserves_responses_with_chat_prompt_enrichment_filter() {
     let original = std::fs::read_to_string(example_config_path("openai/responses/agentic-loop.yaml"))
         .expect("read agentic-loop example");
     let yaml = original.replacen(
-        "      - filter: openai_responses_format",
-        "      - filter: prompt_enrich\n        on_invalid: continue\n        prepend:\n          - role: system\n            content: Be helpful.\n\n      - filter: openai_responses_format",
+        "      - filter: openai_responses_request",
+        "      - filter: prompt_enrich\n        on_invalid: continue\n        prepend:\n          - role: system\n            content: Be helpful.\n\n      - filter: openai_responses_request",
         1,
     );
     assert_ne!(yaml, original, "insert the chat prompt filter before Responses parsing");
@@ -9400,12 +9400,22 @@ fn load_agentic_config(proxy_port: u16, model_port: u16) -> praxis_core::config:
 fn load_agentic_config_with_model_rewrite(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let original = std::fs::read_to_string(path).expect("read agentic-loop example");
+    // The example documents aliasing here: before the managed (state-building)
+    // `openai_responses_request`, after the facts-only classifier. The anchor
+    // matches only the managed instance (the facts-only one declares
+    // `initialize_state: false` before `on_invalid`).
+    let anchor = "      - filter: openai_responses_request\n        on_invalid: reject";
     let yaml = original.replacen(
-        "      - filter: openai_responses_validate",
-        "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"client-alias\": \"gpt-4.1\"\n\n      - filter: openai_responses_validate",
+        anchor,
+        &format!(
+            "      - filter: openai_responses_model_rewrite\n        model_aliases:\n          \"client-alias\": \"gpt-4.1\"\n\n{anchor}"
+        ),
         1,
     );
-    assert_ne!(yaml, original, "expected model rewrite before validation");
+    assert_ne!(
+        yaml, original,
+        "expected to insert model rewrite before the managed request filter"
+    );
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
     praxis_core::config::Config::from_yaml(&yaml).expect("parse agentic-loop config with model rewrite")
