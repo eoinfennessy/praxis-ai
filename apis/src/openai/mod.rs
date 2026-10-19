@@ -39,10 +39,10 @@ pub use conversations::{
 pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
 pub use files::routes::{FilesOperation, FilesOperationSpec, operation_specs as files_operation_specs};
 pub use operation::OpenAiOperationSpec;
-#[cfg(feature = "openai-agentic-loop")]
-pub use responses::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
 pub use responses::AgenticBudgetPolicy;
+#[cfg(feature = "openai-agentic-loop")]
+pub use responses::AgenticLoopFilter;
 #[cfg(feature = "openai-compact")]
 pub use responses::CompactFilter;
 #[cfg(feature = "openai-file-resolve-filter")]

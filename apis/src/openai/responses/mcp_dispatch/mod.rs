@@ -1639,7 +1639,6 @@ fn extract_mcp_tool_calls<'a, T: Borrow<serde_json::Value>>(
 }
 
 /// Count MCP-owned function calls without cloning provider payloads.
-#[cfg(any(feature = "openai-agentic-loop", all(test, feature = "store-sqlite")))]
 fn count_mcp_tool_calls<T: Borrow<serde_json::Value>>(
     tool_calls: &[T],
     tool_index: &McpToolIndex<'_>,

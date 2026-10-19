@@ -10,13 +10,15 @@ use praxis_filter::{
 };
 use serde_json::{Value, json};
 
-use super::{super::state::ResponsesState, budget::SimpleBudget, collect_output_items};
+use super::{super::budget::SimpleBudget, collect_output_items};
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::mcp_admission::ConnectorTrust;
 #[cfg(feature = "openai-mcp-tools")]
 use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
-    openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
+    openai::responses::state::{
+        DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
+    },
     test_utils::{make_filter_context, make_request},
 };
 // `service` (and the store-scoped `StateOwner` path) are gated behind `store`, so
@@ -539,7 +541,7 @@ async fn budgeted_loop_rejects_missing_initializer_before_dispatch() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.extensions
-        .insert(super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
     assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 500));
 }
@@ -550,7 +552,7 @@ async fn budgeted_loop_leaves_non_create_requests_alone() {
     let req = make_request(Method::POST, "/v1/responses/input_tokens");
     let mut ctx = make_filter_context(&req);
     ctx.extensions
-        .insert(super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
 }
@@ -561,7 +563,7 @@ async fn budgeted_loop_rejects_compact_without_earlier_handler() {
     let req = make_request(Method::POST, "/v1/responses/compact");
     let mut ctx = make_filter_context(&req);
     ctx.extensions
-        .insert(super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
+        .insert(super::super::AgenticBudgetPolicy::from_config(&serde_yaml::Value::Null).unwrap());
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
     assert!(
         matches!(action, FilterAction::Reject(rejection) if rejection.status == 400),
@@ -592,14 +594,15 @@ fn budgeted_buffered_output_rejects_before_json_parse() {
 #[test]
 fn preparse_filter_reserves_against_existing_responses_state() {
     let policy =
-        super::AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap()).unwrap();
+        super::super::AgenticBudgetPolicy::from_config(&serde_yaml::from_str("max_retained_bytes: 65536").unwrap())
+            .unwrap();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     let mut state = ResponsesState::from_request_body(json!({"input":"hello","store":false}));
     state.simple_budget = Some(SimpleBudget::new(65_536, 1_000).unwrap());
     ctx.extensions.insert(state);
     let raw = br#"{"model":"gpt-4.1","input":"hello","messages":[]}"#;
-    let charge = super::AgenticBudgetPolicy::input_charge(raw).unwrap() + 2_000;
+    let charge = super::super::AgenticBudgetPolicy::input_charge(raw).unwrap() + 2_000;
     let before = ctx
         .extensions
         .get::<ResponsesState>()

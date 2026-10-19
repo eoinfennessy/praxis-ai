@@ -121,6 +121,7 @@ pub(crate) struct OutputAssignment {
 
 impl OutputAssignment {
     /// Select a canonical output item without copying its payload.
+    #[cfg(any(test, feature = "openai-agentic-loop"))]
     pub(crate) fn new(output_index: usize, item: &serde_json::Value) -> Option<Self> {
         Some(Self {
             output_index,
@@ -1225,6 +1226,7 @@ impl Default for ResponsesState {
 
 impl ResponsesState {
     /// Borrow current-round canonical output selected by a dispatcher queue.
+    #[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
     fn selected_output<'a>(
         &'a self,
         assignments: &'a [OutputAssignment],
@@ -1237,6 +1239,7 @@ impl ResponsesState {
     }
 
     /// Borrow function calls selected for dispatch, including resumed approvals.
+    #[cfg(any(feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
     pub(crate) fn selected_tool_calls(&self) -> Vec<&serde_json::Value> {
         #[cfg(feature = "openai-mcp-tools")]
         let mut selected: Vec<_> = self.selected_output(&self.tool_calls, "function_call").collect();
@@ -1248,12 +1251,14 @@ impl ResponsesState {
     }
 
     /// Borrow hosted tool-search calls selected in the current round.
+    #[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
     pub(crate) fn selected_tool_search_calls(&self) -> Vec<&serde_json::Value> {
         self.selected_output(&self.tool_search_calls, "tool_search_call")
             .collect()
     }
 
     /// Borrow web-search calls selected in the current round.
+    #[cfg(any(test, feature = "openai-agentic-loop"))]
     pub(crate) fn selected_web_search_calls(&self) -> Vec<&serde_json::Value> {
         self.selected_output(&self.web_search_calls, "web_search_call")
             .collect()

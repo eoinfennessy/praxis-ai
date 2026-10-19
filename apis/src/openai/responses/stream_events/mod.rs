@@ -2566,6 +2566,7 @@ fn canonicalize_logical_response(
     }
     // All dispatch assignments index the accumulator that has just moved.
     state.tool_calls.clear();
+    #[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
     state.tool_search_calls.clear();
     state.web_search_calls.clear();
     state.stream_synthesis_reserved.clear();

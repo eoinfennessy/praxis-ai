@@ -33,8 +33,10 @@ const STREAM_STORE_FRAME_NODE_RESERVE: usize = 256;
 /// the accumulator copy, the next round's history copy, and their `serde_json`
 /// expansion. Smaller than the round-local provider charge so releasing a round
 /// nets headroom back while the kept output still accumulates across rounds.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 const RETAINED_OUTPUT_MULTIPLIER: usize = 32;
 /// Store keeps one more persisted projection of that retained output.
+#[cfg(any(test, feature = "openai-agentic-loop"))]
 const RETAINED_STORE_OUTPUT_MULTIPLIER: usize = 16;
 
 /// Request-scoped charge that survives every inference round.
@@ -122,6 +124,7 @@ impl SimpleBudget {
     }
 
     /// Lower the effective limit when another loop instance is reached.
+    #[cfg(any(test, feature = "openai-agentic-loop"))]
     pub(crate) fn lower_limit(&mut self, limit: usize) -> bool {
         self.limit = self.limit.min(limit);
         self.charge().is_some_and(|charge| charge <= self.limit)
@@ -177,6 +180,7 @@ impl SimpleBudget {
     /// dropped once the round is reduced to retained state, so the charge is
     /// round-local and released at the round boundary by
     /// [`SimpleBudget::retain_round_output`].
+    #[cfg(any(test, feature = "openai-agentic-loop"))]
     pub(crate) fn admit_output(&mut self, bytes: &[u8]) -> bool {
         let Some(additional) = output_charge(bytes) else {
             return false;
@@ -328,6 +332,7 @@ impl SimpleBudget {
     /// Returns `false` on arithmetic overflow or if the accumulated retained
     /// output no longer fits the limit — the caller treats that as exhaustion.
     /// The ledger is left unchanged on failure.
+    #[cfg(any(test, feature = "openai-agentic-loop"))]
     pub(crate) fn retain_round_output(&mut self, output_bytes: usize) -> bool {
         let Some(retained) = output_bytes.checked_mul(RETAINED_OUTPUT_MULTIPLIER) else {
             return false;

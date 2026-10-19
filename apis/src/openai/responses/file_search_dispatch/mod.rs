@@ -813,11 +813,16 @@ fn continuation_state_fits(
             .tool_calls
             .iter()
             .chain(&state.web_search_calls)
-            .chain(&state.tool_search_calls)
             .fold(0_usize, |bytes, assignment| {
                 bytes.saturating_add(assignment.item_id.len())
             }),
     );
+    #[cfg(any(test, feature = "openai-agentic-loop", feature = "openai-mcp-tools"))]
+    {
+        used = used.saturating_add(state.tool_search_calls.iter().fold(0_usize, |bytes, assignment| {
+            bytes.saturating_add(assignment.item_id.len())
+        }));
+    }
     for value in [
         state.context_management.as_ref(),
         state.conversation.as_ref(),

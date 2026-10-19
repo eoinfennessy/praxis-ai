@@ -79,10 +79,10 @@ pub(crate) mod tool_parse;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod usage;
 
-#[cfg(feature = "openai-agentic-loop")]
-pub use agentic_loop::AgenticLoopFilter;
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticBudgetPolicy;
+#[cfg(feature = "openai-agentic-loop")]
+pub use agentic_loop::AgenticLoopFilter;
 
 /// Preflight a budgeted Responses body before the first JSON parser allocates.
 /// The same listener policy applies to every reachable loop instance.
