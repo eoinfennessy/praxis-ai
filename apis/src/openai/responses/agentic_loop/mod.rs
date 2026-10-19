@@ -413,9 +413,7 @@ impl HttpFilter for AgenticLoopFilter {
 
     #[expect(
         clippy::too_many_lines,
-        clippy::large_stack_frames,
-        reason = "the loop admits output before its sole parse and transition decision; \
-                  the owned ResponsesState moved into extensions dominates the frame"
+        reason = "the loop admits output before its sole parse and transition decision"
     )]
     fn on_response_body(
         &self,
@@ -466,21 +464,57 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if is_finish_reason_length(&state) {
-            return finish_incomplete_round(ctx, state, body);
-        }
-
-        if has_mixed_function_call_ownership(&state) {
-            return reject_mixed_ownership_round(ctx, state);
-        }
-
-        if let Err(failure) = prepare_dispatcher_round(ctx, &mut state) {
-            return finish_response_failure(ctx, state, &failure);
+        // Funnel the three terminal outcomes through one by-value `state` move
+        // site so this frame keeps a single move-slot for them (the dispatcher
+        // and its helpers are `#[inline(never)]`), holding it under
+        // `clippy.toml`'s `stack-size-threshold`.
+        let terminal = if is_finish_reason_length(&state) {
+            Some(RoundTerminal::Incomplete)
+        } else if has_mixed_function_call_ownership(&state) {
+            Some(RoundTerminal::MixedOwnership)
+        } else if let Err(failure) = prepare_dispatcher_round(ctx, &mut state) {
+            Some(RoundTerminal::Failure(failure))
+        } else {
+            None
+        };
+        if let Some(terminal) = terminal {
+            return finish_terminal_round(ctx, state, body, terminal);
         }
 
         let result = evaluate_loop_decision(ctx, &mut state, body, &self.config)?;
         ctx.extensions.insert(state);
         Ok(result)
+    }
+}
+
+/// The single terminal outcome a completed round can resolve to before the loop
+/// decision, carried so [`on_response_body`] moves the owned `ResponsesState`
+/// through one call site rather than three.
+enum RoundTerminal {
+    /// The model stopped on `length`; preserve the incomplete response.
+    Incomplete,
+    /// The round mixed server-owned and client-owned tool calls; reject it.
+    MixedOwnership,
+    /// A response-phase dispatcher validation failed; convert it through the owner.
+    Failure(DispatchFailure),
+}
+
+/// Dispatch a round's terminal outcome through one by-value `state` move site.
+///
+/// `#[inline(never)]` keeps the three terminal paths' move-slots and locals off
+/// the sole [`on_response_body`] frame, which otherwise trips
+/// `clippy::large_stack_frames` under some target/feature combinations.
+#[inline(never)]
+fn finish_terminal_round(
+    ctx: &mut HttpFilterContext<'_>,
+    state: ResponsesState,
+    body: &mut Option<Bytes>,
+    terminal: RoundTerminal,
+) -> Result<FilterAction, FilterError> {
+    match terminal {
+        RoundTerminal::Incomplete => finish_incomplete_round(ctx, state, body),
+        RoundTerminal::MixedOwnership => reject_mixed_ownership_round(ctx, state),
+        RoundTerminal::Failure(failure) => finish_response_failure(ctx, state, &failure),
     }
 }
 
@@ -616,6 +650,12 @@ fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesSt
 }
 
 /// Return a response-phase dispatcher validation failure through the owner.
+///
+/// `#[inline(never)]` keeps this terminal path's locals out of the sole
+/// `on_response_body` frame, which otherwise accumulates several by-value
+/// `ResponsesState` move-slots and trips `clippy::large_stack_frames` under some
+/// target/feature combinations.
+#[inline(never)]
 fn finish_response_failure(
     ctx: &mut HttpFilterContext<'_>,
     mut state: ResponsesState,
@@ -722,6 +762,10 @@ fn convert_dispatch_failure(
 }
 
 /// Preserve a model-owned incomplete response before validating tool ownership.
+///
+/// `#[inline(never)]` keeps this terminal path's locals off the sole
+/// `on_response_body` frame (see [`finish_response_failure`]).
+#[inline(never)]
 fn finish_incomplete_round(
     ctx: &mut HttpFilterContext<'_>,
     mut state: ResponsesState,
@@ -746,6 +790,10 @@ fn finish_incomplete_round(
 }
 
 /// Reject a completed round that cannot safely split execution ownership.
+///
+/// `#[inline(never)]` keeps this terminal path's locals off the sole
+/// `on_response_body` frame (see [`finish_response_failure`]).
+#[inline(never)]
 fn reject_mixed_ownership_round(
     ctx: &mut HttpFilterContext<'_>,
     mut state: ResponsesState,
